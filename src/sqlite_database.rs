@@ -45,6 +45,9 @@ pub struct PhysicalWriteInstrumentation {
     pub ordinary_durability_barriers: u64,
     pub candidate_transactions: u64,
     pub candidate_durability_barriers: u64,
+    /// Release-test-only decomposition of terminal bootstrap row insertion.
+    /// Production builds leave these counters at zero and pay no timing cost.
+    pub terminal_seed: sqlite_materialization::TerminalSeedInstrumentation,
 }
 
 impl PhysicalSqliteDatabase {
@@ -375,8 +378,12 @@ impl PhysicalSqliteDatabase {
         chunk: &sqlite_materialization::PhysicalTerminalMaterializationChunk,
     ) -> Result<(), FrontierError> {
         self.require_candidate_build()?;
-        sqlite_materialization::seed_terminal_chunk_in_open_candidate(&self.connection, chunk)
-            .map_err(Into::into)
+        let profile =
+            sqlite_materialization::seed_terminal_chunk_in_open_candidate(&self.connection, chunk)?;
+        self.write_instrumentation
+            .terminal_seed
+            .saturating_add_assign(profile);
+        Ok(())
     }
 
     /// Close a terminal seed as ordinary frontier-stamped disposable graph

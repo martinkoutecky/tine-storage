@@ -3,8 +3,12 @@
 //! This module owns disposable SQL shape and bounded physical reads. Inputs are
 //! lowered and semantically validated by tine-core before they cross this boundary.
 
+#[cfg(feature = "test-support")]
+use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fmt;
+#[cfg(feature = "test-support")]
+use std::time::Instant;
 
 use rusqlite::{
     functions::FunctionFlags, params, types::ValueRef, Connection, OptionalExtension as _,
@@ -1381,6 +1385,109 @@ pub struct PhysicalTerminalMaterializationChunk {
     pub logseq_uuid_introductions: Vec<PhysicalLogseqUuidIntroduction>,
 }
 
+/// Fine-grained release-test profile for the row-at-a-time terminal seed.
+/// It is deliberately physical: callers use it to distinguish ordinary table
+/// work from the two FTS virtual tables. Production builds return zeroes and
+/// avoid clock reads entirely.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TerminalSeedInstrumentation {
+    pub page_row_micros: u64,
+    pub page_rows: u64,
+    pub block_row_micros: u64,
+    pub block_rows: u64,
+    pub fts_owner_micros: u64,
+    pub fts_owner_rows: u64,
+    pub word_fts_micros: u64,
+    pub word_fts_rows: u64,
+    pub trigram_fts_micros: u64,
+    pub trigram_fts_rows: u64,
+    pub property_micros: u64,
+    pub property_rows: u64,
+    pub tag_micros: u64,
+    pub tag_rows: u64,
+    pub task_micros: u64,
+    pub task_rows: u64,
+    pub reference_micros: u64,
+    pub reference_rows: u64,
+    pub reference_posting_micros: u64,
+    pub reference_posting_rows: u64,
+    pub alias_micros: u64,
+    pub alias_rows: u64,
+    pub block_home_claim_micros: u64,
+    pub block_home_claim_rows: u64,
+    pub identity_record_micros: u64,
+    pub identity_record_rows: u64,
+    pub logseq_uuid_micros: u64,
+    pub logseq_uuid_rows: u64,
+    pub other_row_micros: u64,
+    pub other_rows: u64,
+}
+
+impl TerminalSeedInstrumentation {
+    pub(crate) fn saturating_add_assign(&mut self, other: Self) {
+        macro_rules! add {
+            ($field:ident) => {
+                self.$field = self.$field.saturating_add(other.$field);
+            };
+        }
+        add!(page_row_micros);
+        add!(page_rows);
+        add!(block_row_micros);
+        add!(block_rows);
+        add!(fts_owner_micros);
+        add!(fts_owner_rows);
+        add!(word_fts_micros);
+        add!(word_fts_rows);
+        add!(trigram_fts_micros);
+        add!(trigram_fts_rows);
+        add!(property_micros);
+        add!(property_rows);
+        add!(tag_micros);
+        add!(tag_rows);
+        add!(task_micros);
+        add!(task_rows);
+        add!(reference_micros);
+        add!(reference_rows);
+        add!(reference_posting_micros);
+        add!(reference_posting_rows);
+        add!(alias_micros);
+        add!(alias_rows);
+        add!(block_home_claim_micros);
+        add!(block_home_claim_rows);
+        add!(identity_record_micros);
+        add!(identity_record_rows);
+        add!(logseq_uuid_micros);
+        add!(logseq_uuid_rows);
+        add!(other_row_micros);
+        add!(other_rows);
+    }
+}
+
+#[cfg(feature = "test-support")]
+thread_local! {
+    static TERMINAL_SEED_INSTRUMENTATION: RefCell<Option<TerminalSeedInstrumentation>> = const { RefCell::new(None) };
+}
+
+#[cfg(feature = "test-support")]
+fn begin_terminal_seed_instrumentation() {
+    TERMINAL_SEED_INSTRUMENTATION.with(|slot| {
+        *slot.borrow_mut() = Some(TerminalSeedInstrumentation::default());
+    });
+}
+
+#[cfg(not(feature = "test-support"))]
+fn begin_terminal_seed_instrumentation() {}
+
+#[cfg(feature = "test-support")]
+fn finish_terminal_seed_instrumentation() -> TerminalSeedInstrumentation {
+    TERMINAL_SEED_INSTRUMENTATION.with(|slot| slot.borrow_mut().take().unwrap_or_default())
+}
+
+#[cfg(not(feature = "test-support"))]
+fn finish_terminal_seed_instrumentation() -> TerminalSeedInstrumentation {
+    TerminalSeedInstrumentation::default()
+}
+
 /// Construction provenance for one accepted sequence of a terminal build.
 ///
 /// The terminal builder applies no intermediate per-event page or reference
@@ -1463,8 +1570,9 @@ pub(crate) fn begin_terminal_construction_in_open_candidate(
 pub(crate) fn seed_terminal_chunk_in_open_candidate(
     transaction: &Connection,
     chunk: &PhysicalTerminalMaterializationChunk,
-) -> Result<(), MaterializationError> {
+) -> Result<TerminalSeedInstrumentation, MaterializationError> {
     require_open_candidate(transaction)?;
+    begin_terminal_seed_instrumentation();
     for page in &chunk.pages {
         insert_page(transaction, page)?;
     }
@@ -1486,7 +1594,7 @@ pub(crate) fn seed_terminal_chunk_in_open_candidate(
         &chunk.portable_path_identity_records,
     )?;
     insert_logseq_uuid_introductions(transaction, &chunk.logseq_uuid_introductions)?;
-    Ok(())
+    Ok(finish_terminal_seed_instrumentation())
 }
 
 /// Close a terminal build whose reference rows are ordinary parser-derived
@@ -2286,7 +2394,68 @@ fn execute_cached(
     sql: &str,
     parameters: &[&dyn rusqlite::ToSql],
 ) -> Result<usize, MaterializationError> {
-    Ok(transaction.prepare_cached(sql)?.execute(parameters)?)
+    #[cfg(feature = "test-support")]
+    let started = Instant::now();
+    let changed = transaction.prepare_cached(sql)?.execute(parameters)?;
+    #[cfg(feature = "test-support")]
+    TERMINAL_SEED_INSTRUMENTATION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let Some(profile) = slot.as_mut() else {
+            return;
+        };
+        let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let (elapsed, rows) = if sql.starts_with("INSERT INTO pages (") {
+            (&mut profile.page_row_micros, &mut profile.page_rows)
+        } else if sql.starts_with("INSERT INTO blocks (") {
+            (&mut profile.block_row_micros, &mut profile.block_rows)
+        } else if sql.starts_with("INSERT INTO search_fts_owners ") {
+            (&mut profile.fts_owner_micros, &mut profile.fts_owner_rows)
+        } else if sql.starts_with("INSERT INTO search_fts (") {
+            (&mut profile.word_fts_micros, &mut profile.word_fts_rows)
+        } else if sql.starts_with("INSERT INTO search_substring_fts ") {
+            (
+                &mut profile.trigram_fts_micros,
+                &mut profile.trigram_fts_rows,
+            )
+        } else if sql.starts_with("INSERT INTO properties (") {
+            (&mut profile.property_micros, &mut profile.property_rows)
+        } else if sql.starts_with("INSERT INTO tags (") {
+            (&mut profile.tag_micros, &mut profile.tag_rows)
+        } else if sql.starts_with("INSERT INTO tasks (") {
+            (&mut profile.task_micros, &mut profile.task_rows)
+        } else if sql.starts_with("INSERT INTO refs (") {
+            (&mut profile.reference_micros, &mut profile.reference_rows)
+        } else if sql.starts_with("INSERT INTO reference_postings (") {
+            (
+                &mut profile.reference_posting_micros,
+                &mut profile.reference_posting_rows,
+            )
+        } else if sql.starts_with("INSERT INTO reference_alias_declarations (") {
+            (&mut profile.alias_micros, &mut profile.alias_rows)
+        } else if sql.starts_with("INSERT OR IGNORE INTO block_home_claims (") {
+            (
+                &mut profile.block_home_claim_micros,
+                &mut profile.block_home_claim_rows,
+            )
+        } else if sql.starts_with("INSERT INTO page_name_identity_records ")
+            || sql.starts_with("INSERT INTO portable_path_identity_records ")
+        {
+            (
+                &mut profile.identity_record_micros,
+                &mut profile.identity_record_rows,
+            )
+        } else if sql.starts_with("INSERT OR IGNORE INTO logseq_uuid_introductions (") {
+            (
+                &mut profile.logseq_uuid_micros,
+                &mut profile.logseq_uuid_rows,
+            )
+        } else {
+            (&mut profile.other_row_micros, &mut profile.other_rows)
+        };
+        *elapsed = elapsed.saturating_add(micros);
+        *rows = rows.saturating_add(u64::try_from(changed).unwrap_or(u64::MAX));
+    });
+    Ok(changed)
 }
 
 fn insert_page(transaction: &Connection, page: &PhysicalPage) -> Result<(), MaterializationError> {
