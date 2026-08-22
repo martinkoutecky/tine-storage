@@ -221,6 +221,21 @@ fn journal_v2_can_be_prepared_opened_and_appended_from_the_public_api() {
     assert_eq!(appended.sequence, 9);
     assert_eq!(appended.data_durability_syncs, 2);
     drop(segment);
+
+    let private_selection = LocalJournalSegmentV2Selection::new(
+        "private.journal-v2",
+        Uuid::from_u128(5),
+        Uuid::from_u128(4),
+        10,
+    )
+    .unwrap();
+    LocalJournalSegmentV2::<ExternalJournalKind>::prepare_single_writer(&dir, &private_selection)
+        .unwrap();
+    let (private_segment, private_recovery) =
+        LocalJournalSegmentV2::<ExternalJournalKind>::open_selected(&dir, &private_selection)
+            .unwrap();
+    assert_eq!(private_recovery.frames_recovered, 0);
+    drop(private_segment);
     drop(dir);
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -236,6 +251,9 @@ fn durable_publication_exposes_create_replace_and_retire_to_a_consumer() {
         .publish_new_exact("schema-2-anchor", b"old")
         .unwrap();
     publication
+        .publish_new_exact_single_writer("private-schema-2-anchor", b"private")
+        .unwrap();
+    publication
         .replace_exact("schema-2-anchor", b"old", b"new")
         .unwrap();
     publication
@@ -245,6 +263,10 @@ fn durable_publication_exposes_create_replace_and_retire_to_a_consumer() {
     assert_eq!(
         std::fs::read(root.join(".retired-schema-2-anchor")).unwrap(),
         b"new"
+    );
+    assert_eq!(
+        std::fs::read(root.join("private-schema-2-anchor")).unwrap(),
+        b"private"
     );
     drop(publication);
     drop(dir);

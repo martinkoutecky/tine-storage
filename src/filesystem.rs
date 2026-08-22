@@ -325,6 +325,31 @@ impl DurableDirectoryPublication {
         }
     }
 
+    /// Create one previously absent authority name while the caller holds the
+    /// sole writer lease for this private namespace.
+    ///
+    /// This has the same exact-byte and no-overwrite contract as
+    /// [`Self::publish_new_exact`]. On Android only, a denied hard-link based
+    /// no-replace installation may fall back to an ordinary same-directory
+    /// atomic rename after proving that the target is absent. Shared/provider
+    /// namespaces must continue to use [`Self::publish_new_exact`].
+    pub fn publish_new_exact_single_writer(
+        &self,
+        name: &str,
+        bytes: &[u8],
+    ) -> Result<(), FilesystemError> {
+        validate_single_entry_name(name)?;
+        #[cfg(windows)]
+        {
+            self.windows.validate()?;
+            return self.windows.publish_new_exact(&self.dir, name, bytes);
+        }
+        #[cfg(not(windows))]
+        {
+            publish_immutable_exact_single_writer(&self.dir, name, bytes)
+        }
+    }
+
     /// Replace `name` only when it still contains `expected`, then reopen and
     /// verify the exact replacement.
     ///
@@ -1918,6 +1943,25 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::AlreadyExists);
         assert_eq!(fixture.dir.read("final").unwrap(), b"exact bytes");
         assert_eq!(fixture.dir.read("other-temporary").unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn durable_directory_single_writer_publication_is_exact_and_never_overwrites() {
+        let fixture = TestDirectory::new("durable-directory-single-writer");
+        let publication = DurableDirectoryPublication::open(&fixture.dir).unwrap();
+        publication
+            .publish_new_exact_single_writer("entry", b"exact bytes")
+            .unwrap();
+        publication
+            .publish_new_exact_single_writer("entry", b"exact bytes")
+            .unwrap();
+        assert_eq!(fixture.dir.read("entry").unwrap(), b"exact bytes");
+
+        assert!(matches!(
+            publication.publish_new_exact_single_writer("entry", b"replacement"),
+            Err(FilesystemError::ByteCollision)
+        ));
+        assert_eq!(fixture.dir.read("entry").unwrap(), b"exact bytes");
     }
 
     #[test]

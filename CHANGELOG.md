@@ -7,6 +7,14 @@ independently in `src/formats.rs` and summarized in
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-08-22
+
+### Fixed
+
+- Android app-private journal-v2 segment, frontier, and selector publication
+  can use the existing sole-writer atomic-rename fallback when hard links are
+  unavailable, while strict shared/provider publication remains unchanged.
+
 ## [0.8.5] - 2026-08-15
 
 ### Fixed
@@ -286,7 +294,11 @@ independently in `src/formats.rs` and summarized in
 - Generated public-API inventory and a production/test-support boundary gate.
 - Machine-readable persistent-format manifest.
 
-[Unreleased]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.2...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.6...HEAD
+[0.8.6]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.5...v0.8.6
+[0.8.5]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.4...v0.8.5
+[0.8.4]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.3...v0.8.4
+[0.8.3]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.1...v0.8.2
 [0.8.1]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/martinkoutecky/tine-storage/compare/v0.7.0...v0.8.0

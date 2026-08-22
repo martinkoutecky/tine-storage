@@ -20,12 +20,12 @@ use crate::local_journal::{
     LocalJournalPayloadKind, LocalJournalRecovery, LocalJournalStats,
     MAX_LOCAL_JOURNAL_FRAME_BYTES, MAX_LOCAL_JOURNAL_SEGMENT_BYTES, MIN_FRAME_BYTES,
 };
-#[cfg(not(windows))]
-use crate::publish_immutable_exact;
 #[cfg(unix)]
 use crate::sync_dir_required;
 #[cfg(windows)]
 use crate::DurableDirectoryPublication;
+#[cfg(not(windows))]
+use crate::{publish_immutable_exact, publish_immutable_exact_single_writer};
 use crate::{read_required_regular, ContentDigest, FilesystemError};
 
 pub const LOCAL_JOURNAL_SEGMENT_PROTOCOL_VERSION: u32 = 2;
@@ -364,6 +364,28 @@ impl<K: LocalJournalPayloadKind> LocalJournalSegmentV2<K> {
         dir: &Dir,
         selection: &LocalJournalSegmentV2Selection,
     ) -> Result<(), LocalJournalError> {
+        Self::prepare_with_publication(dir, selection, false)
+    }
+
+    /// Prepare a non-authoritative v2 segment/header pair while the caller
+    /// holds the sole writer lease for this private namespace.
+    ///
+    /// The strict [`Self::prepare`] API remains the boundary for shared or
+    /// provider-visible namespaces. This variant differs only on Android,
+    /// where a denied hard-link installation may use the private single-writer
+    /// atomic-rename fallback without overwriting an observed target.
+    pub fn prepare_single_writer(
+        dir: &Dir,
+        selection: &LocalJournalSegmentV2Selection,
+    ) -> Result<(), LocalJournalError> {
+        Self::prepare_with_publication(dir, selection, true)
+    }
+
+    fn prepare_with_publication(
+        dir: &Dir,
+        selection: &LocalJournalSegmentV2Selection,
+        single_writer: bool,
+    ) -> Result<(), LocalJournalError> {
         let header = SegmentHeaderV2::for_selection(selection);
         #[cfg(windows)]
         let publication =
@@ -376,13 +398,20 @@ impl<K: LocalJournalPayloadKind> LocalJournalSegmentV2<K> {
             &header.encode(),
         )?;
         #[cfg(not(windows))]
-        create_exact_durable(dir, selection.segment_name(), &header.encode())?;
+        create_exact_durable(
+            dir,
+            selection.segment_name(),
+            &header.encode(),
+            single_writer,
+        )?;
 
         let frontier = FrontierV2::initial(header).encode();
         #[cfg(windows)]
         create_exact_durable_with_publication(&publication, selection.frontier_name(), &frontier)?;
         #[cfg(not(windows))]
-        create_exact_durable(dir, selection.frontier_name(), &frontier)?;
+        create_exact_durable(dir, selection.frontier_name(), &frontier, single_writer)?;
+        #[cfg(windows)]
+        let _ = single_writer;
         Ok(())
     }
 
@@ -869,8 +898,18 @@ fn read_complete_frame<K: LocalJournalPayloadKind>(
 }
 
 #[cfg(not(windows))]
-fn create_exact_durable(dir: &Dir, name: &str, bytes: &[u8]) -> Result<(), LocalJournalError> {
-    publish_immutable_exact(dir, name, bytes).map_err(|error| match error {
+fn create_exact_durable(
+    dir: &Dir,
+    name: &str,
+    bytes: &[u8],
+    single_writer: bool,
+) -> Result<(), LocalJournalError> {
+    let publication = if single_writer {
+        publish_immutable_exact_single_writer(dir, name, bytes)
+    } else {
+        publish_immutable_exact(dir, name, bytes)
+    };
+    publication.map_err(|error| match error {
         FilesystemError::ByteCollision | FilesystemError::StoredLengthMismatch { .. } => {
             LocalJournalError::PreparedArtifactExists(name.to_owned())
         }
@@ -1214,6 +1253,33 @@ mod tests {
             LocalJournalSegmentV2::<TestKind>::prepare(&fixture.dir, &conflicting),
             Err(LocalJournalError::PreparedArtifactExists(_))
         ));
+    }
+
+    #[test]
+    fn single_writer_prepare_is_exact_idempotent_and_never_rebinds_selection() {
+        let fixture = Fixture::new("single-writer-prepare");
+        let selection = fixture.selection();
+        LocalJournalSegmentV2::<TestKind>::prepare_single_writer(&fixture.dir, &selection).unwrap();
+        let header = fixture.bytes(selection.segment_name());
+        let frontier = fixture.bytes(selection.frontier_name());
+
+        LocalJournalSegmentV2::<TestKind>::prepare_single_writer(&fixture.dir, &selection).unwrap();
+        assert_eq!(fixture.bytes(selection.segment_name()), header);
+        assert_eq!(fixture.bytes(selection.frontier_name()), frontier);
+
+        let conflicting = LocalJournalSegmentV2Selection::new(
+            selection.segment_name(),
+            Uuid::from_u128(0x9999),
+            selection.device_id(),
+            selection.base_sequence(),
+        )
+        .unwrap();
+        assert!(matches!(
+            LocalJournalSegmentV2::<TestKind>::prepare_single_writer(&fixture.dir, &conflicting,),
+            Err(LocalJournalError::PreparedArtifactExists(_))
+        ));
+        assert_eq!(fixture.bytes(selection.segment_name()), header);
+        assert_eq!(fixture.bytes(selection.frontier_name()), frontier);
     }
 
     #[test]
