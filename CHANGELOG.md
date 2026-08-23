@@ -7,6 +7,8 @@ independently in `src/formats.rs` and summarized in
 
 ## [Unreleased]
 
+## [0.8.8] - 2026-08-23
+
 ### Added
 
 - SQLite materialized reads can seek and paginate one logical page namespace
