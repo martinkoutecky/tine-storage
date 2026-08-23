@@ -3667,6 +3667,29 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         )
     }
 
+    /// Bounded lightweight candidates for one normalized logical page name.
+    pub fn navigation_pages_by_name_key_with_header_validation(
+        &self,
+        name_key: &str,
+        limit: usize,
+        mut validate_header: impl FnMut(&str, i64) -> Result<(), MaterializationError>,
+    ) -> Result<Vec<PhysicalNavigationPageRow>, MaterializationError> {
+        let limit = checked_limit(limit)?;
+        checked_query_text(name_key)?;
+        let mut statement = self.connection.prepare(
+            "SELECT page_id, name, name_key, path, text_kind, preamble
+             FROM pages WHERE name_key = ?1
+             ORDER BY page_id LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![name_key, limit], |row| {
+            navigation_page_row_with_header_validation(row, &mut validate_header)
+        })?;
+        collect_read_rows(
+            rows.map(|row| row.map_err(MaterializationError::from).and_then(|row| row)),
+            navigation_page_row_output_bytes,
+        )
+    }
+
     /// Stable bounded lookup of descendants in one Logseq namespace.
     ///
     /// The appended `/` is an ASCII byte and its exclusive successor is `0`,

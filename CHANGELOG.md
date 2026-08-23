@@ -7,6 +7,13 @@ independently in `src/formats.rs` and summarized in
 
 ## [Unreleased]
 
+## [0.8.9] - 2026-08-23
+
+### Added
+
+- Logical page-name point lookups can return the same lightweight navigation
+  rows as namespace seeks, avoiding page-body reads during rename planning.
+
 ## [0.8.8] - 2026-08-23
 
 ### Added
