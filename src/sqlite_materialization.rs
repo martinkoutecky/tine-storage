@@ -3667,6 +3667,72 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         )
     }
 
+    /// Stable bounded lookup of descendants in one Logseq namespace.
+    ///
+    /// The appended `/` is an ASCII byte and its exclusive successor is `0`,
+    /// so `[parent/, parent0)` is exactly the binary-collation range of keys
+    /// beginning with `parent/`. The existing `(name_key, page_id)` index can
+    /// therefore seek directly to the namespace instead of scanning pages.
+    pub fn navigation_pages_by_name_key_namespace_after_with_header_validation(
+        &self,
+        parent_name_key: &str,
+        after_name_key: Option<&str>,
+        after_page_id: Option<&[u8; 16]>,
+        limit: usize,
+        mut validate_header: impl FnMut(&str, i64) -> Result<(), MaterializationError>,
+    ) -> Result<Vec<PhysicalNavigationPageRow>, MaterializationError> {
+        let limit = checked_limit(limit)?;
+        checked_query_text(parent_name_key)?;
+        if parent_name_key.is_empty() {
+            return Err(MaterializationError::InvalidQuery(
+                "page namespace parent key must not be empty".into(),
+            ));
+        }
+        if after_name_key.is_some() != after_page_id.is_some() {
+            return Err(MaterializationError::InvalidQuery(
+                "page namespace cursor requires both name key and page ID".into(),
+            ));
+        }
+        if let Some(after) = after_name_key {
+            checked_query_text(after)?;
+        }
+        let lower = format!("{parent_name_key}/");
+        let upper = format!("{parent_name_key}0");
+        let (sql, args): (&str, Vec<rusqlite::types::Value>) = match (after_name_key, after_page_id)
+        {
+            (None, None) => (
+                "SELECT page_id, name, name_key, path, text_kind, preamble
+                     FROM pages
+                     WHERE name_key >= ?1 AND name_key < ?2
+                     ORDER BY name_key, page_id LIMIT ?3",
+                vec![lower.into(), upper.into(), limit.into()],
+            ),
+            (Some(after), Some(page_id)) => (
+                "SELECT page_id, name, name_key, path, text_kind, preamble
+                     FROM pages
+                     WHERE name_key >= ?1 AND name_key < ?2
+                       AND (name_key > ?3 OR (name_key = ?3 AND page_id > ?4))
+                     ORDER BY name_key, page_id LIMIT ?5",
+                vec![
+                    lower.into(),
+                    upper.into(),
+                    after.to_owned().into(),
+                    page_id.to_vec().into(),
+                    limit.into(),
+                ],
+            ),
+            _ => unreachable!("cursor presence was validated above"),
+        };
+        let mut statement = self.connection.prepare(sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
+            navigation_page_row_with_header_validation(row, &mut validate_header)
+        })?;
+        collect_read_rows(
+            rows.map(|row| row.map_err(MaterializationError::from).and_then(|row| row)),
+            navigation_page_row_output_bytes,
+        )
+    }
+
     /// Stable, deduplicated alias declarations joined to their owning page.
     /// The cursor is the final `(owner_path, normalized_alias, source_page_id)`.
     pub fn navigation_aliases_after(

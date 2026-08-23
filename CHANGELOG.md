@@ -7,6 +7,12 @@ independently in `src/formats.rs` and summarized in
 
 ## [Unreleased]
 
+### Added
+
+- SQLite materialized reads can seek and paginate one logical page namespace
+  through the existing `(name_key, page_id)` index, without enumerating the
+  complete page inventory or loading page bodies.
+
 ## [0.8.7] - 2026-08-23
 
 ### Added
