@@ -7,6 +7,15 @@ independently in `src/formats.rs` and summarized in
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-08-23
+
+### Added
+
+- Adaptive authenticated-tree traversals can hold one scratch page-file read
+  session while discovering child nodes. Every page retains its canonical
+  decode, digest, binding, and accounting checks, without repeating the file
+  lock, append-buffer flush, and end-position refresh for every immutable node.
+
 ## [0.8.6] - 2026-08-22
 
 ### Fixed
@@ -294,7 +303,8 @@ independently in `src/formats.rs` and summarized in
 - Generated public-API inventory and a production/test-support boundary gate.
 - Machine-readable persistent-format manifest.
 
-[Unreleased]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.6...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.7...HEAD
+[0.8.7]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.6...v0.8.7
 [0.8.6]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.3...v0.8.4

@@ -127,7 +127,7 @@ pub use packed_patricia::{
 pub use scratch::{
     census_retained_runs, reclaim_unreachable_retained_runs, RetainedRunCensus,
     RetainedRunReclamation, ScratchBlobRef, ScratchConstructionBoundary, ScratchLookupSession,
-    ScratchLookupSessionStats, ScratchLsmRoot, ScratchOperationStats, ScratchPageRef,
-    ScratchPageTag, ScratchRetention, ScratchRun, ScratchRunError, ScratchRunLifecycleStats,
-    ScratchSegmentRef,
+    ScratchLookupSessionStats, ScratchLsmRoot, ScratchOperationStats, ScratchPageReader,
+    ScratchPageRef, ScratchPageTag, ScratchRetention, ScratchRun, ScratchRunError,
+    ScratchRunLifecycleStats, ScratchSegmentRef,
 };
