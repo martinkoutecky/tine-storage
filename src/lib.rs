@@ -72,12 +72,13 @@ pub mod sqlite {
         PhysicalPagePortablePathClaim, PhysicalPageReferrerCandidateRow, PhysicalPageRow,
         PhysicalPlainTextCandidatePageRow, PhysicalProperty, PhysicalPropertyFacetRow,
         PhysicalPropertyRow, PhysicalReference, PhysicalReferencePosting, PhysicalReferenceTarget,
-        PhysicalReferrerRow, PhysicalSearchHit, PhysicalTagRow, PhysicalTask,
-        PhysicalTaskCandidateBlockRow, PhysicalTaskCandidateLocatorRow,
-        PhysicalTaskCandidatePageRow, PhysicalTaskRow, PhysicalTerminalConstructionBatch,
-        PhysicalTerminalMaterializationChunk, PhysicalTerminalProjectionStamp,
-        SqliteGraphProjectionRead, SqliteMaterializedRead, MAX_MATERIALIZATION_QUERY_BYTES,
-        MAX_MATERIALIZATION_QUERY_ROWS, MAX_MATERIALIZATION_READ_BYTES,
+        PhysicalReferrerRow, PhysicalSearchHit, PhysicalSearchIndexBuildStep,
+        PhysicalSearchIndexStatus, PhysicalTagRow, PhysicalTask, PhysicalTaskCandidateBlockRow,
+        PhysicalTaskCandidateLocatorRow, PhysicalTaskCandidatePageRow, PhysicalTaskRow,
+        PhysicalTerminalConstructionBatch, PhysicalTerminalMaterializationChunk,
+        PhysicalTerminalProjectionStamp, SqliteGraphProjectionRead, SqliteMaterializedRead,
+        MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
+        MAX_MATERIALIZATION_READ_BYTES,
     };
 
     #[cfg(feature = "test-support")]

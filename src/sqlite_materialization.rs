@@ -3,7 +3,7 @@
 //! This module owns disposable SQL shape and bounded physical reads. Inputs are
 //! lowered and semantically validated by tine-core before they cross this boundary.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use rusqlite::{
@@ -259,6 +259,41 @@ pub struct ApplyChangeInstrumentation {
     pub cleanup_existing_pages: usize,
     pub cleanup_owned_rows: usize,
     pub cleanup_fts_rowids: usize,
+    /// Logical entities changed in both FTS families. These counters are
+    /// incremented at the authored statement boundary; FTS5 shadow-table
+    /// writes are deliberately not observed.
+    pub fts_page_rows: usize,
+    pub fts_block_rows: usize,
+    pub fts_standard_rows: usize,
+    pub fts_substring_rows: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalSearchIndexStatus {
+    Building { horizon_sequence: u64 },
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PhysicalSearchIndexBuildStep {
+    pub source_rows_indexed: usize,
+    pub outbox_rows_applied: usize,
+    pub ready: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FtsEntityRow {
+    entity_type: i64,
+    entity_id: [u8; 16],
+    page_id: [u8; 16],
+    text: String,
+    normalized_text: String,
+}
+
+impl FtsEntityRow {
+    const fn key(&self) -> (i64, [u8; 16]) {
+        (self.entity_type, self.entity_id)
+    }
 }
 
 pub const MATERIALIZATION_STAMP_DDL: &str = "CREATE TABLE materialization_stamp (
@@ -270,6 +305,34 @@ pub const MATERIALIZATION_BATCHES_DDL: &str = "CREATE TABLE materialization_batc
     acceptance_sequence INTEGER PRIMARY KEY CHECK (acceptance_sequence > 0),
     batch_id BLOB NOT NULL UNIQUE CHECK (length(batch_id) = 16),
     input_digest BLOB NOT NULL CHECK (length(input_digest) = 32)
+) WITHOUT ROWID, STRICT";
+pub const SEARCH_FTS_BUILD_DDL: &str = "CREATE TABLE search_fts_build (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    phase INTEGER NOT NULL CHECK (phase IN (0, 1, 2)),
+    horizon_sequence INTEGER NOT NULL CHECK (horizon_sequence >= 0),
+    cursor_entity_type INTEGER CHECK (cursor_entity_type IN (0, 1)),
+    cursor_entity_id BLOB CHECK (
+        cursor_entity_id IS NULL OR length(cursor_entity_id) = 16
+    ),
+    CHECK (
+        (cursor_entity_type IS NULL AND cursor_entity_id IS NULL)
+        OR (cursor_entity_type IS NOT NULL AND cursor_entity_id IS NOT NULL)
+    )
+) WITHOUT ROWID, STRICT";
+pub const SEARCH_FTS_OUTBOX_DDL: &str = "CREATE TABLE search_fts_outbox (
+    entity_type INTEGER NOT NULL CHECK (entity_type IN (0, 1)),
+    entity_id BLOB NOT NULL CHECK (length(entity_id) = 16),
+    acceptance_sequence INTEGER NOT NULL CHECK (acceptance_sequence >= 0),
+    page_id BLOB CHECK (page_id IS NULL OR length(page_id) = 16),
+    text TEXT,
+    normalized_text TEXT,
+    tombstone INTEGER NOT NULL CHECK (tombstone IN (0, 1)),
+    CHECK (
+        (tombstone = 1 AND page_id IS NULL AND text IS NULL AND normalized_text IS NULL)
+        OR (tombstone = 0 AND page_id IS NOT NULL AND text IS NOT NULL
+            AND normalized_text IS NOT NULL)
+    ),
+    PRIMARY KEY (entity_type, entity_id)
 ) WITHOUT ROWID, STRICT";
 pub const REFERENCE_POSTINGS_DDL: &str = "CREATE TABLE reference_postings (
     source_page_id BLOB NOT NULL CHECK (length(source_page_id) = 16),
@@ -354,7 +417,10 @@ pub const PAGES_DDL: &str = "CREATE TABLE pages (
     path TEXT NOT NULL CHECK (length(CAST(path AS BLOB)) BETWEEN 1 AND 4194304),
     text_kind INTEGER NOT NULL CHECK (text_kind IN (0, 1)),
     preamble TEXT CHECK (preamble IS NULL OR length(CAST(preamble AS BLOB)) <= 16777216),
-    searchable_text TEXT NOT NULL CHECK (length(CAST(searchable_text AS BLOB)) <= 4194304)
+    searchable_text TEXT NOT NULL CHECK (length(CAST(searchable_text AS BLOB)) <= 4194304),
+    normalized_searchable_text TEXT NOT NULL CHECK (
+        length(CAST(normalized_searchable_text AS BLOB)) <= 4194304
+    )
 ) STRICT";
 pub const PAGE_PORTABLE_PATH_CLAIMS_DDL: &str = "CREATE TABLE page_portable_path_claims (
     page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16)
@@ -372,6 +438,9 @@ pub const BLOCKS_DDL: &str = "CREATE TABLE blocks (
     order_key TEXT NOT NULL CHECK (length(CAST(order_key AS BLOB)) BETWEEN 1 AND 4194304),
     content TEXT NOT NULL CHECK (length(CAST(content AS BLOB)) <= 4194304),
     searchable_text TEXT NOT NULL CHECK (length(CAST(searchable_text AS BLOB)) <= 4194304),
+    normalized_searchable_text TEXT NOT NULL CHECK (
+        length(CAST(normalized_searchable_text AS BLOB)) <= 4194304
+    ),
     heading_level INTEGER CHECK (
         heading_level IS NULL OR heading_level BETWEEN 1 AND 6
     ),
@@ -601,7 +670,7 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 22] = [
     ("tasks_page_idx", TASKS_PAGE_INDEX_DDL),
 ];
 
-const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 17] = [
+const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 19] = [
     (
         "materialization_stamp",
         &["singleton", "acceptance_sequence", "frontier_root_digest"],
@@ -654,6 +723,7 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 17] = [
             "text_kind",
             "preamble",
             "searchable_text",
+            "normalized_searchable_text",
         ],
     ),
     (
@@ -670,6 +740,7 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 17] = [
             "order_key",
             "content",
             "searchable_text",
+            "normalized_searchable_text",
             "heading_level",
             "collapsed",
             "logseq_uuid",
@@ -746,9 +817,31 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 17] = [
         "search_fts_owners",
         &["rowid", "entity_type", "entity_id", "page_id"],
     ),
+    (
+        "search_fts_build",
+        &[
+            "singleton",
+            "phase",
+            "horizon_sequence",
+            "cursor_entity_type",
+            "cursor_entity_id",
+        ],
+    ),
+    (
+        "search_fts_outbox",
+        &[
+            "entity_type",
+            "entity_id",
+            "acceptance_sequence",
+            "page_id",
+            "text",
+            "normalized_text",
+            "tombstone",
+        ],
+    ),
 ];
 
-const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 40] = [
+const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 42] = [
     ("table", "materialization_stamp", MATERIALIZATION_STAMP_DDL),
     (
         "table",
@@ -796,6 +889,8 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 40] = [
     ("table", "search_fts_owners", SEARCH_FTS_OWNERS_DDL),
     ("table", "search_fts", SEARCH_FTS_DDL),
     ("table", "search_substring_fts", SEARCH_SUBSTRING_FTS_DDL),
+    ("table", "search_fts_build", SEARCH_FTS_BUILD_DDL),
+    ("table", "search_fts_outbox", SEARCH_FTS_OUTBOX_DDL),
     ("index", "pages_name_idx", PAGES_NAME_INDEX_DDL),
     ("index", "pages_name_key_idx", PAGES_NAME_KEY_INDEX_DDL),
     ("index", "pages_path_idx", PAGES_PATH_INDEX_DDL),
@@ -910,6 +1005,8 @@ pub(crate) fn initialize_graph_projection_schema(
          {SEARCH_FTS_OWNERS_DDL};
          {SEARCH_FTS_DDL};
          {SEARCH_SUBSTRING_FTS_DDL};
+         {SEARCH_FTS_BUILD_DDL};
+         {SEARCH_FTS_OUTBOX_DDL};
          {PAGES_NAME_INDEX_DDL};
          {PAGES_NAME_KEY_INDEX_DDL};
          {PAGES_PATH_INDEX_DDL};
@@ -933,6 +1030,12 @@ pub(crate) fn initialize_graph_projection_schema(
          {TASKS_DEADLINE_INDEX_DDL};
          {TASKS_PAGE_INDEX_DDL};"
     ))?;
+    connection.execute(
+        "INSERT INTO search_fts_build (
+             singleton, phase, horizon_sequence, cursor_entity_type, cursor_entity_id
+         ) VALUES (1, 1, 0, NULL, NULL)",
+        [],
+    )?;
     Ok(())
 }
 
@@ -967,6 +1070,16 @@ pub(crate) fn validate_graph_projection_schema(
         "tasks_deadline_idx",
         TASKS_DEADLINE_INDEX_DDL,
     )?;
+    let build_rows: i64 = connection.query_row(
+        "SELECT COUNT(*) FROM search_fts_build WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if build_rows != 1 {
+        return Err(MaterializationError::Corrupt(
+            "search FTS build marker cardinality is invalid".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1323,6 +1436,28 @@ pub fn recorded_digest(
 /// Prove that a fully built disposable candidate's FTS ownership is exact
 /// before publication.
 pub fn finalize_fresh_bootstrap(connection: &Connection) -> Result<(), MaterializationError> {
+    let phase = fts_build_phase(connection)?;
+    if phase == 0 {
+        let owner_count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM search_fts_owners", [], |row| {
+                row.get(0)
+            })?;
+        let outbox_count: i64 =
+            connection.query_row("SELECT COUNT(*) FROM search_fts_outbox", [], |row| {
+                row.get(0)
+            })?;
+        if owner_count != 0 || outbox_count != 0 {
+            return Err(MaterializationError::Corrupt(
+                "fresh lazy FTS candidate contains pre-readiness rows".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if phase != 1 {
+        return Err(MaterializationError::Corrupt(
+            "fresh bootstrap retained an unfinished FTS seed phase".into(),
+        ));
+    }
     let owner_count: i64 =
         connection.query_row("SELECT COUNT(*) FROM search_fts_owners", [], |row| {
             row.get(0)
@@ -1365,6 +1500,216 @@ pub fn finalize_fresh_bootstrap(connection: &Connection) -> Result<(), Materiali
     Ok(())
 }
 
+pub(crate) fn search_index_status(
+    connection: &Connection,
+) -> Result<PhysicalSearchIndexStatus, MaterializationError> {
+    let (phase, horizon): (i64, i64) = connection.query_row(
+        "SELECT phase, horizon_sequence FROM search_fts_build WHERE singleton = 1",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let horizon_sequence = u64::try_from(horizon)
+        .map_err(|_| MaterializationError::Corrupt("FTS build horizon is negative".into()))?;
+    match phase {
+        0 => Ok(PhysicalSearchIndexStatus::Building { horizon_sequence }),
+        1 => Ok(PhysicalSearchIndexStatus::Ready),
+        2 => Err(MaterializationError::Corrupt(
+            "published projection retained terminal FTS seed phase".into(),
+        )),
+        _ => Err(MaterializationError::Corrupt(
+            "FTS build phase is outside its schema contract".into(),
+        )),
+    }
+}
+
+fn require_fts_ready(connection: &Connection) -> Result<(), MaterializationError> {
+    match search_index_status(connection)? {
+        PhysicalSearchIndexStatus::Ready => Ok(()),
+        PhysicalSearchIndexStatus::Building { horizon_sequence } => {
+            Err(MaterializationError::SearchIndexBuilding { horizon_sequence })
+        }
+    }
+}
+
+pub(crate) fn advance_search_index_build(
+    connection: &mut Connection,
+    limit: usize,
+) -> Result<PhysicalSearchIndexBuildStep, MaterializationError> {
+    let logical_limit = limit;
+    let limit = checked_limit(limit)?;
+    let transaction = connection.transaction()?;
+    let status = search_index_status(&transaction)?;
+    if matches!(status, PhysicalSearchIndexStatus::Ready) {
+        transaction.commit()?;
+        return Ok(PhysicalSearchIndexBuildStep {
+            ready: true,
+            ..PhysicalSearchIndexBuildStep::default()
+        });
+    }
+    let cursor: Option<(i64, Vec<u8>)> = transaction
+        .query_row(
+            "SELECT cursor_entity_type, cursor_entity_id
+             FROM search_fts_build WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                ))
+            },
+        )
+        .optional()?
+        .and_then(|(entity_type, entity_id)| entity_type.zip(entity_id));
+    let source_rows = {
+        let sql = if cursor.is_some() {
+            "SELECT entity_type, entity_id, page_id, text, normalized_text FROM (
+                 SELECT 0 AS entity_type, page_id AS entity_id, page_id,
+                        searchable_text AS text,
+                        normalized_searchable_text AS normalized_text
+                 FROM pages
+                 UNION ALL
+                 SELECT 1 AS entity_type, block_id AS entity_id, page_id,
+                        searchable_text AS text,
+                        normalized_searchable_text AS normalized_text
+                 FROM blocks
+             )
+             WHERE entity_type > ?1 OR (entity_type = ?1 AND entity_id > ?2)
+             ORDER BY entity_type, entity_id LIMIT ?3"
+        } else {
+            "SELECT entity_type, entity_id, page_id, text, normalized_text FROM (
+                 SELECT 0 AS entity_type, page_id AS entity_id, page_id,
+                        searchable_text AS text,
+                        normalized_searchable_text AS normalized_text
+                 FROM pages
+                 UNION ALL
+                 SELECT 1 AS entity_type, block_id AS entity_id, page_id,
+                        searchable_text AS text,
+                        normalized_searchable_text AS normalized_text
+                 FROM blocks
+             ) ORDER BY entity_type, entity_id LIMIT ?1"
+        };
+        let mut statement = transaction.prepare(sql)?;
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<FtsEntityRow> {
+            let entity_id = row.get::<_, Vec<u8>>(1)?;
+            let page_id = row.get::<_, Vec<u8>>(2)?;
+            Ok(FtsEntityRow {
+                entity_type: row.get(0)?,
+                entity_id: decode_id_sql(&entity_id)?,
+                page_id: decode_id_sql(&page_id)?,
+                text: row.get(3)?,
+                normalized_text: row.get(4)?,
+            })
+        };
+        let rows = match cursor.as_ref() {
+            Some((entity_type, entity_id)) => statement.query_map(
+                params![
+                    entity_type,
+                    entity_id,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                map_row,
+            )?,
+            None => {
+                statement.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], map_row)?
+            }
+        };
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for row in &source_rows {
+        delete_fts_entity(&transaction, row.entity_type, row.entity_id)?;
+        insert_fts_row(&transaction, row)?;
+    }
+    if let Some(last) = source_rows.last() {
+        transaction.execute(
+            "UPDATE search_fts_build
+             SET cursor_entity_type = ?1, cursor_entity_id = ?2
+             WHERE singleton = 1",
+            params![last.entity_type, last.entity_id.as_slice()],
+        )?;
+    }
+    if source_rows.len() == logical_limit {
+        let step = PhysicalSearchIndexBuildStep {
+            source_rows_indexed: source_rows.len(),
+            ..PhysicalSearchIndexBuildStep::default()
+        };
+        transaction.commit()?;
+        return Ok(step);
+    }
+
+    let outbox_rows = {
+        let mut statement = transaction.prepare(
+            "SELECT entity_type, entity_id, page_id, text, normalized_text, tombstone
+             FROM search_fts_outbox
+             ORDER BY acceptance_sequence, entity_type, entity_id LIMIT ?1",
+        )?;
+        let rows =
+            statement.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (entity_type, entity_id, page_id, text, normalized_text, tombstone) in &outbox_rows {
+        let entity_id = decode_id(entity_id)?;
+        delete_fts_entity(&transaction, *entity_type, entity_id)?;
+        if *tombstone == 0 {
+            let page_id = page_id
+                .as_deref()
+                .map(decode_id)
+                .transpose()?
+                .ok_or_else(|| {
+                    MaterializationError::Corrupt("live FTS outbox row has no page".into())
+                })?;
+            insert_fts_row(
+                &transaction,
+                &FtsEntityRow {
+                    entity_type: *entity_type,
+                    entity_id,
+                    page_id,
+                    text: text.clone().ok_or_else(|| {
+                        MaterializationError::Corrupt("live FTS outbox row has no text".into())
+                    })?,
+                    normalized_text: normalized_text.clone().ok_or_else(|| {
+                        MaterializationError::Corrupt(
+                            "live FTS outbox row has no normalized text".into(),
+                        )
+                    })?,
+                },
+            )?;
+        }
+        transaction.execute(
+            "DELETE FROM search_fts_outbox WHERE entity_type = ?1 AND entity_id = ?2",
+            params![entity_type, entity_id.as_slice()],
+        )?;
+    }
+    let remaining: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM search_fts_outbox", [], |row| {
+            row.get(0)
+        })?;
+    let ready = remaining == 0;
+    if ready {
+        transaction.execute(
+            "UPDATE search_fts_build
+             SET phase = 1, cursor_entity_type = NULL, cursor_entity_id = NULL
+             WHERE singleton = 1",
+            [],
+        )?;
+    }
+    let step = PhysicalSearchIndexBuildStep {
+        source_rows_indexed: source_rows.len(),
+        outbox_rows_applied: outbox_rows.len(),
+        ready,
+    };
+    transaction.commit()?;
+    Ok(step)
+}
+
 /// One bounded chunk of terminal bootstrap rows.
 ///
 /// Terminal construction seeds an unpublished candidate whose materialized
@@ -1404,7 +1749,7 @@ pub struct PhysicalTerminalProjectionStamp {
     pub frontier_root_digest: ContentDigest,
 }
 
-const TERMINAL_CONSTRUCTION_EMPTY_TABLES: [&str; 18] = [
+const TERMINAL_CONSTRUCTION_EMPTY_TABLES: [&str; 19] = [
     "pages",
     "page_portable_path_claims",
     "blocks",
@@ -1419,6 +1764,7 @@ const TERMINAL_CONSTRUCTION_EMPTY_TABLES: [&str; 18] = [
     "search_fts_owners",
     "search_fts",
     "search_substring_fts",
+    "search_fts_outbox",
     "reference_postings",
     "reference_alias_declarations",
     "reference_alias_bindings",
@@ -1453,6 +1799,13 @@ pub(crate) fn begin_terminal_construction_in_open_candidate(
             "terminal construction requires an unstamped candidate".into(),
         ));
     }
+    transaction.execute(
+        "UPDATE search_fts_build
+         SET phase = 2, horizon_sequence = 0,
+             cursor_entity_type = NULL, cursor_entity_id = NULL
+         WHERE singleton = 1",
+        [],
+    )?;
     for (name, _) in TERMINAL_DEFERRED_INDEXES {
         transaction.execute(&format!("DROP INDEX {name}"), [])?;
     }
@@ -1542,6 +1895,15 @@ pub(crate) fn finish_terminal_graph_projection_in_open_candidate(
             })?,
             stamp.frontier_root_digest.as_bytes().as_slice(),
         ],
+    )?;
+    transaction.execute(
+        "UPDATE search_fts_build
+         SET phase = 0, horizon_sequence = ?1,
+             cursor_entity_type = NULL, cursor_entity_id = NULL
+         WHERE singleton = 1",
+        params![i64::try_from(stamp.acceptance_sequence).map_err(|_| {
+            MaterializationError::Corrupt("acceptance sequence exceeds SQLite".into())
+        })?],
     )?;
     Ok(())
 }
@@ -1688,8 +2050,12 @@ fn apply_change_inner(
     post_frontier_digest: ContentDigest,
 ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
     validate_preserved_page_metadata(transaction, change)?;
-    let instrumentation =
-        apply_graph_projection_rows(transaction, &change.replacements, &change.deletions)?;
+    let instrumentation = apply_graph_projection_rows(
+        transaction,
+        &change.replacements,
+        &change.deletions,
+        Some(sequence),
+    )?;
     let derived = PhysicalGraphProjectionChange {
         replacements: change.replacements.clone(),
         deletions: change.deletions.clone(),
@@ -1897,6 +2263,7 @@ pub(crate) fn apply_graph_projection_rows(
     transaction: &Connection,
     replacements: &[PhysicalPage],
     deletions: &[[u8; 16]],
+    acceptance_sequence: Option<u64>,
 ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
     // A block can move between two replacement pages. Keep its inbound refs
     // through every cleanup pass, then remove every old owner before inserting
@@ -1905,6 +2272,12 @@ pub(crate) fn apply_graph_projection_rows(
         .iter()
         .flat_map(|page| page.blocks.iter().map(|block| block.block_id))
         .collect::<BTreeSet<_>>();
+    let affected_pages = replacements
+        .iter()
+        .map(|page| page.page_id)
+        .chain(deletions.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let old_fts = load_fts_source_rows(transaction, &affected_pages)?;
     let mut instrumentation = ApplyChangeInstrumentation::default();
     for page_id in deletions {
         let cleanup = delete_page(transaction, *page_id, true, &retained_blocks)?;
@@ -1923,6 +2296,14 @@ pub(crate) fn apply_graph_projection_rows(
     for page in replacements {
         insert_page(transaction, page)?;
     }
+    let new_fts = replacement_fts_rows(replacements)?;
+    reconcile_fts_rows(
+        transaction,
+        old_fts,
+        new_fts,
+        acceptance_sequence,
+        &mut instrumentation,
+    )?;
     Ok(instrumentation)
 }
 
@@ -2142,7 +2523,12 @@ pub(crate) fn reset_graph_projection_rows(
     transaction: &Connection,
 ) -> Result<(), MaterializationError> {
     transaction.execute_batch(
-        "DELETE FROM search_substring_fts;
+        "DELETE FROM search_fts_outbox;
+         UPDATE search_fts_build
+         SET phase = 1, horizon_sequence = 0,
+             cursor_entity_type = NULL, cursor_entity_id = NULL
+         WHERE singleton = 1;
+         DELETE FROM search_substring_fts;
          DELETE FROM search_fts;
          DELETE FROM search_fts_owners;
          DELETE FROM tasks;
@@ -2199,28 +2585,6 @@ fn delete_page(
             .collect::<Result<Vec<_>, _>>()?;
         block_ids
     };
-    let fts_rowids = {
-        let mut statement = transaction
-            .prepare("SELECT rowid FROM search_fts_owners WHERE page_id = ?1 ORDER BY rowid")?;
-        let rowids = statement
-            .query_map(params![page.as_slice()], |row| row.get::<_, i64>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        rowids
-    };
-    instrumentation.fts_rowids = fts_rowids.len();
-    for rowid in fts_rowids {
-        transaction.execute(
-            "DELETE FROM search_substring_fts WHERE rowid = ?1",
-            params![rowid],
-        )?;
-        transaction.execute("DELETE FROM search_fts WHERE rowid = ?1", params![rowid])?;
-    }
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM search_fts_owners WHERE page_id = ?1",
-            params![page.as_slice()],
-        )?);
     instrumentation.owned_rows = instrumentation
         .owned_rows
         .saturating_add(transaction.execute(
@@ -2295,8 +2659,8 @@ fn insert_page(transaction: &Connection, page: &PhysicalPage) -> Result<(), Mate
         transaction,
         "INSERT INTO pages (
              page_id, home_document_id, name, name_key, path, text_kind,
-             preamble, searchable_text
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             preamble, searchable_text, normalized_searchable_text
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             page_id.as_slice(),
             page.home_document_id.as_slice(),
@@ -2306,15 +2670,8 @@ fn insert_page(transaction: &Connection, page: &PhysicalPage) -> Result<(), Mate
             page.text_kind,
             &page.preamble,
             &page.searchable_text,
+            &page.normalized_searchable_text,
         ],
-    )?;
-    insert_fts(
-        transaction,
-        "page",
-        page.page_id,
-        page.page_id,
-        &page.searchable_text,
-        &page.normalized_searchable_text,
     )?;
     insert_references(
         transaction,
@@ -2359,9 +2716,9 @@ fn insert_block(
         transaction,
         "INSERT INTO blocks (
              block_id, page_id, home_document_id, parent_block_id, order_key,
-             content, searchable_text, heading_level, collapsed, logseq_uuid,
-             logseq_identity_origin
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             content, searchable_text, normalized_searchable_text, heading_level,
+             collapsed, logseq_uuid, logseq_identity_origin
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             block.block_id.as_slice(),
             page_id.as_slice(),
@@ -2370,19 +2727,12 @@ fn insert_block(
             &block.order,
             &block.content,
             &block.searchable_text,
+            &block.normalized_searchable_text,
             block.heading_level.map(i64::from),
             i64::from(block.collapsed),
             logseq_uuid,
             origin,
         ],
-    )?;
-    insert_fts(
-        transaction,
-        "block",
-        block.block_id,
-        page_id,
-        &block.searchable_text,
-        &block.normalized_searchable_text,
     )?;
     let owner = PhysicalEntityId::Block(block.block_id);
     insert_references(transaction, owner, page_id, &block.references)?;
@@ -2407,24 +2757,237 @@ fn insert_block(
     Ok(())
 }
 
-fn insert_fts(
+fn load_fts_source_rows(
     transaction: &Connection,
-    entity_type: &str,
+    page_ids: &BTreeSet<[u8; 16]>,
+) -> Result<BTreeMap<(i64, [u8; 16]), FtsEntityRow>, MaterializationError> {
+    let mut rows = BTreeMap::new();
+    for page_id in page_ids {
+        let page = transaction
+            .query_row(
+                "SELECT searchable_text, normalized_searchable_text
+                 FROM pages WHERE page_id = ?1",
+                params![page_id.as_slice()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((text, normalized_text)) = page {
+            let row = FtsEntityRow {
+                entity_type: 0,
+                entity_id: *page_id,
+                page_id: *page_id,
+                text,
+                normalized_text,
+            };
+            rows.insert(row.key(), row);
+        }
+        let mut statement = transaction.prepare(
+            "SELECT block_id, searchable_text, normalized_searchable_text
+             FROM blocks WHERE page_id = ?1 ORDER BY block_id",
+        )?;
+        let blocks = statement.query_map(params![page_id.as_slice()], |row| {
+            Ok((
+                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for block in blocks {
+            let (block_id, text, normalized_text) = block?;
+            let row = FtsEntityRow {
+                entity_type: 1,
+                entity_id: decode_id(&block_id)?,
+                page_id: *page_id,
+                text,
+                normalized_text,
+            };
+            if rows.insert(row.key(), row).is_some() {
+                return Err(MaterializationError::Corrupt(
+                    "duplicate FTS source entity in graph projection".into(),
+                ));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn replacement_fts_rows(
+    replacements: &[PhysicalPage],
+) -> Result<BTreeMap<(i64, [u8; 16]), FtsEntityRow>, MaterializationError> {
+    let mut rows = BTreeMap::new();
+    for page in replacements {
+        let page_row = FtsEntityRow {
+            entity_type: 0,
+            entity_id: page.page_id,
+            page_id: page.page_id,
+            text: page.searchable_text.clone(),
+            normalized_text: page.normalized_searchable_text.clone(),
+        };
+        if rows.insert(page_row.key(), page_row).is_some() {
+            return Err(MaterializationError::InvalidInput(
+                "replacement pages contain a duplicate page ID".into(),
+            ));
+        }
+        for block in &page.blocks {
+            let block_row = FtsEntityRow {
+                entity_type: 1,
+                entity_id: block.block_id,
+                page_id: page.page_id,
+                text: block.searchable_text.clone(),
+                normalized_text: block.normalized_searchable_text.clone(),
+            };
+            if rows.insert(block_row.key(), block_row).is_some() {
+                return Err(MaterializationError::InvalidInput(
+                    "replacement pages contain a duplicate block ID".into(),
+                ));
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn fts_build_phase(transaction: &Connection) -> Result<i64, MaterializationError> {
+    transaction
+        .query_row(
+            "SELECT phase FROM search_fts_build WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+}
+
+fn delete_fts_entity(
+    transaction: &Connection,
+    entity_type: i64,
     entity_id: [u8; 16],
-    page_id: [u8; 16],
-    text: &str,
-    normalized_text: &str,
+) -> Result<bool, MaterializationError> {
+    let rowid: Option<i64> = transaction
+        .query_row(
+            "SELECT rowid FROM search_fts_owners
+             WHERE entity_type = ?1 AND entity_id = ?2",
+            params![entity_type, entity_id.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(rowid) = rowid else {
+        return Ok(false);
+    };
+    transaction.execute(
+        "DELETE FROM search_substring_fts WHERE rowid = ?1",
+        params![rowid],
+    )?;
+    transaction.execute("DELETE FROM search_fts WHERE rowid = ?1", params![rowid])?;
+    transaction.execute(
+        "DELETE FROM search_fts_owners WHERE rowid = ?1",
+        params![rowid],
+    )?;
+    Ok(true)
+}
+
+fn upsert_fts_outbox(
+    transaction: &Connection,
+    sequence: u64,
+    key: (i64, [u8; 16]),
+    after: Option<&FtsEntityRow>,
 ) -> Result<(), MaterializationError> {
-    if normalized_text.len() > MAX_MATERIALIZATION_FIELD_BYTES {
+    let sequence = i64::try_from(sequence)
+        .map_err(|_| MaterializationError::Corrupt("acceptance sequence exceeds SQLite".into()))?;
+    let (page_id, text, normalized_text, tombstone) = match after {
+        Some(row) => (
+            Some(row.page_id.to_vec()),
+            Some(row.text.as_str()),
+            Some(row.normalized_text.as_str()),
+            0_i64,
+        ),
+        None => (None, None, None, 1_i64),
+    };
+    transaction.execute(
+        "INSERT INTO search_fts_outbox (
+             entity_type, entity_id, acceptance_sequence, page_id,
+             text, normalized_text, tombstone
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+             acceptance_sequence = excluded.acceptance_sequence,
+             page_id = excluded.page_id,
+             text = excluded.text,
+             normalized_text = excluded.normalized_text,
+             tombstone = excluded.tombstone",
+        params![
+            key.0,
+            key.1.as_slice(),
+            sequence,
+            page_id,
+            text,
+            normalized_text,
+            tombstone,
+        ],
+    )?;
+    Ok(())
+}
+
+fn reconcile_fts_rows(
+    transaction: &Connection,
+    old: BTreeMap<(i64, [u8; 16]), FtsEntityRow>,
+    new: BTreeMap<(i64, [u8; 16]), FtsEntityRow>,
+    acceptance_sequence: Option<u64>,
+    instrumentation: &mut ApplyChangeInstrumentation,
+) -> Result<(), MaterializationError> {
+    let phase = fts_build_phase(transaction)?;
+    if phase == 2 {
+        return Ok(());
+    }
+    let keys = old
+        .keys()
+        .chain(new.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for key in keys {
+        let before = old.get(&key);
+        let after = new.get(&key);
+        if before == after {
+            continue;
+        }
+        if key.0 == 0 {
+            instrumentation.fts_page_rows = instrumentation.fts_page_rows.saturating_add(1);
+        } else {
+            instrumentation.fts_block_rows = instrumentation.fts_block_rows.saturating_add(1);
+        }
+        instrumentation.fts_standard_rows = instrumentation.fts_standard_rows.saturating_add(1);
+        instrumentation.fts_substring_rows = instrumentation.fts_substring_rows.saturating_add(1);
+        if phase == 0 {
+            let sequence = acceptance_sequence.ok_or_else(|| {
+                MaterializationError::InvalidInput(
+                    "an FTS-building projection change requires an acceptance sequence".into(),
+                )
+            })?;
+            upsert_fts_outbox(transaction, sequence, key, after)?;
+            continue;
+        }
+        if delete_fts_entity(transaction, key.0, key.1)? {
+            instrumentation.cleanup_fts_rowids =
+                instrumentation.cleanup_fts_rowids.saturating_add(1);
+        }
+        if let Some(after) = after {
+            insert_fts_row(transaction, after)?;
+        }
+    }
+    Ok(())
+}
+
+fn insert_fts_row(
+    transaction: &Connection,
+    row: &FtsEntityRow,
+) -> Result<(), MaterializationError> {
+    if row.normalized_text.len() > MAX_MATERIALIZATION_FIELD_BYTES {
         return Err(resource_limit(
             "normalized searchable text bytes",
-            normalized_text.len(),
+            row.normalized_text.len(),
             MAX_MATERIALIZATION_FIELD_BYTES,
         ));
     }
-    let entity_type_value = match entity_type {
-        "page" => 0_i64,
-        "block" => 1_i64,
+    let entity_type = match row.entity_type {
+        0 => "page",
+        1 => "block",
         _ => {
             return Err(MaterializationError::InvalidInput(
                 "unknown FTS entity type".into(),
@@ -2435,7 +2998,11 @@ fn insert_fts(
         transaction,
         "INSERT INTO search_fts_owners (entity_type, entity_id, page_id)
          VALUES (?1, ?2, ?3)",
-        params![entity_type_value, entity_id.as_slice(), page_id.as_slice(),],
+        params![
+            row.entity_type,
+            row.entity_id.as_slice(),
+            row.page_id.as_slice(),
+        ],
     )?;
     let rowid = transaction.last_insert_rowid();
     execute_cached(
@@ -2446,16 +3013,16 @@ fn insert_fts(
         params![
             rowid,
             entity_type,
-            uuid::Uuid::from_bytes(entity_id).simple().to_string(),
-            uuid::Uuid::from_bytes(page_id).simple().to_string(),
-            text,
-            normalized_text,
+            uuid::Uuid::from_bytes(row.entity_id).simple().to_string(),
+            uuid::Uuid::from_bytes(row.page_id).simple().to_string(),
+            &row.text,
+            &row.normalized_text,
         ],
     )?;
     execute_cached(
         transaction,
         "INSERT INTO search_substring_fts (rowid, normalized_text) VALUES (?1, ?2)",
-        params![rowid, normalized_text],
+        params![rowid, &row.normalized_text],
     )?;
     Ok(())
 }
@@ -4142,6 +4709,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         after: Option<[u8; 16]>,
         limit: usize,
     ) -> Result<Vec<PhysicalPlainTextCandidatePageRow>, MaterializationError> {
+        require_fts_ready(self.connection)?;
         let limit = checked_limit(limit)?;
         checked_query_text(normalized_phrase)?;
         if normalized_phrase.trim().is_empty()
@@ -4216,6 +4784,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
                     ),
                 }
             } else {
+                require_fts_ready(self.connection)?;
                 let phrase = format!("\"{}\"", normalized_needle.replace('"', "\"\""));
                 match after {
                     None => (
@@ -4258,6 +4827,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         after: Option<[u8; 16]>,
         limit: usize,
     ) -> Result<Vec<PhysicalFuzzyCandidatePageRow>, MaterializationError> {
+        require_fts_ready(self.connection)?;
         let limit = checked_limit(limit)?;
         checked_query_text(normalized_needle)?;
         if normalized_needle.is_empty() {
@@ -4757,6 +5327,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         query: &str,
         limit: usize,
     ) -> Result<Vec<PhysicalSearchHit>, MaterializationError> {
+        require_fts_ready(self.connection)?;
         let limit = checked_limit(limit)?;
         checked_query_text(query)?;
         if query.trim().is_empty() {
@@ -5017,6 +5588,9 @@ pub enum MaterializationError {
         materialized: u64,
         frontier: u64,
     },
+    SearchIndexBuilding {
+        horizon_sequence: u64,
+    },
     InvalidQuery(String),
 }
 
@@ -5031,6 +5605,7 @@ impl fmt::Display for MaterializationError {
             Self::Incomplete(error) => write!(f, "incomplete materialization input: {error}"),
             Self::Contradiction(error) => write!(f, "materialization contradicts accepted semantics: {error}"),
             Self::Stale { materialized, frontier } => write!(f, "materialization frontier {materialized} is stale against accepted frontier {frontier}"),
+            Self::SearchIndexBuilding { horizon_sequence } => write!(f, "search index building from projection frontier {horizon_sequence}"),
             Self::InvalidQuery(error) => write!(f, "invalid materialization query: {error}"),
         }
     }
@@ -5177,6 +5752,149 @@ mod tests {
         }
     }
 
+    fn lazy_terminal_database(page: PhysicalPage) -> Connection {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection, digest(b"empty")).unwrap();
+        let transaction = connection.transaction().unwrap();
+        begin_terminal_construction_in_open_candidate(&transaction).unwrap();
+        seed_terminal_chunk_in_open_candidate(
+            &transaction,
+            &PhysicalTerminalMaterializationChunk {
+                pages: vec![page],
+                ..PhysicalTerminalMaterializationChunk::default()
+            },
+        )
+        .unwrap();
+        finish_terminal_graph_projection_in_open_candidate(
+            &transaction,
+            &[],
+            PhysicalTerminalProjectionStamp {
+                acceptance_sequence: 0,
+                frontier_root_digest: digest(b"lazy-terminal"),
+            },
+        )
+        .unwrap();
+        finalize_fresh_bootstrap(&transaction).unwrap();
+        transaction.commit().unwrap();
+        connection
+    }
+
+    #[test]
+    fn terminal_activation_serves_before_fts_build_and_search_reports_building() {
+        let mut connection = lazy_terminal_database(page(1, "Alpha"));
+        assert_eq!(
+            search_index_status(&connection).unwrap(),
+            PhysicalSearchIndexStatus::Building {
+                horizon_sequence: 0
+            }
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM search_fts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let read = SqliteMaterializedRead::new(&connection, 0, digest(b"lazy-terminal")).unwrap();
+        assert_eq!(
+            read.search("alpha", 10).unwrap_err(),
+            MaterializationError::SearchIndexBuilding {
+                horizon_sequence: 0
+            }
+        );
+        while !advance_search_index_build(&mut connection, 1)
+            .unwrap()
+            .ready
+        {}
+        assert_eq!(
+            search_index_status(&connection).unwrap(),
+            PhysicalSearchIndexStatus::Ready
+        );
+        let read = SqliteMaterializedRead::new(&connection, 0, digest(b"lazy-terminal")).unwrap();
+        assert_eq!(read.search("alpha", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ready_content_only_save_touches_one_block_and_no_page_in_both_indexes() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection, digest(b"empty")).unwrap();
+        let original = page(1, "Page title");
+        apply_and_commit(
+            &mut connection,
+            &change(1, vec![original.clone()], Vec::new()),
+            1,
+            digest(b"frontier-1"),
+        );
+        let mut edited = original;
+        edited.blocks[0].content = "changed content".into();
+        edited.blocks[0].searchable_text = "changed content".into();
+        edited.blocks[0].normalized_searchable_text = "changed content".into();
+        let stats = apply_and_commit(
+            &mut connection,
+            &change(2, vec![edited], Vec::new()),
+            2,
+            digest(b"frontier-2"),
+        );
+        assert_eq!(stats.fts_page_rows, 0);
+        assert_eq!(stats.fts_block_rows, 1);
+        assert_eq!(stats.fts_standard_rows, 1);
+        assert_eq!(stats.fts_substring_rows, 1);
+    }
+
+    #[test]
+    fn ready_page_search_text_change_touches_the_page_row() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection, digest(b"empty")).unwrap();
+        let original = page(1, "Old title");
+        apply_and_commit(
+            &mut connection,
+            &change(1, vec![original.clone()], Vec::new()),
+            1,
+            digest(b"frontier-1"),
+        );
+        let mut edited = original;
+        edited.searchable_text = "New title".into();
+        edited.normalized_searchable_text = "new title".into();
+        let stats = apply_and_commit(
+            &mut connection,
+            &change(2, vec![edited], Vec::new()),
+            2,
+            digest(b"frontier-2"),
+        );
+        assert_eq!(stats.fts_page_rows, 1);
+        assert_eq!(stats.fts_block_rows, 0);
+    }
+
+    #[test]
+    fn edit_during_lazy_build_is_caught_up_before_readiness() {
+        let mut connection = lazy_terminal_database(page(1, "Alpha"));
+        assert!(
+            !advance_search_index_build(&mut connection, 1)
+                .unwrap()
+                .ready
+        );
+        let mut edited = page(1, "Alpha");
+        edited.blocks[0].content = "Beta".into();
+        edited.blocks[0].searchable_text = "Beta".into();
+        edited.blocks[0].normalized_searchable_text = "beta".into();
+        let stats = apply_and_commit(
+            &mut connection,
+            &change(2, vec![edited], Vec::new()),
+            1,
+            digest(b"frontier-1"),
+        );
+        assert_eq!(stats.fts_page_rows, 0);
+        assert_eq!(stats.fts_block_rows, 1);
+        while !advance_search_index_build(&mut connection, 1)
+            .unwrap()
+            .ready
+        {}
+        let read = SqliteMaterializedRead::new(&connection, 1, digest(b"frontier-1")).unwrap();
+        let hits = read.search("beta", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(matches!(hits[0].entity, PhysicalEntityId::Block(_)));
+    }
+
     #[test]
     fn terminal_construction_defers_and_transactionally_restores_secondary_indexes() {
         let mut connection = Connection::open_in_memory().unwrap();
@@ -5228,8 +5946,8 @@ mod tests {
             .execute(
                 "INSERT INTO pages (
                      page_id, home_document_id, name, name_key, path, text_kind,
-                     preamble, searchable_text
-                 ) VALUES (?1, ?2, 'Page', 'page', 'pages/page.md', 0, NULL, '')",
+                     preamble, searchable_text, normalized_searchable_text
+                 ) VALUES (?1, ?2, 'Page', 'page', 'pages/page.md', 0, NULL, '', '')",
                 params![id(10).as_slice(), id(20).as_slice()],
             )
             .unwrap();
@@ -5238,9 +5956,9 @@ mod tests {
                 .execute(
                     "INSERT INTO blocks (
                          block_id, page_id, home_document_id, parent_block_id,
-                         order_key, content, searchable_text, heading_level,
-                         collapsed, logseq_uuid, logseq_identity_origin
-                     ) VALUES (?1, ?2, ?3, NULL, 'a', '', '', NULL, 0, ?4, 0)",
+                         order_key, content, searchable_text, normalized_searchable_text,
+                         heading_level, collapsed, logseq_uuid, logseq_identity_origin
+                     ) VALUES (?1, ?2, ?3, NULL, 'a', '', '', '', NULL, 0, ?4, 0)",
                     params![
                         id(value).as_slice(),
                         id(10).as_slice(),

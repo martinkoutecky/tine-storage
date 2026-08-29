@@ -14,6 +14,11 @@ independently in `src/formats.rs` and summarized in
   recovery authority; explicit checkpointing and atomic file-set publication
   establish durable projection snapshots without a sync for every cache
   transaction or DDL statement.
+- Managed terminal projections now publish before either FTS family is built.
+  A bounded, crash-resumable background builder catches up live edits through
+  a transaction-local outbox and flips one readiness marker atomically. Ready
+  projections maintain both the Unicode and trigram indexes by entity delta,
+  so a one-block edit no longer rewrites the page's complete search surface.
 
 ### Fixed
 

@@ -17,7 +17,9 @@ use crate::sqlite_frontier::{
     PhysicalFrontierDocument, PhysicalFrontierRoot, PreflightDisposition, StoredBatch,
     StoredFrontier,
 };
-use crate::sqlite_materialization::{self, SqliteMaterializedRead};
+use crate::sqlite_materialization::{
+    self, PhysicalSearchIndexBuildStep, PhysicalSearchIndexStatus, SqliteMaterializedRead,
+};
 #[cfg(any(test, feature = "test-support"))]
 use crate::sqlite_materialization::{ApplyChangeInstrumentation, PhysicalMaterializationChange};
 use crate::ContentDigest;
@@ -414,6 +416,21 @@ impl PhysicalSqliteDatabase {
 
     pub fn finalize_fresh_bootstrap(&self) -> Result<(), FrontierError> {
         sqlite_materialization::finalize_fresh_bootstrap(&self.connection).map_err(Into::into)
+    }
+
+    pub fn search_index_status(&self) -> Result<PhysicalSearchIndexStatus, FrontierError> {
+        sqlite_materialization::search_index_status(&self.connection).map_err(Into::into)
+    }
+
+    /// Advance the disposable FTS build by one bounded transaction. No
+    /// checkpoint or durability barrier is issued: readiness is projection
+    /// state and the accepted archive remains authoritative.
+    pub fn advance_search_index_build(
+        &mut self,
+        limit: usize,
+    ) -> Result<PhysicalSearchIndexBuildStep, FrontierError> {
+        sqlite_materialization::advance_search_index_build(&mut self.connection, limit)
+            .map_err(Into::into)
     }
 
     pub fn materialized_row_digest(&self) -> Result<ContentDigest, FrontierError> {
