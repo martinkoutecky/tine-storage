@@ -5932,6 +5932,89 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_mid_build_reopen_resumes_cursor_and_outbox_to_eager_equivalence() {
+        let path = std::env::temp_dir().join(format!(
+            "tine-lazy-fts-resume-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let initial = vec![page(1, "Alpha"), page(2, "計画 café")];
+        let mut edited = initial[0].clone();
+        edited.blocks[0].content = "Changed after partial build".into();
+        edited.blocks[0].searchable_text = "Changed after partial build".into();
+        edited.blocks[0].normalized_searchable_text = "changed after partial build".into();
+
+        {
+            let mut connection = Connection::open(&path).unwrap();
+            initialize_schema(&connection, digest(b"empty")).unwrap();
+            let transaction = connection.transaction().unwrap();
+            begin_terminal_construction_in_open_candidate(&transaction).unwrap();
+            seed_terminal_chunk_in_open_candidate(
+                &transaction,
+                &PhysicalTerminalMaterializationChunk {
+                    pages: initial.clone(),
+                    ..PhysicalTerminalMaterializationChunk::default()
+                },
+            )
+            .unwrap();
+            finish_terminal_graph_projection_in_open_candidate(
+                &transaction,
+                &[],
+                PhysicalTerminalProjectionStamp {
+                    acceptance_sequence: 0,
+                    frontier_root_digest: digest(b"lazy-terminal"),
+                },
+            )
+            .unwrap();
+            finalize_fresh_bootstrap(&transaction).unwrap();
+            transaction.commit().unwrap();
+
+            assert!(
+                !advance_search_index_build(&mut connection, 1)
+                    .unwrap()
+                    .ready
+            );
+            apply_and_commit(
+                &mut connection,
+                &change(2, vec![edited.clone()], Vec::new()),
+                1,
+                digest(b"frontier-1"),
+            );
+            let (cursor, outbox): (i64, i64) = connection
+                .query_row(
+                    "SELECT cursor_entity_type IS NOT NULL,
+                            (SELECT COUNT(*) FROM search_fts_outbox)
+                     FROM search_fts_build WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(cursor, 1, "the reopen cut must retain a partial cursor");
+            assert!(outbox > 0, "the reopen cut must retain catch-up work");
+        }
+
+        let resumed_rows = {
+            let mut connection = Connection::open(&path).unwrap();
+            validate_schema(&connection).unwrap();
+            while !advance_search_index_build(&mut connection, 1)
+                .unwrap()
+                .ready
+            {}
+            logical_fts_rows(&connection)
+        };
+
+        let mut eager = Connection::open_in_memory().unwrap();
+        initialize_schema(&eager, digest(b"empty")).unwrap();
+        apply_and_commit(
+            &mut eager,
+            &change(1, vec![edited, initial[1].clone()], Vec::new()),
+            1,
+            digest(b"frontier-1"),
+        );
+        assert_eq!(resumed_rows, logical_fts_rows(&eager));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn lazy_bulk_build_matches_the_eager_index_row_set_in_both_families() {
         let pages = vec![page(2, "計画 café"), page(1, "Alpha")];
         let mut eager = Connection::open_in_memory().unwrap();
