@@ -259,13 +259,18 @@ pub struct ApplyChangeInstrumentation {
     pub cleanup_existing_pages: usize,
     pub cleanup_owned_rows: usize,
     pub cleanup_fts_rowids: usize,
-    /// Logical entities changed in both FTS families. These counters are
-    /// incremented at the authored statement boundary; FTS5 shadow-table
-    /// writes are deliberately not observed.
-    pub fts_page_rows: usize,
-    pub fts_block_rows: usize,
-    pub fts_standard_rows: usize,
-    pub fts_substring_rows: usize,
+}
+
+/// Test-facing detail for proving that ready-state maintenance is bounded to
+/// changed logical entities. Keep this separate from the stable public
+/// instrumentation record: adding fields to that exhaustively constructible
+/// record would be a breaking API change.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct FtsChangeInstrumentation {
+    page_rows: usize,
+    block_rows: usize,
+    standard_rows: usize,
+    substring_rows: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1525,9 +1530,9 @@ pub(crate) fn search_index_status(
 fn require_fts_ready(connection: &Connection) -> Result<(), MaterializationError> {
     match search_index_status(connection)? {
         PhysicalSearchIndexStatus::Ready => Ok(()),
-        PhysicalSearchIndexStatus::Building { horizon_sequence } => {
-            Err(MaterializationError::SearchIndexBuilding { horizon_sequence })
-        }
+        PhysicalSearchIndexStatus::Building { horizon_sequence } => Err(
+            MaterializationError::search_index_building(horizon_sequence),
+        ),
     }
 }
 
@@ -2018,6 +2023,7 @@ pub fn apply_change(
         sequence,
         input_digest,
         post_frontier_digest,
+        None,
     )
 }
 
@@ -2039,6 +2045,7 @@ pub(crate) fn apply_change_in_open_candidate(
         sequence,
         input_digest,
         post_frontier_digest,
+        None,
     )
 }
 
@@ -2048,6 +2055,7 @@ fn apply_change_inner(
     sequence: u64,
     input_digest: ContentDigest,
     post_frontier_digest: ContentDigest,
+    fts_instrumentation: Option<&mut FtsChangeInstrumentation>,
 ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
     validate_preserved_page_metadata(transaction, change)?;
     let instrumentation = apply_graph_projection_rows(
@@ -2055,6 +2063,7 @@ fn apply_change_inner(
         &change.replacements,
         &change.deletions,
         Some(sequence),
+        fts_instrumentation,
     )?;
     let derived = PhysicalGraphProjectionChange {
         replacements: change.replacements.clone(),
@@ -2264,6 +2273,7 @@ pub(crate) fn apply_graph_projection_rows(
     replacements: &[PhysicalPage],
     deletions: &[[u8; 16]],
     acceptance_sequence: Option<u64>,
+    fts_instrumentation: Option<&mut FtsChangeInstrumentation>,
 ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
     // A block can move between two replacement pages. Keep its inbound refs
     // through every cleanup pass, then remove every old owner before inserting
@@ -2303,6 +2313,7 @@ pub(crate) fn apply_graph_projection_rows(
         new_fts,
         acceptance_sequence,
         &mut instrumentation,
+        fts_instrumentation,
     )?;
     Ok(instrumentation)
 }
@@ -2931,6 +2942,7 @@ fn reconcile_fts_rows(
     new: BTreeMap<(i64, [u8; 16]), FtsEntityRow>,
     acceptance_sequence: Option<u64>,
     instrumentation: &mut ApplyChangeInstrumentation,
+    mut fts_instrumentation: Option<&mut FtsChangeInstrumentation>,
 ) -> Result<(), MaterializationError> {
     let phase = fts_build_phase(transaction)?;
     if phase == 2 {
@@ -2947,13 +2959,15 @@ fn reconcile_fts_rows(
         if before == after {
             continue;
         }
-        if key.0 == 0 {
-            instrumentation.fts_page_rows = instrumentation.fts_page_rows.saturating_add(1);
-        } else {
-            instrumentation.fts_block_rows = instrumentation.fts_block_rows.saturating_add(1);
+        if let Some(stats) = fts_instrumentation.as_deref_mut() {
+            if key.0 == 0 {
+                stats.page_rows = stats.page_rows.saturating_add(1);
+            } else {
+                stats.block_rows = stats.block_rows.saturating_add(1);
+            }
+            stats.standard_rows = stats.standard_rows.saturating_add(1);
+            stats.substring_rows = stats.substring_rows.saturating_add(1);
         }
-        instrumentation.fts_standard_rows = instrumentation.fts_standard_rows.saturating_add(1);
-        instrumentation.fts_substring_rows = instrumentation.fts_substring_rows.saturating_add(1);
         if phase == 0 {
             let sequence = acceptance_sequence.ok_or_else(|| {
                 MaterializationError::InvalidInput(
@@ -5588,10 +5602,28 @@ pub enum MaterializationError {
         materialized: u64,
         frontier: u64,
     },
-    SearchIndexBuilding {
-        horizon_sequence: u64,
-    },
     InvalidQuery(String),
+}
+
+const SEARCH_INDEX_BUILDING_PREFIX: &str = "search index building from projection frontier ";
+
+impl MaterializationError {
+    fn search_index_building(horizon_sequence: u64) -> Self {
+        Self::Incomplete(format!("{SEARCH_INDEX_BUILDING_PREFIX}{horizon_sequence}"))
+    }
+
+    /// Returns the build horizon when this error represents a temporarily
+    /// unavailable lazy search index. Consumers can branch on this method
+    /// without matching error text or requiring a new exhaustive enum variant.
+    pub fn search_index_building_horizon(&self) -> Option<u64> {
+        match self {
+            Self::Incomplete(detail) => detail
+                .strip_prefix(SEARCH_INDEX_BUILDING_PREFIX)?
+                .parse()
+                .ok(),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for MaterializationError {
@@ -5605,7 +5637,6 @@ impl fmt::Display for MaterializationError {
             Self::Incomplete(error) => write!(f, "incomplete materialization input: {error}"),
             Self::Contradiction(error) => write!(f, "materialization contradicts accepted semantics: {error}"),
             Self::Stale { materialized, frontier } => write!(f, "materialization frontier {materialized} is stale against accepted frontier {frontier}"),
-            Self::SearchIndexBuilding { horizon_sequence } => write!(f, "search index building from projection frontier {horizon_sequence}"),
             Self::InvalidQuery(error) => write!(f, "invalid materialization query: {error}"),
         }
     }
@@ -5717,6 +5748,27 @@ mod tests {
         .unwrap();
         transaction.commit().unwrap();
         stats
+    }
+
+    fn apply_and_commit_with_fts_instrumentation(
+        connection: &mut Connection,
+        change: &PhysicalMaterializationChange,
+        sequence: u64,
+        frontier: ContentDigest,
+    ) -> FtsChangeInstrumentation {
+        let transaction = connection.transaction().unwrap();
+        let mut fts = FtsChangeInstrumentation::default();
+        apply_change_inner(
+            &transaction,
+            change,
+            sequence,
+            digest(format!("input-{sequence}").as_bytes()),
+            frontier,
+            Some(&mut fts),
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        fts
     }
 
     fn assert_streaming_digest_matches_legacy(connection: &Connection) {
@@ -5833,10 +5885,10 @@ mod tests {
         );
         let read = SqliteMaterializedRead::new(&connection, 0, digest(b"lazy-terminal")).unwrap();
         assert_eq!(
-            read.search("alpha", 10).unwrap_err(),
-            MaterializationError::SearchIndexBuilding {
-                horizon_sequence: 0
-            }
+            read.search("alpha", 10)
+                .unwrap_err()
+                .search_index_building_horizon(),
+            Some(0)
         );
         while !advance_search_index_build(&mut connection, 1)
             .unwrap()
@@ -5865,16 +5917,16 @@ mod tests {
         edited.blocks[0].content = "changed content".into();
         edited.blocks[0].searchable_text = "changed content".into();
         edited.blocks[0].normalized_searchable_text = "changed content".into();
-        let stats = apply_and_commit(
+        let stats = apply_and_commit_with_fts_instrumentation(
             &mut connection,
             &change(2, vec![edited], Vec::new()),
             2,
             digest(b"frontier-2"),
         );
-        assert_eq!(stats.fts_page_rows, 0);
-        assert_eq!(stats.fts_block_rows, 1);
-        assert_eq!(stats.fts_standard_rows, 1);
-        assert_eq!(stats.fts_substring_rows, 1);
+        assert_eq!(stats.page_rows, 0);
+        assert_eq!(stats.block_rows, 1);
+        assert_eq!(stats.standard_rows, 1);
+        assert_eq!(stats.substring_rows, 1);
     }
 
     #[test]
@@ -5891,14 +5943,14 @@ mod tests {
         let mut edited = original;
         edited.searchable_text = "New title".into();
         edited.normalized_searchable_text = "new title".into();
-        let stats = apply_and_commit(
+        let stats = apply_and_commit_with_fts_instrumentation(
             &mut connection,
             &change(2, vec![edited], Vec::new()),
             2,
             digest(b"frontier-2"),
         );
-        assert_eq!(stats.fts_page_rows, 1);
-        assert_eq!(stats.fts_block_rows, 0);
+        assert_eq!(stats.page_rows, 1);
+        assert_eq!(stats.block_rows, 0);
     }
 
     #[test]
@@ -5913,14 +5965,14 @@ mod tests {
         edited.blocks[0].content = "Beta".into();
         edited.blocks[0].searchable_text = "Beta".into();
         edited.blocks[0].normalized_searchable_text = "beta".into();
-        let stats = apply_and_commit(
+        let stats = apply_and_commit_with_fts_instrumentation(
             &mut connection,
             &change(2, vec![edited], Vec::new()),
             1,
             digest(b"frontier-1"),
         );
-        assert_eq!(stats.fts_page_rows, 0);
-        assert_eq!(stats.fts_block_rows, 1);
+        assert_eq!(stats.page_rows, 0);
+        assert_eq!(stats.block_rows, 1);
         while !advance_search_index_build(&mut connection, 1)
             .unwrap()
             .ready

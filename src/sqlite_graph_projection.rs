@@ -196,6 +196,7 @@ impl PhysicalGraphProjectionDatabase {
             &change.replacements,
             &change.deletions,
             None,
+            None,
         )?;
         sqlite_materialization::replace_graph_projection_reference_facts(
             &transaction,
