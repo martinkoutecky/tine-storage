@@ -5939,6 +5939,8 @@ mod tests {
         ));
         let initial = vec![page(1, "Alpha"), page(2, "計画 café")];
         let mut edited = initial[0].clone();
+        edited.searchable_text = "Renamed after partial build".into();
+        edited.normalized_searchable_text = "renamed after partial build".into();
         edited.blocks[0].content = "Changed after partial build".into();
         edited.blocks[0].searchable_text = "Changed after partial build".into();
         edited.blocks[0].normalized_searchable_text = "changed after partial build".into();
@@ -5979,17 +5981,25 @@ mod tests {
                 1,
                 digest(b"frontier-1"),
             );
-            let (cursor, outbox): (i64, i64) = connection
+            let (cursor_type, cursor_id, outbox): (i64, Vec<u8>, i64) = connection
                 .query_row(
-                    "SELECT cursor_entity_type IS NOT NULL,
-                            (SELECT COUNT(*) FROM search_fts_outbox)
+                    "SELECT cursor_entity_type, cursor_entity_id,
+                            (SELECT COUNT(*) FROM search_fts_outbox
+                             WHERE entity_type = 0 AND entity_id = ?1)
                      FROM search_fts_build WHERE singleton = 1",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    params![initial[0].page_id.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .unwrap();
-            assert_eq!(cursor, 1, "the reopen cut must retain a partial cursor");
-            assert!(outbox > 0, "the reopen cut must retain catch-up work");
+            assert_eq!(
+                (cursor_type, cursor_id.as_slice()),
+                (0, initial[0].page_id.as_slice()),
+                "the changed page must sort behind the persisted cursor"
+            );
+            assert_eq!(
+                outbox, 1,
+                "the reopen cut must retain catch-up for the changed page behind the cursor"
+            );
         }
 
         let resumed_rows = {
