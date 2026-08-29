@@ -5,7 +5,7 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
-## [Unreleased]
+## [0.8.10] - 2026-08-29
 
 ### Changed
 
