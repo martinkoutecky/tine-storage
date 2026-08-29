@@ -5752,7 +5752,7 @@ mod tests {
         }
     }
 
-    fn lazy_terminal_database(page: PhysicalPage) -> Connection {
+    fn lazy_terminal_database_with_pages(pages: Vec<PhysicalPage>) -> Connection {
         let mut connection = Connection::open_in_memory().unwrap();
         initialize_schema(&connection, digest(b"empty")).unwrap();
         let transaction = connection.transaction().unwrap();
@@ -5760,7 +5760,7 @@ mod tests {
         seed_terminal_chunk_in_open_candidate(
             &transaction,
             &PhysicalTerminalMaterializationChunk {
-                pages: vec![page],
+                pages,
                 ..PhysicalTerminalMaterializationChunk::default()
             },
         )
@@ -5777,6 +5777,42 @@ mod tests {
         finalize_fresh_bootstrap(&transaction).unwrap();
         transaction.commit().unwrap();
         connection
+    }
+
+    fn lazy_terminal_database(page: PhysicalPage) -> Connection {
+        lazy_terminal_database_with_pages(vec![page])
+    }
+
+    type LogicalFtsRow = (i64, Vec<u8>, Vec<u8>, String, String, String);
+
+    /// Compare the two authored FTS families by logical entity, deliberately
+    /// excluding rowid allocation and FTS5 shadow-table implementation detail.
+    fn logical_fts_rows(connection: &Connection) -> Vec<LogicalFtsRow> {
+        let mut statement = connection
+            .prepare(
+                "SELECT owner.entity_type, owner.entity_id, owner.page_id,
+                        standard.text, standard.normalized_text,
+                        substring.normalized_text
+                 FROM search_fts_owners AS owner
+                 JOIN search_fts AS standard ON standard.rowid = owner.rowid
+                 JOIN search_substring_fts AS substring ON substring.rowid = owner.rowid
+                 ORDER BY owner.entity_type, owner.entity_id",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
     }
 
     #[test]
@@ -5893,6 +5929,63 @@ mod tests {
         let hits = read.search("beta", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(matches!(hits[0].entity, PhysicalEntityId::Block(_)));
+    }
+
+    #[test]
+    fn lazy_bulk_build_matches_the_eager_index_row_set_in_both_families() {
+        let pages = vec![page(2, "計画 café"), page(1, "Alpha")];
+        let mut eager = Connection::open_in_memory().unwrap();
+        initialize_schema(&eager, digest(b"empty")).unwrap();
+        apply_and_commit(
+            &mut eager,
+            &change(1, pages.clone(), Vec::new()),
+            1,
+            digest(b"frontier-1"),
+        );
+
+        let mut lazy = lazy_terminal_database_with_pages(pages);
+        while !advance_search_index_build(&mut lazy, 1).unwrap().ready {}
+
+        assert_eq!(logical_fts_rows(&lazy), logical_fts_rows(&eager));
+    }
+
+    #[test]
+    fn delta_maintained_index_matches_from_scratch_final_state_in_both_families() {
+        let initial = vec![page(1, "Alpha"), page(2, "Beta"), page(3, "Gamma")];
+        let mut delta = Connection::open_in_memory().unwrap();
+        initialize_schema(&delta, digest(b"empty")).unwrap();
+        apply_and_commit(
+            &mut delta,
+            &change(1, initial.clone(), Vec::new()),
+            1,
+            digest(b"frontier-1"),
+        );
+
+        let mut edited_block = initial[0].clone();
+        edited_block.blocks[0].content = "Changed 計画".into();
+        edited_block.blocks[0].searchable_text = "Changed 計画".into();
+        edited_block.blocks[0].normalized_searchable_text = "changed 計画".into();
+        let mut edited_page = initial[1].clone();
+        edited_page.searchable_text = "Renamed café".into();
+        edited_page.normalized_searchable_text = "renamed café".into();
+        let final_pages = vec![edited_block, edited_page];
+        apply_and_commit(
+            &mut delta,
+            &change(2, final_pages.clone(), vec![initial[2].page_id]),
+            2,
+            digest(b"frontier-2"),
+        );
+
+        let mut from_scratch = Connection::open_in_memory().unwrap();
+        initialize_schema(&from_scratch, digest(b"empty")).unwrap();
+        apply_and_commit(
+            &mut from_scratch,
+            &change(3, final_pages, Vec::new()),
+            1,
+            digest(b"frontier-final"),
+        );
+
+        assert_eq!(logical_fts_rows(&delta), logical_fts_rows(&from_scratch));
     }
 
     #[test]
