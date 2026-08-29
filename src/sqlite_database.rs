@@ -36,9 +36,12 @@ pub struct PhysicalSqliteDatabase {
     candidate_build_active: bool,
 }
 
-/// Physical commit accounting for accepted-event application. Schema setup,
-/// checkpoint publication, and directory publication are intentionally outside
-/// these apply-path counters.
+/// Physical transaction accounting for accepted-event application. Schema
+/// setup, checkpoint publication, and directory publication are intentionally
+/// outside these apply-path counters. The durability fields remain for API
+/// compatibility, but are zero under the disposable projection's
+/// `synchronous=NORMAL` contract: durability belongs to the later explicit
+/// checkpoint and file-set publication boundary, not to each transaction.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PhysicalWriteInstrumentation {
     pub ordinary_transactions: u64,
@@ -62,7 +65,7 @@ impl PhysicalSqliteDatabase {
         connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_STATEMENTS);
         connection.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = FULL;
+             PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;
              PRAGMA trusted_schema = OFF;",
         )?;
@@ -222,10 +225,6 @@ impl PhysicalSqliteDatabase {
                 .write_instrumentation
                 .ordinary_transactions
                 .saturating_add(1);
-            self.write_instrumentation.ordinary_durability_barriers = self
-                .write_instrumentation
-                .ordinary_durability_barriers
-                .saturating_add(1);
         }
         Ok(result)
     }
@@ -342,9 +341,9 @@ impl PhysicalSqliteDatabase {
     }
 
     /// Commit the fully proved candidate once. Under this connection's
-    /// `synchronous=FULL` contract, the commit is the candidate apply-path
-    /// durability barrier; WAL checkpoint and atomic publication remain later
-    /// explicit boundaries.
+    /// `synchronous=NORMAL` contract, this commit completes the candidate's
+    /// logical transaction. Durability is established later by the explicit
+    /// WAL checkpoint and atomic file-set publication.
     pub fn finish_candidate_build(&mut self) -> Result<(), FrontierError> {
         if !self.candidate_build_active || self.connection.is_autocommit() {
             return Err(FrontierError::InvalidInput(
@@ -353,10 +352,6 @@ impl PhysicalSqliteDatabase {
         }
         self.connection.execute_batch("COMMIT")?;
         self.candidate_build_active = false;
-        self.write_instrumentation.candidate_durability_barriers = self
-            .write_instrumentation
-            .candidate_durability_barriers
-            .saturating_add(1);
         Ok(())
     }
 
@@ -663,6 +658,43 @@ mod tests {
                 .unwrap()
                 .acceptance_sequence(),
             0
+        );
+    }
+
+    #[test]
+    fn writable_projection_uses_normal_synchronous_mode() {
+        let path = TestDatabasePath::new("normal-sync");
+        let database = PhysicalSqliteDatabase::open_writable(path.as_path()).unwrap();
+        let synchronous: i64 = database
+            .connection
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(synchronous, 1, "SQLite NORMAL is numeric mode 1");
+    }
+
+    #[test]
+    fn schema_initialization_failure_rolls_back_the_whole_schema() {
+        let path = TestDatabasePath::new("schema-atomic");
+        let database = PhysicalSqliteDatabase::open_writable(path.as_path()).unwrap();
+        database
+            .execute_corrupting_sql_for_test(
+                "CREATE TABLE materialization_stamp (preexisting INTEGER NOT NULL)",
+            )
+            .unwrap();
+
+        assert!(database.initialize_schema(claim(8), b"empty").is_err());
+        let meta_exists: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'meta'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            meta_exists, 0,
+            "a failed grouped schema build must not retain earlier DDL"
         );
     }
 

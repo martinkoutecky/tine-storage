@@ -460,7 +460,12 @@ pub fn initialize_schema(
     claim: PhysicalClaim,
     empty_frontier: &[u8],
 ) -> Result<(), FrontierError> {
-    connection.execute_batch(&format!(
+    // Schema state is disposable, but it must still be all-or-nothing. Apart
+    // from avoiding one FULL/NORMAL commit per DDL statement, this means a
+    // failed candidate never leaves a partially shaped database that looks
+    // meaningful to later diagnostics or recovery.
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(&format!(
         "PRAGMA application_id = {SQLITE_APPLICATION_ID};
          PRAGMA user_version = {SQLITE_SCHEMA_VERSION};
          {META_DDL}; {FRONTIER_DDL}; {FRONTIER_DOCUMENTS_DDL};
@@ -468,8 +473,8 @@ pub fn initialize_schema(
          {APPLIED_BATCHES_DDL}; {BATCH_ID_INDEX_DDL}; {ACCEPTANCE_SEQUENCE_INDEX_DDL};"
     ))?;
     let empty_digest = ContentDigest::of(empty_frontier);
-    sqlite_materialization::initialize_schema(connection, empty_digest)?;
-    connection.execute(
+    sqlite_materialization::initialize_schema(&transaction, empty_digest)?;
+    transaction.execute(
         "INSERT INTO meta (
              singleton, workspace_id, lineage_digest, oplog_protocol_version,
              operation_schema_version, object_envelope_schema_version,
@@ -485,13 +490,15 @@ pub fn initialize_schema(
             i64::from(claim.managed_entity_set_version),
         ],
     )?;
-    connection.execute(
+    transaction.execute(
         "INSERT INTO frontier (
              singleton, frontier_root, frontier_root_digest, applied_batch_count
          ) VALUES (1, ?1, ?2, 0)",
         params![empty_frontier, empty_digest.as_bytes().as_slice()],
     )?;
-    validate_schema_and_claim(connection, claim)
+    validate_schema_and_claim(&transaction, claim)?;
+    transaction.commit()?;
+    Ok(())
 }
 
 pub fn validate_schema_and_claim(
@@ -3224,14 +3231,14 @@ mod tests {
     }
 
     #[test]
-    fn candidate_batch_matches_ordinary_apply_and_keeps_live_commit_durability() {
+    fn candidate_batch_matches_ordinary_apply_without_per_commit_durability() {
         let (_ordinary_path, mut ordinary, empty) = initialized_facade();
         let ordinary_scenario = apply_two_part_fresh_bootstrap(&mut ordinary, &empty);
         let ordinary_semantic = ordinary.semantic_projection_digest().unwrap();
         let ordinary_rows = ordinary.materialized_row_digest().unwrap();
         let ordinary_writes = ordinary.write_instrumentation();
         assert_eq!(ordinary_writes.ordinary_transactions, 2);
-        assert_eq!(ordinary_writes.ordinary_durability_barriers, 2);
+        assert_eq!(ordinary_writes.ordinary_durability_barriers, 0);
         assert_eq!(ordinary_writes.candidate_transactions, 0);
         assert_eq!(ordinary_writes.candidate_durability_barriers, 0);
 
@@ -3255,7 +3262,7 @@ mod tests {
         assert_eq!(candidate_writes.ordinary_transactions, 0);
         assert_eq!(candidate_writes.ordinary_durability_barriers, 0);
         assert_eq!(candidate_writes.candidate_transactions, 1);
-        assert_eq!(candidate_writes.candidate_durability_barriers, 1);
+        assert_eq!(candidate_writes.candidate_durability_barriers, 0);
     }
 
     #[test]

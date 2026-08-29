@@ -7,6 +7,14 @@ independently in `src/formats.rs` and summarized in
 
 ## [Unreleased]
 
+### Changed
+
+- Disposable SQLite projections now use WAL `synchronous=NORMAL`, and fresh
+  schema construction is one atomic transaction. Accepted history remains the
+  recovery authority; explicit checkpointing and atomic file-set publication
+  establish durable projection snapshots without a sync for every cache
+  transaction or DDL statement.
+
 ### Fixed
 
 - Exact immutable publication batches on Linux and Android now keep final names
