@@ -1,7 +1,7 @@
 #[cfg(windows)]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsMaybeDirExt as _};
 use cap_std::fs::{Dir, OpenOptions};
-#[cfg(any(target_os = "android", all(test, unix)))]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::collections::HashSet;
 #[cfg(unix)]
 use std::ffi::CString;
@@ -1414,14 +1414,25 @@ pub struct ExactImmutablePublicationBatch {
     archive: Dir,
     publications: usize,
     existing_publications: usize,
-    #[cfg(any(target_os = "android", all(test, unix)))]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     exact_publications: Vec<ExactBatchPublication>,
 }
 
-#[cfg(any(target_os = "android", all(test, unix)))]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 struct ExactBatchPublication {
     dir: Dir,
-    filename: String,
+    temp_name: Option<String>,
+    final_name: String,
+    exact_length: u64,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+impl Drop for ExactBatchPublication {
+    fn drop(&mut self) {
+        if let Some(temp_name) = self.temp_name.as_deref() {
+            let _ = self.dir.remove_file(temp_name);
+        }
+    }
 }
 
 /// Non-forgeable evidence that an exact immutable publication batch finished.
@@ -1437,7 +1448,7 @@ impl ExactImmutablePublicationBatch {
             archive: archive.try_clone()?,
             publications: 0,
             existing_publications: 0,
-            #[cfg(any(target_os = "android", all(test, unix)))]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             exact_publications: Vec::new(),
         })
     }
@@ -1449,12 +1460,8 @@ impl ExactImmutablePublicationBatch {
         filename: &str,
         bytes: &[u8],
     ) -> Result<(), FilesystemError> {
-        let existing = stage_immutable_unflushed(dir, filename, bytes)?;
-        #[cfg(any(target_os = "android", all(test, unix)))]
-        self.exact_publications.push(ExactBatchPublication {
-            dir: dir.try_clone()?,
-            filename: filename.to_owned(),
-        });
+        let (publication, existing) = stage_exact_batch_publication(dir, filename, bytes)?;
+        self.exact_publications.push(publication);
         self.publications = self.publications.saturating_add(1);
         self.existing_publications = self
             .existing_publications
@@ -1474,10 +1481,18 @@ impl ExactImmutablePublicationBatch {
         Ok(())
     }
 
-    pub fn finish(self) -> Result<CompletedExactImmutablePublicationBatch, FilesystemError> {
-        #[cfg(any(target_os = "android", all(test, unix)))]
-        flush_exact_batch(&self.archive, &self.exact_publications)?;
-        #[cfg(not(any(target_os = "android", all(test, unix))))]
+    pub fn finish(mut self) -> Result<CompletedExactImmutablePublicationBatch, FilesystemError> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            flush_exact_batch_data(&self.archive, &self.exact_publications)?;
+            self.existing_publications =
+                self.existing_publications
+                    .saturating_add(install_exact_batch_publications(
+                        &mut self.exact_publications,
+                    )?);
+            sync_exact_batch_directories(&self.exact_publications)?;
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         flush_exact_batch(&self.archive)?;
         #[cfg(test)]
         note_batch_durability_barrier();
@@ -1500,36 +1515,52 @@ impl CompletedExactImmutablePublicationBatch {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn stage_immutable_unflushed(
+fn stage_exact_batch_publication(
     dir: &Dir,
     filename: &str,
     bytes: &[u8],
-) -> Result<bool, FilesystemError> {
+) -> Result<(ExactBatchPublication, bool), FilesystemError> {
+    match dir.symlink_metadata(filename) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(FilesystemError::UnsafeEntry(format!(
+                    "stored path is not a regular no-follow file: {filename}"
+                )));
+            }
+            verify_existing(dir, filename, bytes)?;
+            return Ok((
+                ExactBatchPublication {
+                    dir: dir.try_clone()?,
+                    temp_name: None,
+                    final_name: filename.to_owned(),
+                    exact_length: bytes.len() as u64,
+                },
+                true,
+            ));
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+
     let temp_name = format!(".tmp-{}", Uuid::new_v4());
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    options.read(true).write(true).create_new(true);
     let mut temp = dir.open_with(&temp_name, &options)?;
-    temp.write_all(bytes)?;
+    if let Err(error) = temp.write_all(bytes) {
+        drop(temp);
+        let _ = dir.remove_file(&temp_name);
+        return Err(error.into());
+    }
     drop(temp);
-    let result = match rename_noreplace(dir, &temp_name, filename) {
-        Ok(()) => Ok(false),
-        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
-            verify_existing(dir, filename, bytes).map(|()| true)
-        }
-        Err(error) => Err(error.into()),
-    };
-    let cleanup = dir.remove_file(&temp_name);
-    if let Err(error) = result {
-        let _ = cleanup;
-        return Err(error);
-    }
-    if cleanup
-        .as_ref()
-        .is_err_and(|error| error.kind() != ErrorKind::NotFound)
-    {
-        cleanup?;
-    }
-    result
+    Ok((
+        ExactBatchPublication {
+            dir: dir.try_clone()?,
+            temp_name: Some(temp_name),
+            final_name: filename.to_owned(),
+            exact_length: bytes.len() as u64,
+        },
+        false,
+    ))
 }
 
 fn verify_existing(dir: &Dir, filename: &str, expected: &[u8]) -> Result<(), FilesystemError> {
@@ -1596,40 +1627,24 @@ fn rename_noreplace(_dir: &Dir, _from: &str, _to: &str) -> io::Result<()> {
     ))
 }
 
-#[cfg(all(target_os = "linux", not(test)))]
-fn flush_exact_batch(archive: &Dir) -> Result<(), FilesystemError> {
-    // cap-std may retain an O_PATH descriptor. Derive a real descriptor only
-    // through that retained archive capability before issuing the one barrier.
-    let fd = unsafe {
-        libc::openat(
-            archive.as_fd().as_raw_fd(),
-            c".".as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    // SAFETY: openat returned one newly owned directory descriptor.
-    let archive = unsafe { fs::File::from_raw_fd(fd) };
-    let result = unsafe { libc::syncfs(archive.as_raw_fd()) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error().into())
-    }
-}
-
-#[cfg(any(target_os = "android", all(test, unix)))]
-fn flush_exact_batch(
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn flush_exact_batch_data(
     archive: &Dir,
     exact_publications: &[ExactBatchPublication],
 ) -> Result<(), FilesystemError> {
     let result = flush_filesystem(archive);
-    finish_android_exact_batch_flush(exact_publications, result)
+    #[cfg(target_os = "android")]
+    {
+        finish_android_exact_batch_data_flush(exact_publications, result)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = exact_publications;
+        result.map_err(FilesystemError::from)
+    }
 }
 
-#[cfg(any(target_os = "android", all(test, unix)))]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn flush_filesystem(archive: &Dir) -> io::Result<()> {
     // cap-std may retain an O_PATH descriptor. Derive a real descriptor only
     // through that retained archive capability before issuing the one barrier.
@@ -1716,8 +1731,8 @@ fn finish_android_single_writer_install(
     }
 }
 
-#[cfg(any(target_os = "android", all(test, unix)))]
-fn finish_android_exact_batch_flush(
+#[cfg(any(target_os = "android", all(test, target_os = "linux")))]
+fn finish_android_exact_batch_data_flush(
     exact_publications: &[ExactBatchPublication],
     result: io::Result<()>,
 ) -> Result<(), FilesystemError> {
@@ -1728,19 +1743,71 @@ fn finish_android_exact_batch_flush(
     }
 
     // Some Android kernels deny filesystem-wide synchronization even for an
-    // app-private archive. Synchronize every exact immutable file retained by
-    // this batch, then request directory-entry durability. A directory fsync
-    // capability refusal is the one platform limitation we cannot strengthen;
-    // all ordinary file and I/O failures remain fatal.
-    let mut synchronized_directories = HashSet::new();
+    // app-private archive. Synchronize every staged temporary file (or an exact
+    // final name retained from an interrupted prior batch) before any new final
+    // name is installed. All ordinary file and I/O failures remain fatal.
     for publication in exact_publications {
-        open_file_nofollow(&publication.dir, &publication.filename)?.sync_all()?;
+        let name = publication
+            .temp_name
+            .as_deref()
+            .unwrap_or(&publication.final_name);
+        open_file_nofollow(&publication.dir, name)?.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn install_exact_batch_publications(
+    publications: &mut [ExactBatchPublication],
+) -> Result<usize, FilesystemError> {
+    let mut raced_existing = 0_usize;
+    for publication in publications {
+        let Some(temp_name) = publication.temp_name.as_deref() else {
+            continue;
+        };
+        match rename_noreplace(&publication.dir, temp_name, &publication.final_name) {
+            Ok(()) => publication.temp_name = None,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                verify_existing_batch_publication(publication)?;
+                publication.temp_name = None;
+                raced_existing = raced_existing.saturating_add(1);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(raced_existing)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn verify_existing_batch_publication(
+    publication: &ExactBatchPublication,
+) -> Result<(), FilesystemError> {
+    let temp_name = publication
+        .temp_name
+        .as_deref()
+        .ok_or(FilesystemError::ByteCollision)?;
+    let staged = StagedExactImmutablePublication {
+        dir: publication.dir.try_clone()?,
+        temp_name: temp_name.to_owned(),
+        final_name: publication.final_name.clone(),
+        exact_length: publication.exact_length,
+    };
+    verify_existing_staged(&staged)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn sync_exact_batch_directories(
+    publications: &[ExactBatchPublication],
+) -> Result<(), FilesystemError> {
+    let mut synchronized_directories = HashSet::new();
+    for publication in publications {
         let directory_identity = directory_identity(&publication.dir)?;
         if !synchronized_directories.insert(directory_identity) {
             continue;
         }
         match sync_dir_required(&publication.dir) {
             Ok(()) => {}
+            #[cfg(target_os = "android")]
             Err(error) if android_durability_capability_refusal(&error) => {}
             Err(error) => return Err(error.into()),
         }
@@ -1748,7 +1815,7 @@ fn finish_android_exact_batch_flush(
     Ok(())
 }
 
-#[cfg(any(target_os = "android", all(test, unix)))]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn directory_identity(dir: &Dir) -> io::Result<(libc::dev_t, libc::ino_t)> {
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `stat` is valid writable storage and the retained directory
@@ -1761,12 +1828,19 @@ fn directory_identity(dir: &Dir) -> io::Result<(libc::dev_t, libc::ino_t)> {
     Ok((stat.st_dev, stat.st_ino))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 fn simulate_android_exact_batch_finish(
-    batch: ExactImmutablePublicationBatch,
+    mut batch: ExactImmutablePublicationBatch,
     filesystem_result: io::Result<()>,
 ) -> Result<CompletedExactImmutablePublicationBatch, FilesystemError> {
-    finish_android_exact_batch_flush(&batch.exact_publications, filesystem_result)?;
+    finish_android_exact_batch_data_flush(&batch.exact_publications, filesystem_result)?;
+    batch.existing_publications =
+        batch
+            .existing_publications
+            .saturating_add(install_exact_batch_publications(
+                &mut batch.exact_publications,
+            )?);
+    sync_exact_batch_directories(&batch.exact_publications)?;
     Ok(CompletedExactImmutablePublicationBatch {
         _private: (),
         publications: batch.publications,
@@ -2116,13 +2190,52 @@ mod tests {
     }
 
     #[test]
-    fn abandoned_batch_retry_verifies_existing_bytes_and_finishes_once() {
-        let fixture = TestDirectory::new("batch-retry");
-        let mut abandoned = ExactImmutablePublicationBatch::new(&fixture.dir).unwrap();
-        abandoned
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn deferred_batch_keeps_final_names_unpublished_until_finish() {
+        let fixture = TestDirectory::new("batch-stage-before-install");
+        let mut batch = ExactImmutablePublicationBatch::new(&fixture.dir).unwrap();
+        batch.publish(&fixture.dir, "first", b"one").unwrap();
+        batch.publish(&fixture.dir, "second", b"two").unwrap();
+
+        assert!(fixture.dir.symlink_metadata("first").is_err());
+        assert!(fixture.dir.symlink_metadata("second").is_err());
+        assert_eq!(temporary_entries(&fixture.dir).len(), 2);
+
+        batch.finish().unwrap();
+        assert_persisted_entries(
+            &fixture,
+            &[("first", b"one".as_slice()), ("second", b"two".as_slice())],
+        );
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn abandoned_deferred_batch_leaves_no_final_names_or_temporary_residue() {
+        let fixture = TestDirectory::new("batch-abandoned-before-finish");
+        let mut batch = ExactImmutablePublicationBatch::new(&fixture.dir).unwrap();
+        batch
+            .publish(&fixture.dir, "entry", b"exact bytes")
+            .unwrap();
+
+        drop(batch);
+
+        assert!(fixture.dir.symlink_metadata("entry").is_err());
+        assert!(temporary_entries(&fixture.dir).is_empty());
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn retry_after_crash_between_install_and_directory_sync_verifies_existing_bytes() {
+        let fixture = TestDirectory::new("batch-retry-after-install");
+        let mut interrupted = ExactImmutablePublicationBatch::new(&fixture.dir).unwrap();
+        interrupted
             .publish(&fixture.dir, "existing", b"exact bytes")
             .unwrap();
-        drop(abandoned);
+        flush_exact_batch_data(&interrupted.archive, &interrupted.exact_publications).unwrap();
+        install_exact_batch_publications(&mut interrupted.exact_publications).unwrap();
+        // Simulate process death after installing the immutable name but before
+        // synchronizing its destination directory.
+        drop(interrupted);
 
         reset_immutable_publication_test_stats();
         let mut retry = ExactImmutablePublicationBatch::new(&fixture.dir).unwrap();
@@ -2138,6 +2251,39 @@ mod tests {
             1
         );
         assert_persisted_entries(&fixture, &[("existing", b"exact bytes")]);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn exact_race_during_finish_removes_the_losing_staged_name() {
+        let fixture = TestDirectory::new("batch-raced-install-cleanup");
+        let mut batch = ExactImmutablePublicationBatch::new(&fixture.dir).unwrap();
+        batch
+            .publish(&fixture.dir, "raced", b"exact bytes")
+            .unwrap();
+        assert_eq!(temporary_entries(&fixture.dir).len(), 1);
+
+        publish_immutable_exact(&fixture.dir, "raced", b"exact bytes").unwrap();
+        let completed = batch.finish().unwrap();
+
+        assert_eq!(completed.publication_count(), 1);
+        assert_eq!(completed.existing_publication_count(), 1);
+        assert_persisted_entries(&fixture, &[("raced", b"exact bytes")]);
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn portable_batch_keeps_per_artifact_durable_publication() {
+        let fixture = TestDirectory::new("portable-batch-publication");
+        let mut batch = ExactImmutablePublicationBatch::new(&fixture.dir).unwrap();
+        batch
+            .publish(&fixture.dir, "entry", b"exact bytes")
+            .unwrap();
+
+        // The portable implementation intentionally remains the ordinary
+        // per-artifact durable publisher rather than the Linux/Android batch.
+        assert_persisted_entries(&fixture, &[("entry", b"exact bytes")]);
+        batch.finish().unwrap();
     }
 
     #[test]

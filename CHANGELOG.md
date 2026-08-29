@@ -7,6 +7,14 @@ independently in `src/formats.rs` and summarized in
 
 ## [Unreleased]
 
+### Fixed
+
+- Exact immutable publication batches on Linux and Android now keep final names
+  absent until all staged bytes are durable, then install no-replace and flush
+  every distinct destination directory before reporting completion. Interrupted
+  retries verify exact existing winners, Android retains its capability-refusal
+  fallback, and abandoned or raced staged files leave no temporary residue.
+
 ## [0.8.9] - 2026-08-23
 
 ### Added
