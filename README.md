@@ -20,7 +20,10 @@ Checkpoint-generation accepted history uses the separate
 sequence algorithms, V2 immutable object codecs, and a storage-agnostic shared
 reader/writer. Tine supplies engine policy and the physical content-addressed
 object store; this crate validates canonical bytes, logical addresses, bounded
-tree shape, and the sequence/status/batch/causal cross-check.
+tree shape, and the one-based sequence/status/batch/causal cross-check. A
+caller-supplied decoder validates the preserved exact Tine V1/V2 evidence bytes
+and lets the shared reader bind their batch, sequence, manifest, and event fields
+without making this physical crate depend on the engine crate.
 
 ## Persistent-format identity
 

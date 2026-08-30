@@ -12,14 +12,16 @@ independently in `src/formats.rs` and summarized in
 - A public `sealed_accepted_index` module now owns the frozen V1 authenticated
   map algorithm and the canonical V2 accepted-status, acceptance-sequence, and
   causal-record formats used by checkpoint generations. Its shared reader and
-  writer cross-check sequence, status, batch-map, and causal bindings without
-  depending on Tine engine types or a physical filesystem layout.
+  writer cross-check the one-based sequence, status, batch-map, causal, and
+  caller-decoded exact-evidence bindings without depending on Tine engine types
+  or a physical filesystem layout.
 
 ### Changed
 
-- SQLite's existing accepted-frontier validation now imports the shared V1 map
-  priority and node-digest primitives. Golden fixtures prove the refactor is
-  byte- and root-identical to prior releases.
+- SQLite's existing accepted-frontier validation and Tine's clean/scratch
+  derivations now import the shared V1 map and causal primitives. Golden fixtures
+  prove the refactor is byte-, root-, and causal-address-identical to prior
+  releases.
 
 ## [0.8.10] - 2026-08-29
 
