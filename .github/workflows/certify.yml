@@ -111,14 +111,24 @@ jobs:
       - uses: swatinem/rust-cache@v2
       - run: cargo test --locked api_surface
       - run: cargo test --locked --test public_boundary
-      - name: Check against the preceding storage tag when one exists
+      - name: Check against the latest certified storage release when one exists
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          baseline="$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)"
+          # A failed certification attempt deliberately leaves its tag as an
+          # audit record, but it is not a released public API baseline. GitHub's
+          # `releases/latest` endpoint excludes drafts and prereleases and only
+          # advances after the receipt job publishes a successful release.
+          baseline="$(
+            gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
+              --jq .tag_name 2>/dev/null || true
+          )"
           if [ -z "$baseline" ]; then
             echo "Initial release: no semver baseline exists yet."
             exit 0
           fi
+          git rev-parse --verify "$baseline^{commit}"
           cargo install cargo-semver-checks --locked --version 0.50.0
           cargo semver-checks check-release --baseline-rev "$baseline"
 

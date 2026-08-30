@@ -5,6 +5,13 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.8.13] - 2026-08-30
+
+### Fixed
+
+- Certification now checks Rust API compatibility against the latest published
+  storage release rather than an uncertified tag left by a failed attempt.
+
 ## [0.8.12] - 2026-08-30
 
 ### Fixed
