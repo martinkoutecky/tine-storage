@@ -118,11 +118,14 @@ jobs:
         run: |
           # A failed certification attempt deliberately leaves its tag as an
           # audit record, but it is not a released public API baseline. GitHub's
-          # `releases/latest` endpoint excludes drafts and prereleases and only
-          # advances after the receipt job publishes a successful release.
+          # Stable GitHub Releases advance only after the receipt job succeeds.
+          # The list endpoint returns an empty array for a repository with no
+          # releases, while API and transport failures remain fatal under
+          # `bash -e`; do not turn an infrastructure failure into a skipped
+          # semver check.
           baseline="$(
-            gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
-              --jq .tag_name 2>/dev/null || true
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --jq 'map(select(.draft == false and .prerelease == false))[0].tag_name // empty'
           )"
           if [ -z "$baseline" ]; then
             echo "Initial release: no semver baseline exists yet."
