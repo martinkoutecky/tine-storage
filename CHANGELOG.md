@@ -5,6 +5,22 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.8.11] - 2026-08-30
+
+### Added
+
+- A public `sealed_accepted_index` module now owns the frozen V1 authenticated
+  map algorithm and the canonical V2 accepted-status, acceptance-sequence, and
+  causal-record formats used by checkpoint generations. Its shared reader and
+  writer cross-check sequence, status, batch-map, and causal bindings without
+  depending on Tine engine types or a physical filesystem layout.
+
+### Changed
+
+- SQLite's existing accepted-frontier validation now imports the shared V1 map
+  priority and node-digest primitives. Golden fixtures prove the refactor is
+  byte- and root-identical to prior releases.
+
 ## [0.8.10] - 2026-08-29
 
 ### Changed

@@ -47,6 +47,12 @@ pub use crate::local_journal_v2::{
     LOCAL_JOURNAL_SEGMENT_V2_MAGIC,
 };
 pub use crate::scratch::{SCRATCH_PAGE_SCHEMA_VERSION, SCRATCH_SCHEMA_VERSION};
+pub use crate::sealed_accepted_index_impl::{
+    SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION, SEALED_ACCEPTED_INDEX_SCHEMA_VERSION,
+    SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION, SEALED_ACCEPTED_SEQUENCE_FANOUT,
+    SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY, SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION,
+    SEALED_ACCEPTED_STATUS_SCHEMA_VERSION,
+};
 pub use crate::sqlite_frontier::{SQLITE_APPLICATION_ID, SQLITE_SCHEMA_VERSION};
 
 // --- on-disk layout: names and shape -----------------------------------------
@@ -256,6 +262,36 @@ pub const FORMAT_MANIFEST: &[FormatConstant] = &[
         FormatKind::Identity,
         SQLITE_SCHEMA_VERSION as u64,
     ),
+    num(
+        "SEALED_ACCEPTED_INDEX_SCHEMA_VERSION",
+        "sealed accepted-index family",
+        FormatKind::Identity,
+        SEALED_ACCEPTED_INDEX_SCHEMA_VERSION as u64,
+    ),
+    num(
+        "SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION",
+        "sealed accepted-map node",
+        FormatKind::Identity,
+        SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION as u64,
+    ),
+    num(
+        "SEALED_ACCEPTED_STATUS_SCHEMA_VERSION",
+        "sealed accepted-status record",
+        FormatKind::Identity,
+        SEALED_ACCEPTED_STATUS_SCHEMA_VERSION as u64,
+    ),
+    num(
+        "SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION",
+        "sealed accepted-sequence tree",
+        FormatKind::Identity,
+        SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION as u64,
+    ),
+    num(
+        "SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION",
+        "sealed accepted-causal record",
+        FormatKind::Identity,
+        SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION as u64,
+    ),
     // layout
     num(
         "LOCAL_JOURNAL_SEGMENT_HEADER_BYTES",
@@ -310,6 +346,18 @@ pub const FORMAT_MANIFEST: &[FormatConstant] = &[
         "engine scratch LSM",
         FormatKind::Layout,
         SCRATCH_LSM_LEVELS as u64,
+    ),
+    num(
+        "SEALED_ACCEPTED_SEQUENCE_FANOUT",
+        "sealed accepted-sequence tree",
+        FormatKind::Layout,
+        SEALED_ACCEPTED_SEQUENCE_FANOUT as u64,
+    ),
+    num(
+        "SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY",
+        "sealed accepted-sequence tree",
+        FormatKind::Layout,
+        SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY as u64,
     ),
     // Managed-storage path grammar. These rows are an ownership/certification
     // migration only: every value is frozen to the preceding Tine-owned
@@ -1257,6 +1305,11 @@ mod tests {
         assert_eq!(SCRATCH_PAGE_SCHEMA_VERSION, 1);
         assert_eq!(SQLITE_APPLICATION_ID, 0x5449_4e45);
         assert_eq!(SQLITE_SCHEMA_VERSION, 21);
+        assert_eq!(SEALED_ACCEPTED_INDEX_SCHEMA_VERSION, 2);
+        assert_eq!(SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION, 2);
+        assert_eq!(SEALED_ACCEPTED_STATUS_SCHEMA_VERSION, 2);
+        assert_eq!(SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION, 2);
+        assert_eq!(SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION, 2);
 
         assert_eq!(LOCAL_JOURNAL_SEGMENT_HEADER_BYTES, 136);
         assert_eq!(LOCAL_JOURNAL_FRONTIER_BYTES, 240);
@@ -1267,6 +1320,8 @@ mod tests {
         assert_eq!(SCRATCH_PAGES_FILE, "pages.index");
         assert_eq!(SCRATCH_BLOBS_FILE, "blobs.data");
         assert_eq!(SCRATCH_LSM_LEVELS, 32);
+        assert_eq!(SEALED_ACCEPTED_SEQUENCE_FANOUT, 32);
+        assert_eq!(SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY, 1);
 
         assert_eq!(MAX_MANIFEST_BYTES, 1024 * 1024);
         assert_eq!(MAX_OBJECT_BYTES, 256 * 1024 * 1024);
@@ -1333,6 +1388,26 @@ mod tests {
                 FormatValue::Number(SQLITE_SCHEMA_VERSION as u64),
             ),
             (
+                "SEALED_ACCEPTED_INDEX_SCHEMA_VERSION",
+                FormatValue::Number(SEALED_ACCEPTED_INDEX_SCHEMA_VERSION as u64),
+            ),
+            (
+                "SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION",
+                FormatValue::Number(SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION as u64),
+            ),
+            (
+                "SEALED_ACCEPTED_STATUS_SCHEMA_VERSION",
+                FormatValue::Number(SEALED_ACCEPTED_STATUS_SCHEMA_VERSION as u64),
+            ),
+            (
+                "SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION",
+                FormatValue::Number(SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION as u64),
+            ),
+            (
+                "SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION",
+                FormatValue::Number(SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION as u64),
+            ),
+            (
                 "LOCAL_JOURNAL_SEGMENT_HEADER_BYTES",
                 FormatValue::Number(LOCAL_JOURNAL_SEGMENT_HEADER_BYTES as u64),
             ),
@@ -1355,6 +1430,14 @@ mod tests {
             (
                 "SCRATCH_LSM_LEVELS",
                 FormatValue::Number(SCRATCH_LSM_LEVELS as u64),
+            ),
+            (
+                "SEALED_ACCEPTED_SEQUENCE_FANOUT",
+                FormatValue::Number(SEALED_ACCEPTED_SEQUENCE_FANOUT as u64),
+            ),
+            (
+                "SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY",
+                FormatValue::Number(SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY as u64),
             ),
             (
                 "MAX_MANIFEST_BYTES",
@@ -1443,7 +1526,7 @@ mod tests {
         assert_eq!(actual, expected, "managed-storage path vocabulary drifted");
         assert_eq!(
             FORMAT_MANIFEST.len(),
-            31 + expected.len(),
+            38 + expected.len(),
             "a format row was added outside the pinned base or managed-layout inventories",
         );
     }

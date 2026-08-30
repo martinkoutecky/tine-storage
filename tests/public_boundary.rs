@@ -16,6 +16,9 @@
 
 use serde::{Deserialize, Serialize};
 use tine_storage::formats::{self, FormatKind, FormatValue};
+use tine_storage::sealed_accepted_index::{
+    authenticated_map_empty_digest, AcceptedSequenceRootV2, AcceptedStatusRecordV2,
+};
 use tine_storage::sqlite::{
     MaterializationError, PhysicalBlockStructureRow, PhysicalGraphProjectionChange,
     PhysicalGraphProjectionDatabase, PhysicalTaskCandidateBlockRow, SqliteGraphProjectionRead,
@@ -66,6 +69,33 @@ fn content_digests_are_usable_from_outside_the_crate() {
     assert_eq!(digest.as_bytes().len(), 32);
     assert_eq!(digest, ContentDigest::of(b"bytes"));
     assert_ne!(digest, ContentDigest::of(b"other bytes"));
+}
+
+#[test]
+fn sealed_accepted_index_codecs_are_usable_from_outside_the_crate() {
+    let empty = AcceptedSequenceRootV2::empty();
+    assert_eq!(
+        AcceptedSequenceRootV2::decode(&empty.encode().unwrap()).unwrap(),
+        empty
+    );
+
+    let record = AcceptedStatusRecordV2 {
+        batch_id: [7; 16],
+        no_op: false,
+        evidence_schema: 8,
+        exact_evidence_bytes: vec![1, 2, 3],
+        accepted_causal_record_digest: ContentDigest::from_bytes([9; 32]),
+    };
+    let address = record.value_digest();
+    assert_eq!(
+        AcceptedStatusRecordV2::decode(record.batch_id, address, &record.encode().unwrap())
+            .unwrap(),
+        record
+    );
+    assert_eq!(
+        authenticated_map_empty_digest(),
+        ContentDigest::of(b"tine/oplog/authenticated-map/v1/empty")
+    );
 }
 
 /// Compile-use the exact production signatures from an external crate without

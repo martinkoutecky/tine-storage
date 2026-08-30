@@ -35,6 +35,8 @@ pub enum ExportPath {
     Formats,
     /// `tine_storage::api_surface::NAME`
     ApiSurface,
+    /// `tine_storage::sealed_accepted_index::NAME`
+    SealedAcceptedIndex,
 }
 
 impl ExportPath {
@@ -44,6 +46,7 @@ impl ExportPath {
             ExportPath::Sqlite => "tine_storage::sqlite",
             ExportPath::Formats => "tine_storage::formats",
             ExportPath::ApiSurface => "tine_storage::api_surface",
+            ExportPath::SealedAcceptedIndex => "tine_storage::sealed_accepted_index",
         }
     }
 }
@@ -149,11 +152,12 @@ fn leaf_names(item: &str) -> Vec<String> {
 }
 
 /// Isolate the body of `pub mod sqlite { ... }` by brace matching.
-fn sqlite_module_body(lib_rs: &str) -> &str {
+fn inline_module_body<'a>(lib_rs: &'a str, module: &str) -> &'a str {
+    let declaration = format!("pub mod {module} {{");
     let start = lib_rs
-        .find("pub mod sqlite {")
-        .expect("lib.rs must declare `pub mod sqlite`");
-    let body_start = start + "pub mod sqlite {".len();
+        .find(&declaration)
+        .unwrap_or_else(|| panic!("lib.rs must declare `pub mod {module}`"));
+    let body_start = start + declaration.len();
     let mut depth = 1usize;
     for (offset, byte) in lib_rs[body_start..].bytes().enumerate() {
         match byte {
@@ -167,7 +171,7 @@ fn sqlite_module_body(lib_rs: &str) -> &str {
             _ => {}
         }
     }
-    panic!("`pub mod sqlite` is not brace-balanced");
+    panic!("`pub mod {module}` is not brace-balanced");
 }
 
 /// Public items declared directly in a module, as opposed to re-exported into
@@ -209,14 +213,16 @@ pub fn exported_names() -> Vec<ExportedName> {
     const LIB_RS: &str = include_str!("lib.rs");
     const FORMATS_RS: &str = include_str!("formats.rs");
 
-    let sqlite_body = sqlite_module_body(LIB_RS);
-    // The root region is lib.rs with the sqlite module body removed, so an
-    // export inside that module is not counted twice.
-    let root_region = LIB_RS.replace(sqlite_body, "");
+    let sqlite_body = inline_module_body(LIB_RS, "sqlite");
+    let sealed_body = inline_module_body(LIB_RS, "sealed_accepted_index");
+    // The root region is lib.rs with both public facade bodies removed, so an
+    // export inside either module is not counted twice.
+    let root_region = LIB_RS.replace(sqlite_body, "").replace(sealed_body, "");
 
     let mut names = Vec::new();
     names.extend(parse_exports(ExportPath::Root, &root_region));
     names.extend(parse_exports(ExportPath::Sqlite, sqlite_body));
+    names.extend(parse_exports(ExportPath::SealedAcceptedIndex, sealed_body));
     names.extend(parse_exports(ExportPath::Formats, FORMATS_RS));
 
     // Items *declared* in a public module rather than re-exported into it.
@@ -229,7 +235,7 @@ pub fn exported_names() -> Vec<ExportedName> {
     ));
 
     // The public modules are themselves public paths.
-    for module in ["api_surface", "formats", "sqlite"] {
+    for module in ["api_surface", "formats", "sealed_accepted_index", "sqlite"] {
         names.push(ExportedName {
             path: ExportPath::Root,
             name: module.to_string(),

@@ -15,6 +15,13 @@ frontier stamps beside those tables. Consumers use the curated
 `tine_storage::sqlite` facade; it exposes typed physical operations without raw
 connections or DDL construction details.
 
+Checkpoint-generation accepted history uses the separate
+`tine_storage::sealed_accepted_index` facade. It owns canonical logical map and
+sequence algorithms, V2 immutable object codecs, and a storage-agnostic shared
+reader/writer. Tine supplies engine policy and the physical content-addressed
+object store; this crate validates canonical bytes, logical addresses, bounded
+tree shape, and the sequence/status/batch/causal cross-check.
+
 ## Persistent-format identity
 
 `tine_storage::formats` collects every constant that describes bytes already on
@@ -43,6 +50,8 @@ Package-local test ownership is intentionally divided as follows:
 - Persistent-format invariants: `durable_batch::tests` and `digest_sealed::tests`.
 - Durability and filesystem publication invariants: `filesystem::tests`.
 - Authenticated-index invariants: `authenticated_patricia::tests`.
+- Sealed accepted-history index invariants:
+  `sealed_accepted_index_impl::tests`.
 - Scratch lifecycle and retained-run invariants: `scratch::tests`.
 - SQLite transaction and schema invariants: `sqlite_frontier::tests` and
   `sqlite_materialization::tests`.

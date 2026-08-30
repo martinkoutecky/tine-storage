@@ -31,6 +31,7 @@ mod local_journal_v2;
 mod managed_layout;
 mod packed_patricia;
 mod scratch;
+mod sealed_accepted_index_impl;
 mod sqlite_database;
 mod sqlite_fileset;
 mod sqlite_frontier;
@@ -88,6 +89,27 @@ pub mod sqlite {
     pub use crate::sqlite_materialization::{
         apply_change as apply_materialization_change_for_test,
         initialize_schema as initialize_materialization_schema_for_test,
+    };
+}
+
+/// Canonical logical and physical formats for checkpoint-generation accepted
+/// history indexes.
+///
+/// The module is intentionally independent of Tine's engine policy and of any
+/// particular filesystem layout. Both the engine and SQLite compose the same
+/// reader/writer with their own content-addressed object store.
+pub mod sealed_accepted_index {
+    pub use crate::sealed_accepted_index_impl::{
+        accepted_causal_record_digest, authenticated_map_empty_digest,
+        authenticated_map_node_digest, authenticated_map_priority,
+        authenticated_map_priority_order, authenticated_map_root, causal_clock_counter_digest,
+        AcceptedSequenceChildV2, AcceptedSequenceEntryV2, AcceptedSequenceNodeV2,
+        AcceptedSequenceRootV2, AcceptedStatusRecordV2, AuthenticatedMapLinkV1,
+        AuthenticatedMapRootV1, CausalTipRecordV2, SealedAcceptedCausalClockEntryV2,
+        SealedAcceptedCausalRecordV2, SealedAcceptedIndexError, SealedAcceptedIndexObjectStore,
+        SealedAcceptedIndexReader, SealedAcceptedIndexRootsV2, SealedAcceptedIndexWriter,
+        SealedAcceptedMembershipProofV2, SealedAcceptedObjectKind, SealedAuthenticatedMapNodeV2,
+        MAX_ACCEPTED_INDEX_DEPTH,
     };
 }
 

@@ -11,6 +11,9 @@ use std::fmt;
 
 use rusqlite::{params, Connection, OptionalExtension as _, Transaction, TransactionBehavior};
 
+use crate::sealed_accepted_index_impl::{
+    authenticated_map_node_digest, authenticated_map_priority_order,
+};
 use crate::sqlite_materialization::{
     self, ApplyChangeInstrumentation, MaterializationError, PhysicalMaterializationChange,
 };
@@ -879,41 +882,6 @@ fn decode_id(bytes: &[u8], what: &str) -> Result<[u8; 16], FrontierError> {
 struct MapLink {
     key: [u8; 16],
     digest: ContentDigest,
-}
-
-fn authenticated_map_priority(key: [u8; 16]) -> ContentDigest {
-    let mut bytes = b"tine/oplog/authenticated-map/v1/priority\0".to_vec();
-    bytes.extend_from_slice(&key);
-    ContentDigest::of(&bytes)
-}
-
-fn authenticated_map_priority_order(left: [u8; 16], right: [u8; 16]) -> Ordering {
-    authenticated_map_priority(left)
-        .as_bytes()
-        .cmp(authenticated_map_priority(right).as_bytes())
-        .then_with(|| left.cmp(&right))
-}
-
-fn authenticated_map_node_digest(
-    key: [u8; 16],
-    value_digest: ContentDigest,
-    left: Option<([u8; 16], ContentDigest)>,
-    right: Option<([u8; 16], ContentDigest)>,
-) -> ContentDigest {
-    let mut bytes = b"tine/oplog/authenticated-map/v1/node\0".to_vec();
-    bytes.extend_from_slice(&key);
-    bytes.extend_from_slice(value_digest.as_bytes());
-    for child in [left, right] {
-        match child {
-            Some((child_key, digest)) => {
-                bytes.push(1);
-                bytes.extend_from_slice(&child_key);
-                bytes.extend_from_slice(digest.as_bytes());
-            }
-            None => bytes.push(0),
-        }
-    }
-    ContentDigest::of(&bytes)
 }
 
 fn causal_clock_counter_digest(peer: [u8; 16], counter: u64) -> ContentDigest {
