@@ -20,7 +20,8 @@ use tine_storage::sealed_accepted_index::{
     authenticated_map_empty_digest, AcceptedSequenceRootV2, AcceptedStatusRecordV2,
 };
 use tine_storage::sqlite::{
-    MaterializationError, PhysicalBlockStructureRow, PhysicalGraphProjectionChange,
+    MaterializationError, PhysicalBlockStructureRow, PhysicalCheckpointFrontierRoot,
+    PhysicalCheckpointGenerationBinding, PhysicalFrontierRoot, PhysicalGraphProjectionChange,
     PhysicalGraphProjectionDatabase, PhysicalTaskCandidateBlockRow, SqliteGraphProjectionRead,
     SqliteMaterializedRead,
 };
@@ -96,6 +97,66 @@ fn sealed_accepted_index_codecs_are_usable_from_outside_the_crate() {
         authenticated_map_empty_digest(),
         ContentDigest::of(b"tine/oplog/authenticated-map/v1/empty")
     );
+}
+
+#[test]
+fn live_and_checkpoint_frontiers_are_explicit_and_publicly_typed() {
+    let empty = ContentDigest::of(b"empty");
+    let live = PhysicalFrontierRoot {
+        canonical_bytes: vec![1],
+        acceptance_sequence: 0,
+        document_count: 0,
+        document_map_root_key: None,
+        document_map_root_digest: empty,
+        batch_map_root_key: None,
+        batch_map_root_digest: empty,
+        state_digest: empty,
+    };
+    assert_eq!(live.digest(), ContentDigest::of(&[1]));
+
+    let generation = PhysicalCheckpointGenerationBinding {
+        generation_id: [1; 16],
+        predecessor_generation_id: None,
+        full_anchor_generation_id: [1; 16],
+        covered_count: 0,
+        covered_document_count: 0,
+        covered_block_count: 0,
+        covered_retained_bytes_total: 0,
+        covered_semantic_capsules_root_digest: empty,
+        covered_batch_root_key: None,
+        covered_batch_root_digest: empty,
+        covered_status_root_key: None,
+        covered_status_root_digest: empty,
+        covered_sequence_root_digest: None,
+        covered_sequence_height: 0,
+        covered_causal_tip_root_key: None,
+        covered_causal_tip_root_digest: empty,
+        covered_head_facts_root_digest: empty,
+        current_projection_payload_pins_root_digest: empty,
+        nonlinear_state_root_digest: empty,
+        retention_pins_root_digest: empty,
+    };
+    let checkpoint = PhysicalCheckpointFrontierRoot {
+        canonical_bytes: vec![2],
+        acceptance_sequence: 0,
+        document_count: 0,
+        document_overlay_count: 0,
+        retained_bytes_total: 0,
+        document_map_root_key: None,
+        document_map_root_digest: empty,
+        batch_map_root_key: None,
+        batch_map_root_digest: empty,
+        batch_map_count: 0,
+        status_map_root_key: None,
+        status_map_root_digest: empty,
+        status_map_count: 0,
+        sequence_root_digest: None,
+        sequence_height: 0,
+        sequence_count: 0,
+        generation,
+        state_digest: empty,
+    };
+    assert_eq!(checkpoint.digest(), ContentDigest::of(&[2]));
 }
 
 /// Compile-use the exact production signatures from an external crate without
@@ -188,7 +249,7 @@ fn a_receipt_can_be_generated_from_the_public_manifest() {
 fn format_constants_are_reachable_through_formats() {
     assert_eq!(formats::SCRATCH_DIR, "engine-scratch-v2");
     assert!(formats::MAX_OBJECT_BYTES > 0);
-    assert!(formats::SQLITE_SCHEMA_VERSION > 0);
+    assert_eq!(formats::SQLITE_SCHEMA_VERSION, 22);
     assert_eq!(formats::LOCAL_JOURNAL_SEGMENT_PROTOCOL_VERSION, 2);
     assert_eq!(formats::LOCAL_JOURNAL_SEGMENT_HEADER_BYTES, 136);
     assert_eq!(formats::LOCAL_JOURNAL_FRONTIER_BYTES, 240);

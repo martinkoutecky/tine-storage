@@ -13,16 +13,16 @@ use rusqlite::TransactionBehavior;
 use rusqlite::{params, Connection, OpenFlags};
 
 use crate::sqlite_frontier::{
-    self, ApplyResult, FrontierError, PhysicalApplyRequest, PhysicalClaim,
-    PhysicalFrontierDocument, PhysicalFrontierRoot, PreflightDisposition, StoredBatch,
-    StoredFrontier,
+    self, ApplyResult, FrontierError, PhysicalApplyRequest, PhysicalCheckpointFrontierRoot,
+    PhysicalCheckpointGenerationAnchor, PhysicalClaim, PhysicalFrontierDocument,
+    PhysicalFrontierRoot, PreflightDisposition, StoredBatch, StoredFrontier,
 };
 use crate::sqlite_materialization::{
     self, PhysicalSearchIndexBuildStep, PhysicalSearchIndexStatus, SqliteMaterializedRead,
 };
 #[cfg(any(test, feature = "test-support"))]
 use crate::sqlite_materialization::{ApplyChangeInstrumentation, PhysicalMaterializationChange};
-use crate::ContentDigest;
+use crate::{sealed_accepted_index_impl::SealedAcceptedIndexRead, ContentDigest};
 
 /// Prepared-statement cache size for the writable connection.
 const PREPARED_STATEMENT_CACHE_STATEMENTS: usize = 64;
@@ -103,6 +103,20 @@ impl PhysicalSqliteDatabase {
         empty_frontier: &[u8],
     ) -> Result<(), FrontierError> {
         sqlite_frontier::initialize_schema(&self.connection, claim, empty_frontier)
+    }
+
+    pub fn initialize_checkpoint_candidate_schema(
+        &self,
+        claim: PhysicalClaim,
+        root: &PhysicalCheckpointFrontierRoot,
+        anchor: &PhysicalCheckpointGenerationAnchor,
+    ) -> Result<(), FrontierError> {
+        sqlite_frontier::initialize_checkpoint_candidate_schema(
+            &self.connection,
+            claim,
+            root,
+            anchor,
+        )
     }
 
     pub fn validate_schema_and_claim(&self, claim: PhysicalClaim) -> Result<(), FrontierError> {
@@ -188,6 +202,47 @@ impl PhysicalSqliteDatabase {
         ancestor: [u8; 16],
     ) -> Result<bool, FrontierError> {
         sqlite_frontier::batch_descends_from(&self.connection, root, descendant, ancestor)
+    }
+
+    pub fn contains_checkpoint_batch(
+        &self,
+        root: &PhysicalCheckpointFrontierRoot,
+        sealed: &dyn SealedAcceptedIndexRead,
+        batch_id: [u8; 16],
+    ) -> Result<bool, FrontierError> {
+        sqlite_frontier::contains_checkpoint_batch(&self.connection, root, sealed, batch_id)
+    }
+
+    pub fn authenticate_checkpoint_batch(
+        &self,
+        root: &PhysicalCheckpointFrontierRoot,
+        sealed: &dyn SealedAcceptedIndexRead,
+        batch_id: [u8; 16],
+        causal_record_digest: ContentDigest,
+    ) -> Result<bool, FrontierError> {
+        sqlite_frontier::authenticate_checkpoint_batch(
+            &self.connection,
+            root,
+            sealed,
+            batch_id,
+            causal_record_digest,
+        )
+    }
+
+    pub fn checkpoint_batch_descends_from(
+        &self,
+        root: &PhysicalCheckpointFrontierRoot,
+        sealed: &dyn SealedAcceptedIndexRead,
+        descendant: [u8; 16],
+        ancestor: [u8; 16],
+    ) -> Result<bool, FrontierError> {
+        sqlite_frontier::checkpoint_batch_descends_from(
+            &self.connection,
+            root,
+            sealed,
+            descendant,
+            ancestor,
+        )
     }
 
     pub fn frontier_document(

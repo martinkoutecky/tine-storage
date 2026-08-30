@@ -780,8 +780,8 @@ pub struct SealedAcceptedMembershipProofV2 {
 
 /// Domain fields recovered from one exact canonical accepted-evidence value.
 ///
-/// `tine-storage` deliberately does not own Tine's V1/V2 evidence codecs. The
-/// caller-supplied decoder below validates those bytes without causing this
+/// `tine-storage` deliberately does not own Tine's accepted-evidence codec. The
+/// caller-supplied decoder below validates the current bytes without causing this
 /// physical crate to depend on the engine crate; the sealed reader then binds
 /// the decoded identity to all three authenticated index edges.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -798,6 +798,24 @@ pub trait SealedAcceptedEvidenceDecoder {
         evidence_schema: u32,
         exact_evidence_bytes: &[u8],
     ) -> Result<AcceptedEvidenceBindingV2, SealedAcceptedIndexError>;
+}
+
+/// Read-only covered-node seam used by SQLite's hot-first composite index.
+///
+/// Implementations expose only already-sealed immutable objects. They cannot
+/// publish, enumerate, or reinterpret a missing covered object as an ordinary
+/// cache miss.
+pub trait SealedAcceptedIndexRead {
+    fn sealed_map_node(
+        &self,
+        link: AuthenticatedMapLinkV1,
+    ) -> Result<SealedAuthenticatedMapNodeV2, SealedAcceptedIndexError>;
+
+    fn sealed_causal_record(
+        &self,
+        batch_id: [u8; 16],
+        address: ContentDigest,
+    ) -> Result<SealedAcceptedCausalRecordV2, SealedAcceptedIndexError>;
 }
 
 pub struct SealedAcceptedIndexReader<'a, Store> {
@@ -933,7 +951,7 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexReader<'a, St
         }))
     }
 
-    fn read_map_node(
+    pub fn read_map_node(
         &self,
         link: AuthenticatedMapLinkV1,
     ) -> Result<SealedAuthenticatedMapNodeV2, SealedAcceptedIndexError> {
@@ -949,6 +967,25 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexReader<'a, St
         self.store
             .read_sealed_accepted_object(kind, address)?
             .ok_or(SealedAcceptedIndexError::Missing { kind, address })
+    }
+}
+
+impl<Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexRead
+    for SealedAcceptedIndexReader<'_, Store>
+{
+    fn sealed_map_node(
+        &self,
+        link: AuthenticatedMapLinkV1,
+    ) -> Result<SealedAuthenticatedMapNodeV2, SealedAcceptedIndexError> {
+        self.read_map_node(link)
+    }
+
+    fn sealed_causal_record(
+        &self,
+        batch_id: [u8; 16],
+        address: ContentDigest,
+    ) -> Result<SealedAcceptedCausalRecordV2, SealedAcceptedIndexError> {
+        self.causal(batch_id, address)
     }
 }
 

@@ -1304,7 +1304,7 @@ mod tests {
         assert_eq!(SCRATCH_SCHEMA_VERSION, 13);
         assert_eq!(SCRATCH_PAGE_SCHEMA_VERSION, 1);
         assert_eq!(SQLITE_APPLICATION_ID, 0x5449_4e45);
-        assert_eq!(SQLITE_SCHEMA_VERSION, 21);
+        assert_eq!(SQLITE_SCHEMA_VERSION, 22);
         assert_eq!(SEALED_ACCEPTED_INDEX_SCHEMA_VERSION, 2);
         assert_eq!(SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION, 2);
         assert_eq!(SEALED_ACCEPTED_STATUS_SCHEMA_VERSION, 2);

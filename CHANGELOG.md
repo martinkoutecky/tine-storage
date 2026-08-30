@@ -5,6 +5,29 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.8.14] - 2026-08-30
+
+### Added
+
+- SQLite frontier APIs now expose an explicit checkpoint-generation binding,
+  anchor, and candidate frontier plus read-only hot-plus-sealed membership,
+  authentication, and causal-containment entry points. Missing covered objects
+  remain corruption; the injection seam cannot publish or enumerate sealed
+  history.
+- The one current SQLite schema includes the checkpoint-generation anchor table
+  used by a separately constructed candidate while keeping active
+  `applied_batches` and materialization rows tail-relative.
+
+### Changed
+
+- The SQLite schema advances to 22 as a pre-0.7 blank-slate change. The crate
+  implements no older schema reader, compatibility fixture, or migration path;
+  Tine preserves unrecognized private state and rebuilds from Markdown/Org.
+- A checkpoint candidate is a separate disposable file under the same current
+  schema. This release adds no production checkpoint marker, selector, or
+  cutover path, and a regression proves candidate construction never mutates
+  the live file.
+
 ## [0.8.13] - 2026-08-30
 
 ### Fixed

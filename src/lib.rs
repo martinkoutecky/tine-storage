@@ -54,8 +54,9 @@ pub mod sqlite {
     };
     pub use crate::sqlite_frontier::{
         ApplyDisposition, ApplyFault, ApplyResult, FrontierError, PhysicalAcceptedBatch,
-        PhysicalApplyRequest, PhysicalClaim, PhysicalFrontierDocument, PhysicalFrontierRoot,
-        PreflightDisposition, StoredBatch, StoredFrontier,
+        PhysicalApplyRequest, PhysicalCheckpointFrontierRoot, PhysicalCheckpointGenerationAnchor,
+        PhysicalCheckpointGenerationBinding, PhysicalClaim, PhysicalFrontierDocument,
+        PhysicalFrontierRoot, PreflightDisposition, StoredBatch, StoredFrontier,
     };
     pub use crate::sqlite_graph_projection::{
         PhysicalGraphProjectionDatabase, PhysicalGraphProjectionSourceDelta,
@@ -108,9 +109,9 @@ pub mod sealed_accepted_index {
         AuthenticatedMapLinkV1, AuthenticatedMapRootV1, CausalTipRecordV2,
         SealedAcceptedCausalClockEntryV2, SealedAcceptedCausalRecordV2,
         SealedAcceptedEvidenceDecoder, SealedAcceptedIndexError, SealedAcceptedIndexObjectStore,
-        SealedAcceptedIndexReader, SealedAcceptedIndexRootsV2, SealedAcceptedIndexWriter,
-        SealedAcceptedMembershipProofV2, SealedAcceptedObjectKind, SealedAuthenticatedMapNodeV2,
-        MAX_ACCEPTED_INDEX_DEPTH,
+        SealedAcceptedIndexRead, SealedAcceptedIndexReader, SealedAcceptedIndexRootsV2,
+        SealedAcceptedIndexWriter, SealedAcceptedMembershipProofV2, SealedAcceptedObjectKind,
+        SealedAuthenticatedMapNodeV2, MAX_ACCEPTED_INDEX_DEPTH,
     };
 }
 

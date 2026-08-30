@@ -14,6 +14,7 @@ use rusqlite::{params, Connection, OptionalExtension as _, Transaction, Transact
 use crate::sealed_accepted_index_impl::{
     accepted_causal_record_digest, authenticated_map_empty_digest, authenticated_map_node_digest,
     authenticated_map_priority_order, causal_clock_counter_digest, AuthenticatedMapLinkV1,
+    SealedAcceptedCausalRecordV2, SealedAcceptedIndexError, SealedAcceptedIndexRead,
 };
 use crate::sqlite_materialization::{
     self, ApplyChangeInstrumentation, MaterializationError, PhysicalMaterializationChange,
@@ -21,7 +22,7 @@ use crate::sqlite_materialization::{
 use crate::ContentDigest;
 
 pub const SQLITE_APPLICATION_ID: u32 = 0x5449_4e45;
-pub const SQLITE_SCHEMA_VERSION: u32 = 21;
+pub const SQLITE_SCHEMA_VERSION: u32 = 22;
 const MAX_AUTHENTICATED_MAP_DEPTH: usize = 256;
 
 pub const META_DDL: &str = "CREATE TABLE meta (
@@ -107,17 +108,64 @@ pub const APPLIED_BATCHES_DDL: &str = "CREATE TABLE applied_batches (
     acceptance_sequence INTEGER NOT NULL CHECK (acceptance_sequence > 0),
     retained_bytes INTEGER NOT NULL CHECK (retained_bytes >= 0)
 ) STRICT";
+pub const CHECKPOINT_GENERATION_ANCHOR_DDL: &str = "CREATE TABLE checkpoint_generation_anchor (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    generation_id BLOB NOT NULL CHECK (length(generation_id) = 16),
+    predecessor_generation_id BLOB,
+    full_anchor_generation_id BLOB NOT NULL CHECK (length(full_anchor_generation_id) = 16),
+    covered_count INTEGER NOT NULL CHECK (covered_count >= 0),
+    covered_document_count INTEGER NOT NULL CHECK (covered_document_count >= 0),
+    covered_block_count INTEGER NOT NULL CHECK (covered_block_count >= 0),
+    covered_retained_bytes_total INTEGER NOT NULL CHECK (covered_retained_bytes_total >= 0),
+    covered_semantic_capsules_root_digest BLOB NOT NULL
+        CHECK (length(covered_semantic_capsules_root_digest) = 32),
+    covered_batch_root_key BLOB,
+    covered_batch_root_digest BLOB NOT NULL CHECK (length(covered_batch_root_digest) = 32),
+    covered_status_root_key BLOB,
+    covered_status_root_digest BLOB NOT NULL CHECK (length(covered_status_root_digest) = 32),
+    covered_sequence_root_digest BLOB,
+    covered_sequence_height INTEGER NOT NULL
+        CHECK (covered_sequence_height >= 0 AND covered_sequence_height <= 255),
+    covered_causal_tip_root_key BLOB,
+    covered_causal_tip_root_digest BLOB NOT NULL
+        CHECK (length(covered_causal_tip_root_digest) = 32),
+    covered_head_facts_root_digest BLOB NOT NULL
+        CHECK (length(covered_head_facts_root_digest) = 32),
+    current_projection_payload_pins_root_digest BLOB NOT NULL
+        CHECK (length(current_projection_payload_pins_root_digest) = 32),
+    nonlinear_state_root_digest BLOB NOT NULL CHECK (length(nonlinear_state_root_digest) = 32),
+    retention_pins_root_digest BLOB NOT NULL CHECK (length(retention_pins_root_digest) = 32),
+    checkpoint_frontier_root BLOB NOT NULL,
+    checkpoint_frontier_root_digest BLOB NOT NULL
+        CHECK (length(checkpoint_frontier_root_digest) = 32),
+    terminal_batch_id BLOB,
+    terminal_evidence_digest BLOB,
+    materialization_frontier_root_digest BLOB NOT NULL
+        CHECK (length(materialization_frontier_root_digest) = 32),
+    CHECK (predecessor_generation_id IS NULL OR length(predecessor_generation_id) = 16),
+    CHECK ((covered_batch_root_key IS NULL AND covered_count = 0)
+        OR length(covered_batch_root_key) = 16),
+    CHECK ((covered_status_root_key IS NULL AND covered_count = 0)
+        OR length(covered_status_root_key) = 16),
+    CHECK ((covered_sequence_root_digest IS NULL AND covered_count = 0)
+        OR length(covered_sequence_root_digest) = 32),
+    CHECK ((covered_causal_tip_root_key IS NULL AND covered_count = 0)
+        OR length(covered_causal_tip_root_key) = 16),
+    CHECK ((terminal_batch_id IS NULL AND terminal_evidence_digest IS NULL AND covered_count = 0)
+        OR (length(terminal_batch_id) = 16 AND length(terminal_evidence_digest) = 32))
+) STRICT";
 pub const BATCH_ID_INDEX_DDL: &str =
     "CREATE UNIQUE INDEX applied_batches_batch_id_uq ON applied_batches(batch_id)";
 pub const ACCEPTANCE_SEQUENCE_INDEX_DDL: &str = "CREATE UNIQUE INDEX \
     applied_batches_acceptance_sequence_uq ON applied_batches(acceptance_sequence)";
 
-const EXPECTED_TABLES: [&str; 37] = [
+const EXPECTED_TABLES: [&str; 38] = [
     "accepted_batch_nodes",
     "applied_batches",
     "block_home_claims",
     "blocks",
     "causal_clock_nodes",
+    "checkpoint_generation_anchor",
     "frontier",
     "frontier_documents",
     "logseq_uuid_introductions",
@@ -245,6 +293,34 @@ const APPLIED_BATCH_COLUMNS: &[&str] = &[
     "acceptance_sequence",
     "retained_bytes",
 ];
+const CHECKPOINT_GENERATION_ANCHOR_COLUMNS: &[&str] = &[
+    "singleton",
+    "generation_id",
+    "predecessor_generation_id",
+    "full_anchor_generation_id",
+    "covered_count",
+    "covered_document_count",
+    "covered_block_count",
+    "covered_retained_bytes_total",
+    "covered_semantic_capsules_root_digest",
+    "covered_batch_root_key",
+    "covered_batch_root_digest",
+    "covered_status_root_key",
+    "covered_status_root_digest",
+    "covered_sequence_root_digest",
+    "covered_sequence_height",
+    "covered_causal_tip_root_key",
+    "covered_causal_tip_root_digest",
+    "covered_head_facts_root_digest",
+    "current_projection_payload_pins_root_digest",
+    "nonlinear_state_root_digest",
+    "retention_pins_root_digest",
+    "checkpoint_frontier_root",
+    "checkpoint_frontier_root_digest",
+    "terminal_batch_id",
+    "terminal_evidence_digest",
+    "materialization_frontier_root_digest",
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PhysicalClaim {
@@ -270,6 +346,67 @@ pub struct PhysicalFrontierRoot {
 }
 
 impl PhysicalFrontierRoot {
+    pub fn digest(&self) -> ContentDigest {
+        ContentDigest::of(&self.canonical_bytes)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalCheckpointGenerationBinding {
+    pub generation_id: [u8; 16],
+    pub predecessor_generation_id: Option<[u8; 16]>,
+    pub full_anchor_generation_id: [u8; 16],
+    pub covered_count: u64,
+    pub covered_document_count: u64,
+    pub covered_block_count: u64,
+    pub covered_retained_bytes_total: u64,
+    pub covered_semantic_capsules_root_digest: ContentDigest,
+    pub covered_batch_root_key: Option<[u8; 16]>,
+    pub covered_batch_root_digest: ContentDigest,
+    pub covered_status_root_key: Option<[u8; 16]>,
+    pub covered_status_root_digest: ContentDigest,
+    pub covered_sequence_root_digest: Option<ContentDigest>,
+    pub covered_sequence_height: u8,
+    pub covered_causal_tip_root_key: Option<[u8; 16]>,
+    pub covered_causal_tip_root_digest: ContentDigest,
+    pub covered_head_facts_root_digest: ContentDigest,
+    pub current_projection_payload_pins_root_digest: ContentDigest,
+    pub nonlinear_state_root_digest: ContentDigest,
+    pub retention_pins_root_digest: ContentDigest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalCheckpointGenerationAnchor {
+    pub generation: PhysicalCheckpointGenerationBinding,
+    pub checkpoint_frontier_root: Vec<u8>,
+    pub terminal_batch_id: Option<[u8; 16]>,
+    pub terminal_evidence_digest: Option<ContentDigest>,
+    pub materialization_frontier_root_digest: ContentDigest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalCheckpointFrontierRoot {
+    pub canonical_bytes: Vec<u8>,
+    pub acceptance_sequence: u64,
+    pub document_count: u64,
+    pub document_overlay_count: u64,
+    pub retained_bytes_total: u64,
+    pub document_map_root_key: Option<[u8; 16]>,
+    pub document_map_root_digest: ContentDigest,
+    pub batch_map_root_key: Option<[u8; 16]>,
+    pub batch_map_root_digest: ContentDigest,
+    pub batch_map_count: u64,
+    pub status_map_root_key: Option<[u8; 16]>,
+    pub status_map_root_digest: ContentDigest,
+    pub status_map_count: u64,
+    pub sequence_root_digest: Option<ContentDigest>,
+    pub sequence_height: u8,
+    pub sequence_count: u64,
+    pub generation: PhysicalCheckpointGenerationBinding,
+    pub state_digest: ContentDigest,
+}
+
+impl PhysicalCheckpointFrontierRoot {
     pub fn digest(&self) -> ContentDigest {
         ContentDigest::of(&self.canonical_bytes)
     }
@@ -371,6 +508,7 @@ pub struct StoredBatch {
 pub enum FrontierError {
     Sqlite(String),
     Materialization(MaterializationError),
+    SealedAcceptedIndex(SealedAcceptedIndexError),
     Schema(String),
     ClaimBytes {
         field: &'static str,
@@ -400,6 +538,7 @@ impl fmt::Display for FrontierError {
         match self {
             Self::Sqlite(error) => write!(formatter, "SQLite frontier error: {error}"),
             Self::Materialization(error) => error.fmt(formatter),
+            Self::SealedAcceptedIndex(error) => error.fmt(formatter),
             Self::Schema(error) => write!(formatter, "SQLite frontier schema mismatch: {error}"),
             Self::ClaimBytes { field, .. } => write!(formatter, "SQLite claim {field} mismatch"),
             Self::ClaimVersion {
@@ -451,6 +590,12 @@ impl From<MaterializationError> for FrontierError {
     }
 }
 
+impl From<SealedAcceptedIndexError> for FrontierError {
+    fn from(value: SealedAcceptedIndexError) -> Self {
+        Self::SealedAcceptedIndex(value)
+    }
+}
+
 struct HexId<'a>(&'a [u8; 16]);
 impl fmt::Display for HexId<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -476,7 +621,8 @@ pub fn initialize_schema(
          PRAGMA user_version = {SQLITE_SCHEMA_VERSION};
          {META_DDL}; {FRONTIER_DDL}; {FRONTIER_DOCUMENTS_DDL};
          {CAUSAL_CLOCK_NODES_DDL}; {ACCEPTED_BATCH_NODES_DDL};
-         {APPLIED_BATCHES_DDL}; {BATCH_ID_INDEX_DDL}; {ACCEPTANCE_SEQUENCE_INDEX_DDL};"
+         {APPLIED_BATCHES_DDL}; {CHECKPOINT_GENERATION_ANCHOR_DDL};
+         {BATCH_ID_INDEX_DDL}; {ACCEPTANCE_SEQUENCE_INDEX_DDL};"
     ))?;
     let empty_digest = ContentDigest::of(empty_frontier);
     sqlite_materialization::initialize_schema(&transaction, empty_digest)?;
@@ -507,6 +653,195 @@ pub fn initialize_schema(
     Ok(())
 }
 
+pub fn initialize_checkpoint_candidate_schema(
+    connection: &Connection,
+    claim: PhysicalClaim,
+    root: &PhysicalCheckpointFrontierRoot,
+    anchor: &PhysicalCheckpointGenerationAnchor,
+) -> Result<(), FrontierError> {
+    validate_checkpoint_anchor_input(root, anchor)?;
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(&format!(
+        "PRAGMA application_id = {SQLITE_APPLICATION_ID};
+         PRAGMA user_version = {SQLITE_SCHEMA_VERSION};
+         {META_DDL}; {FRONTIER_DDL}; {FRONTIER_DOCUMENTS_DDL};
+         {CAUSAL_CLOCK_NODES_DDL}; {ACCEPTED_BATCH_NODES_DDL};
+         {APPLIED_BATCHES_DDL}; {CHECKPOINT_GENERATION_ANCHOR_DDL};
+         {BATCH_ID_INDEX_DDL}; {ACCEPTANCE_SEQUENCE_INDEX_DDL};"
+    ))?;
+    sqlite_materialization::initialize_schema(&transaction, root.digest())?;
+    transaction.execute(
+        "UPDATE materialization_stamp
+         SET acceptance_sequence = ?1, frontier_root_digest = ?2
+         WHERE singleton = 1",
+        params![
+            sqlite_i64(root.acceptance_sequence, "acceptance sequence")?,
+            anchor
+                .materialization_frontier_root_digest
+                .as_bytes()
+                .as_slice(),
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO meta (
+             singleton, workspace_id, lineage_digest, oplog_protocol_version,
+             operation_schema_version, object_envelope_schema_version,
+             manifest_encoding_version, managed_entity_set_version
+         ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            claim.workspace_id.as_slice(),
+            claim.lineage_digest.as_bytes().as_slice(),
+            i64::from(claim.oplog_protocol_version),
+            i64::from(claim.operation_schema_version),
+            i64::from(claim.object_envelope_schema_version),
+            i64::from(claim.manifest_encoding_version),
+            i64::from(claim.managed_entity_set_version),
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO frontier (
+             singleton, frontier_root, frontier_root_digest, applied_batch_count
+         ) VALUES (1, ?1, ?2, ?3)",
+        params![
+            root.canonical_bytes.as_slice(),
+            root.digest().as_bytes().as_slice(),
+            sqlite_i64(root.acceptance_sequence, "acceptance sequence")?,
+        ],
+    )?;
+    let generation = &anchor.generation;
+    transaction.execute(
+        "INSERT INTO checkpoint_generation_anchor (
+             singleton, generation_id, predecessor_generation_id,
+             full_anchor_generation_id, covered_count, covered_document_count,
+             covered_block_count, covered_retained_bytes_total,
+             covered_semantic_capsules_root_digest, covered_batch_root_key,
+             covered_batch_root_digest, covered_status_root_key,
+             covered_status_root_digest, covered_sequence_root_digest,
+             covered_sequence_height, covered_causal_tip_root_key,
+             covered_causal_tip_root_digest, covered_head_facts_root_digest,
+             current_projection_payload_pins_root_digest,
+             nonlinear_state_root_digest, retention_pins_root_digest,
+             checkpoint_frontier_root, checkpoint_frontier_root_digest,
+             terminal_batch_id, terminal_evidence_digest,
+             materialization_frontier_root_digest
+         ) VALUES (
+             1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+             ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
+         )",
+        params![
+            generation.generation_id.as_slice(),
+            generation
+                .predecessor_generation_id
+                .as_ref()
+                .map(|value| value.as_slice()),
+            generation.full_anchor_generation_id.as_slice(),
+            sqlite_i64(generation.covered_count, "covered count")?,
+            sqlite_i64(generation.covered_document_count, "covered document count")?,
+            sqlite_i64(generation.covered_block_count, "covered block count")?,
+            sqlite_i64(
+                generation.covered_retained_bytes_total,
+                "covered retained bytes"
+            )?,
+            generation
+                .covered_semantic_capsules_root_digest
+                .as_bytes()
+                .as_slice(),
+            generation
+                .covered_batch_root_key
+                .as_ref()
+                .map(|value| value.as_slice()),
+            generation.covered_batch_root_digest.as_bytes().as_slice(),
+            generation
+                .covered_status_root_key
+                .as_ref()
+                .map(|value| value.as_slice()),
+            generation.covered_status_root_digest.as_bytes().as_slice(),
+            generation
+                .covered_sequence_root_digest
+                .as_ref()
+                .map(|value| value.as_bytes().as_slice()),
+            i64::from(generation.covered_sequence_height),
+            generation
+                .covered_causal_tip_root_key
+                .as_ref()
+                .map(|value| value.as_slice()),
+            generation
+                .covered_causal_tip_root_digest
+                .as_bytes()
+                .as_slice(),
+            generation
+                .covered_head_facts_root_digest
+                .as_bytes()
+                .as_slice(),
+            generation
+                .current_projection_payload_pins_root_digest
+                .as_bytes()
+                .as_slice(),
+            generation.nonlinear_state_root_digest.as_bytes().as_slice(),
+            generation.retention_pins_root_digest.as_bytes().as_slice(),
+            anchor.checkpoint_frontier_root.as_slice(),
+            ContentDigest::of(&anchor.checkpoint_frontier_root)
+                .as_bytes()
+                .as_slice(),
+            anchor
+                .terminal_batch_id
+                .as_ref()
+                .map(|value| value.as_slice()),
+            anchor
+                .terminal_evidence_digest
+                .as_ref()
+                .map(|value| value.as_bytes().as_slice()),
+            anchor
+                .materialization_frontier_root_digest
+                .as_bytes()
+                .as_slice(),
+        ],
+    )?;
+    validate_schema_and_claim(&transaction, claim)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn sqlite_i64(value: u64, field: &str) -> Result<i64, FrontierError> {
+    i64::try_from(value).map_err(|_| FrontierError::InvalidInput(format!("{field} exceeds SQLite")))
+}
+
+fn validate_checkpoint_anchor_input(
+    root: &PhysicalCheckpointFrontierRoot,
+    anchor: &PhysicalCheckpointGenerationAnchor,
+) -> Result<(), FrontierError> {
+    let generation = &anchor.generation;
+    let count = generation.covered_count;
+    let terminal_pair_is_valid = if count == 0 {
+        anchor.terminal_batch_id.is_none() && anchor.terminal_evidence_digest.is_none()
+    } else {
+        anchor.terminal_batch_id.is_some() && anchor.terminal_evidence_digest.is_some()
+    };
+    if root.generation != *generation
+        || root.acceptance_sequence != count
+        || root.document_count != generation.covered_document_count
+        || root.document_overlay_count != 0
+        || root.retained_bytes_total != generation.covered_retained_bytes_total
+        || root.batch_map_root_key != generation.covered_batch_root_key
+        || root.batch_map_root_digest != generation.covered_batch_root_digest
+        || root.batch_map_count != count
+        || root.status_map_root_key != generation.covered_status_root_key
+        || root.status_map_root_digest != generation.covered_status_root_digest
+        || root.status_map_count != count
+        || root.sequence_root_digest != generation.covered_sequence_root_digest
+        || root.sequence_height != generation.covered_sequence_height
+        || root.sequence_count != count
+        || anchor.checkpoint_frontier_root != root.canonical_bytes
+        || anchor.materialization_frontier_root_digest != root.digest()
+        || !terminal_pair_is_valid
+    {
+        return Err(FrontierError::InvalidInput(
+            "checkpoint-generation anchor does not match its checkpoint frontier".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn validate_schema_and_claim(
     connection: &Connection,
     claim: PhysicalClaim,
@@ -521,7 +856,7 @@ pub fn validate_schema_and_claim(
     let user_version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if user_version != SQLITE_SCHEMA_VERSION {
         return Err(FrontierError::Schema(format!(
-            "user_version {user_version} != {SQLITE_SCHEMA_VERSION}"
+            "unsupported SQLite frontier user_version {user_version}; current is {SQLITE_SCHEMA_VERSION}"
         )));
     }
     let journal_mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
@@ -537,7 +872,7 @@ pub fn validate_schema_and_claim(
         .collect();
     if tables != expected_tables {
         return Err(FrontierError::Schema(format!(
-            "unexpected P2.1 tables: {tables:?}"
+            "unexpected SQLite schema tables: {tables:?}"
         )));
     }
     let indexes = schema_names(connection, "index")?;
@@ -547,7 +882,7 @@ pub fn validate_schema_and_claim(
         .collect();
     if indexes != expected_indexes {
         return Err(FrontierError::Schema(format!(
-            "unexpected P2.1 indexes: {indexes:?}"
+            "unexpected SQLite schema indexes: {indexes:?}"
         )));
     }
     for (table, columns) in [
@@ -560,6 +895,11 @@ pub fn validate_schema_and_claim(
     ] {
         validate_table_columns(connection, table, columns)?;
     }
+    validate_table_columns(
+        connection,
+        "checkpoint_generation_anchor",
+        CHECKPOINT_GENERATION_ANCHOR_COLUMNS,
+    )?;
     for (kind, name, ddl) in [
         ("table", "meta", META_DDL),
         ("table", "frontier", FRONTIER_DDL),
@@ -576,6 +916,12 @@ pub fn validate_schema_and_claim(
     ] {
         validate_schema_sql(connection, kind, name, ddl)?;
     }
+    validate_schema_sql(
+        connection,
+        "table",
+        "checkpoint_generation_anchor",
+        CHECKPOINT_GENERATION_ANCHOR_DDL,
+    )?;
     sqlite_materialization::validate_schema(connection)?;
     let stored: (Vec<u8>, Vec<u8>, i64, i64, i64, i64, i64) = connection.query_row(
         "SELECT workspace_id, lineage_digest, oplog_protocol_version,
@@ -632,14 +978,96 @@ pub fn validate_schema_and_claim(
             });
         }
     }
-    let counts: (i64, i64) = connection.query_row(
-        "SELECT (SELECT COUNT(*) FROM meta), (SELECT COUNT(*) FROM frontier)",
+    let counts: (i64, i64, i64) = connection.query_row(
+        "SELECT (SELECT COUNT(*) FROM meta), (SELECT COUNT(*) FROM frontier),
+                (SELECT COUNT(*) FROM checkpoint_generation_anchor)",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    if counts.0 != 1 || counts.1 != 1 || !(0..=1).contains(&counts.2) {
+        return Err(FrontierError::Corrupt(
+            "meta/frontier/checkpoint singleton cardinality is invalid".into(),
+        ));
+    }
+    if counts.2 == 1 {
+        validate_checkpoint_generation_anchor(connection)?;
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_generation_anchor(connection: &Connection) -> Result<(), FrontierError> {
+    let stored: (
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+        i64,
+        Vec<u8>,
+    ) = connection
+        .query_row(
+            "SELECT covered_count, checkpoint_frontier_root,
+                    checkpoint_frontier_root_digest, terminal_batch_id,
+                    terminal_evidence_digest, covered_sequence_height,
+                    materialization_frontier_root_digest
+             FROM checkpoint_generation_anchor WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .map_err(|error| {
+            FrontierError::Corrupt(format!(
+                "checkpoint-generation anchor singleton is missing or malformed: {error}"
+            ))
+        })?;
+    let covered_count = u64::try_from(stored.0)
+        .map_err(|_| FrontierError::Corrupt("covered count is negative".into()))?;
+    if stored.2.as_slice() != ContentDigest::of(&stored.1).as_bytes() || stored.6 != stored.2 {
+        return Err(FrontierError::Corrupt(
+            "checkpoint frontier digest does not match its canonical bytes".into(),
+        ));
+    }
+    let terminal_pair_is_valid = if covered_count == 0 {
+        stored.3.is_none() && stored.4.is_none()
+    } else {
+        stored.3.as_ref().is_some_and(|value| value.len() == 16)
+            && stored.4.as_ref().is_some_and(|value| value.len() == 32)
+    };
+    if !terminal_pair_is_valid || !(0..=255).contains(&stored.5) {
+        return Err(FrontierError::Corrupt(
+            "checkpoint-generation anchor terminal evidence is invalid".into(),
+        ));
+    }
+    let (frontier_bytes, frontier_digest, applied_count): (Vec<u8>, Vec<u8>, i64) = connection
+        .query_row(
+            "SELECT frontier_root, frontier_root_digest, applied_batch_count
+             FROM frontier WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+    if frontier_bytes != stored.1 || frontier_digest != stored.2 || applied_count < stored.0 {
+        return Err(FrontierError::Corrupt(
+            "active frontier is behind or misbound to its generation anchor".into(),
+        ));
+    }
+    let (materialized_count, materialized_frontier): (i64, Vec<u8>) = connection.query_row(
+        "SELECT acceptance_sequence, frontier_root_digest
+         FROM materialization_stamp WHERE singleton = 1",
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if counts != (1, 1) {
+    if materialized_count != applied_count || materialized_frontier != frontier_digest {
         return Err(FrontierError::Corrupt(
-            "meta/frontier singleton cardinality is invalid".into(),
+            "materialization stamp is not bound to the active checkpoint frontier".into(),
         ));
     }
     Ok(())
@@ -1014,7 +1442,19 @@ fn load_batch_map_node(
     connection: &Connection,
     expected: &MapLink,
 ) -> Result<BatchMapNode, FrontierError> {
-    let stored = connection
+    load_hot_batch_map_node(connection, expected)?.ok_or_else(|| {
+        FrontierError::Corrupt(format!(
+            "authenticated accepted-batch node {} is missing",
+            expected.digest
+        ))
+    })
+}
+
+fn load_hot_batch_map_node(
+    connection: &Connection,
+    expected: &MapLink,
+) -> Result<Option<BatchMapNode>, FrontierError> {
+    let Some(stored) = connection
         .query_row(
             "SELECT batch_id, value_digest, left_batch_id, left_digest,
                 right_batch_id, right_digest FROM accepted_batch_nodes WHERE node_digest = ?1",
@@ -1031,12 +1471,9 @@ fn load_batch_map_node(
             },
         )
         .optional()?
-        .ok_or_else(|| {
-            FrontierError::Corrupt(format!(
-                "authenticated accepted-batch node {} is missing",
-                expected.digest
-            ))
-        })?;
+    else {
+        return Ok(None);
+    };
     let batch_id = decode_id(&stored.0, "batch ID")?;
     let node = BatchMapNode {
         batch_id,
@@ -1058,7 +1495,7 @@ fn load_batch_map_node(
             "authenticated accepted-batch node is misbound".into(),
         ));
     }
-    Ok(node)
+    Ok(Some(node))
 }
 
 fn batch_map_value(
@@ -1082,6 +1519,87 @@ fn batch_map_value(
     while let Some(link) = current {
         ensure_depth(depth, "accepted batch lookup")?;
         let node = load_batch_map_node(connection, &link)?;
+        match batch_id.cmp(&node.batch_id) {
+            Ordering::Equal => return Ok(Some(node.value_digest)),
+            Ordering::Less => current = node.left,
+            Ordering::Greater => current = node.right,
+        }
+        depth += 1;
+    }
+    Ok(None)
+}
+
+fn validate_checkpoint_root_shape(
+    root: &PhysicalCheckpointFrontierRoot,
+) -> Result<(), FrontierError> {
+    let count = root.acceptance_sequence;
+    let roots_match_count = |key: Option<[u8; 16]>, digest: ContentDigest| {
+        if count == 0 {
+            key.is_none() && digest == authenticated_map_empty_digest()
+        } else {
+            key.is_some()
+        }
+    };
+    if root.batch_map_count != count
+        || root.status_map_count != count
+        || root.sequence_count != count
+        || root.generation.covered_count > count
+        || root.document_overlay_count > root.document_count
+        || !roots_match_count(root.batch_map_root_key, root.batch_map_root_digest)
+        || !roots_match_count(root.status_map_root_key, root.status_map_root_digest)
+        || (count == 0) != root.sequence_root_digest.is_none()
+    {
+        return Err(FrontierError::Corrupt(
+            "checkpoint frontier root/count shape is inconsistent".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn load_composite_batch_map_node(
+    connection: &Connection,
+    sealed: &dyn SealedAcceptedIndexRead,
+    expected: &MapLink,
+) -> Result<BatchMapNode, FrontierError> {
+    if let Some(node) = load_hot_batch_map_node(connection, expected)? {
+        return Ok(node);
+    }
+    let sealed = sealed.sealed_map_node(AuthenticatedMapLinkV1 {
+        key: expected.key,
+        digest: expected.digest,
+    })?;
+    Ok(BatchMapNode {
+        batch_id: sealed.key,
+        value_digest: sealed.value_digest,
+        left: sealed.left.map(|child| MapLink {
+            key: child.key,
+            digest: child.digest,
+        }),
+        right: sealed.right.map(|child| MapLink {
+            key: child.key,
+            digest: child.digest,
+        }),
+    })
+}
+
+fn batch_map_value_checkpoint(
+    connection: &Connection,
+    root: &PhysicalCheckpointFrontierRoot,
+    sealed: &dyn SealedAcceptedIndexRead,
+    batch_id: [u8; 16],
+) -> Result<Option<ContentDigest>, FrontierError> {
+    validate_checkpoint_root_shape(root)?;
+    let Some(key) = root.batch_map_root_key else {
+        return Ok(None);
+    };
+    let mut current = Some(MapLink {
+        key,
+        digest: root.batch_map_root_digest,
+    });
+    let mut depth = 0;
+    while let Some(link) = current {
+        ensure_depth(depth, "checkpoint accepted batch lookup")?;
+        let node = load_composite_batch_map_node(connection, sealed, &link)?;
         match batch_id.cmp(&node.batch_id) {
             Ordering::Equal => return Ok(Some(node.value_digest)),
             Ordering::Less => current = node.left,
@@ -1199,6 +1717,131 @@ pub fn authenticate_batch(
 ) -> Result<bool, FrontierError> {
     authenticated_batch_record(connection, root, batch_id, Some(causal_record_digest))
         .map(|record| record.is_some())
+}
+
+enum CheckpointAuthenticatedBatchRecord {
+    Hot(StoredBatch),
+    Covered(SealedAcceptedCausalRecordV2),
+}
+
+impl CheckpointAuthenticatedBatchRecord {
+    fn causal_dot(&self) -> Result<([u8; 16], u64), FrontierError> {
+        match self {
+            Self::Hot(record) => Ok((
+                decode_id(&record.causal_peer_id, "causal peer ID")?,
+                u64::try_from(record.causal_counter).map_err(|_| {
+                    FrontierError::Corrupt("stored causal counter is invalid".into())
+                })?,
+            )),
+            Self::Covered(record) => Ok((record.causal_peer_id, record.causal_counter)),
+        }
+    }
+
+    fn clock_counter(
+        &self,
+        connection: &Connection,
+        peer: [u8; 16],
+    ) -> Result<Option<u64>, FrontierError> {
+        match self {
+            Self::Hot(record) => {
+                let clock = MapLink {
+                    key: decode_id(&record.causal_clock_root_key, "causal clock root key")?,
+                    digest: decode_digest(&record.causal_clock_root_digest)?,
+                };
+                causal_clock_lookup(connection, Some(clock), peer)
+            }
+            Self::Covered(record) => Ok(record
+                .canonical_causal_clock
+                .binary_search_by_key(&peer, |entry| entry.peer_id)
+                .ok()
+                .map(|index| record.canonical_causal_clock[index].counter)),
+        }
+    }
+}
+
+fn authenticated_checkpoint_batch_record(
+    connection: &Connection,
+    root: &PhysicalCheckpointFrontierRoot,
+    sealed: &dyn SealedAcceptedIndexRead,
+    batch_id: [u8; 16],
+    expected_value: Option<ContentDigest>,
+) -> Result<Option<CheckpointAuthenticatedBatchRecord>, FrontierError> {
+    let Some(value) = batch_map_value_checkpoint(connection, root, sealed, batch_id)? else {
+        return Ok(None);
+    };
+    if expected_value.is_some_and(|expected| expected != value) {
+        return Err(FrontierError::Corrupt(format!(
+            "accepted batch {} differs from its authenticated causal record",
+            HexId(&batch_id)
+        )));
+    }
+    if let Some(record) = load_batch(connection, batch_id)? {
+        validate_stored_batch_physical(&record)?;
+        let authenticated = CheckpointAuthenticatedBatchRecord::Hot(record);
+        let (peer, counter) = authenticated.causal_dot()?;
+        if authenticated.clock_counter(connection, peer)? != Some(counter) {
+            return Err(FrontierError::Corrupt(format!(
+                "accepted batch {} causal dot is absent from its authenticated hot clock",
+                HexId(&batch_id)
+            )));
+        }
+        return Ok(Some(authenticated));
+    }
+    let record = sealed.sealed_causal_record(batch_id, value)?;
+    Ok(Some(CheckpointAuthenticatedBatchRecord::Covered(record)))
+}
+
+pub fn contains_checkpoint_batch(
+    connection: &Connection,
+    root: &PhysicalCheckpointFrontierRoot,
+    sealed: &dyn SealedAcceptedIndexRead,
+    batch_id: [u8; 16],
+) -> Result<bool, FrontierError> {
+    authenticated_checkpoint_batch_record(connection, root, sealed, batch_id, None)
+        .map(|record| record.is_some())
+}
+
+pub fn authenticate_checkpoint_batch(
+    connection: &Connection,
+    root: &PhysicalCheckpointFrontierRoot,
+    sealed: &dyn SealedAcceptedIndexRead,
+    batch_id: [u8; 16],
+    causal_record_digest: ContentDigest,
+) -> Result<bool, FrontierError> {
+    authenticated_checkpoint_batch_record(
+        connection,
+        root,
+        sealed,
+        batch_id,
+        Some(causal_record_digest),
+    )
+    .map(|record| record.is_some())
+}
+
+pub fn checkpoint_batch_descends_from(
+    connection: &Connection,
+    root: &PhysicalCheckpointFrontierRoot,
+    sealed: &dyn SealedAcceptedIndexRead,
+    descendant: [u8; 16],
+    ancestor: [u8; 16],
+) -> Result<bool, FrontierError> {
+    let descendant =
+        authenticated_checkpoint_batch_record(connection, root, sealed, descendant, None)?
+            .ok_or_else(|| {
+                FrontierError::Corrupt(
+                    "descendant batch is absent from the checkpoint authenticated accepted map"
+                        .into(),
+                )
+            })?;
+    let Some(ancestor) =
+        authenticated_checkpoint_batch_record(connection, root, sealed, ancestor, None)?
+    else {
+        return Ok(false);
+    };
+    let (peer, counter) = ancestor.causal_dot()?;
+    Ok(descendant
+        .clock_counter(connection, peer)?
+        .is_some_and(|found| found >= counter))
 }
 
 fn causal_clock_lookup(
@@ -2689,6 +3332,10 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+    use crate::sealed_accepted_index::{
+        AuthenticatedMapRootV1, SealedAcceptedCausalClockEntryV2, SealedAcceptedIndexObjectStore,
+        SealedAcceptedIndexReader, SealedAcceptedIndexWriter, SealedAcceptedObjectKind,
+    };
     use crate::sqlite::{
         PhysicalEntityId, PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalSqliteDatabase,
     };
@@ -2696,6 +3343,49 @@ mod tests {
     use super::*;
 
     static NEXT_DATABASE: AtomicU64 = AtomicU64::new(1);
+
+    #[derive(Default)]
+    struct TestSealedStore {
+        objects: Vec<(SealedAcceptedObjectKind, ContentDigest, Vec<u8>)>,
+    }
+
+    impl SealedAcceptedIndexObjectStore for TestSealedStore {
+        fn read_sealed_accepted_object(
+            &self,
+            kind: SealedAcceptedObjectKind,
+            address: ContentDigest,
+        ) -> Result<Option<Vec<u8>>, SealedAcceptedIndexError> {
+            Ok(self
+                .objects
+                .iter()
+                .find(|(found_kind, found_address, _)| {
+                    *found_kind == kind && *found_address == address
+                })
+                .map(|(_, _, bytes)| bytes.clone()))
+        }
+
+        fn publish_sealed_accepted_object(
+            &mut self,
+            kind: SealedAcceptedObjectKind,
+            address: ContentDigest,
+            bytes: &[u8],
+        ) -> Result<(), SealedAcceptedIndexError> {
+            if let Some((_, _, existing)) =
+                self.objects.iter().find(|(found_kind, found_address, _)| {
+                    *found_kind == kind && *found_address == address
+                })
+            {
+                if existing.as_slice() != bytes {
+                    return Err(SealedAcceptedIndexError::Store(
+                        "test object collision".into(),
+                    ));
+                }
+                return Ok(());
+            }
+            self.objects.push((kind, address, bytes.to_vec()));
+            Ok(())
+        }
+    }
 
     struct TestDatabase {
         path: PathBuf,
@@ -2802,6 +3492,65 @@ mod tests {
             batch_map_root_digest,
             state_digest: ContentDigest::of(&sequence.to_be_bytes()),
         }
+    }
+
+    fn empty_checkpoint_root_and_anchor() -> (
+        PhysicalCheckpointFrontierRoot,
+        PhysicalCheckpointGenerationAnchor,
+    ) {
+        let empty = authenticated_map_empty_digest();
+        let generation = PhysicalCheckpointGenerationBinding {
+            generation_id: id(2),
+            predecessor_generation_id: Some(id(1)),
+            full_anchor_generation_id: id(2),
+            covered_count: 0,
+            covered_document_count: 0,
+            covered_block_count: 0,
+            covered_retained_bytes_total: 0,
+            covered_semantic_capsules_root_digest: ContentDigest::of(b"capsules"),
+            covered_batch_root_key: None,
+            covered_batch_root_digest: empty,
+            covered_status_root_key: None,
+            covered_status_root_digest: empty,
+            covered_sequence_root_digest: None,
+            covered_sequence_height: 0,
+            covered_causal_tip_root_key: None,
+            covered_causal_tip_root_digest: empty,
+            covered_head_facts_root_digest: ContentDigest::of(b"heads"),
+            current_projection_payload_pins_root_digest: ContentDigest::of(b"payloads"),
+            nonlinear_state_root_digest: ContentDigest::of(b"nonlinear"),
+            retention_pins_root_digest: ContentDigest::of(b"retention"),
+        };
+        let mut canonical_bytes = b"synthetic physical checkpoint frontier\0".to_vec();
+        canonical_bytes.extend_from_slice(generation.generation_id.as_slice());
+        let root = PhysicalCheckpointFrontierRoot {
+            canonical_bytes: canonical_bytes.clone(),
+            acceptance_sequence: 0,
+            document_count: 0,
+            document_overlay_count: 0,
+            retained_bytes_total: 0,
+            document_map_root_key: None,
+            document_map_root_digest: empty,
+            batch_map_root_key: None,
+            batch_map_root_digest: empty,
+            batch_map_count: 0,
+            status_map_root_key: None,
+            status_map_root_digest: empty,
+            status_map_count: 0,
+            sequence_root_digest: None,
+            sequence_height: 0,
+            sequence_count: 0,
+            generation: generation.clone(),
+            state_digest: ContentDigest::of(b"checkpoint-state"),
+        };
+        let anchor = PhysicalCheckpointGenerationAnchor {
+            generation,
+            checkpoint_frontier_root: canonical_bytes,
+            terminal_batch_id: None,
+            terminal_evidence_digest: None,
+            materialization_frontier_root_digest: root.digest(),
+        };
+        (root, anchor)
     }
 
     fn claim() -> PhysicalClaim {
@@ -2923,6 +3672,227 @@ mod tests {
             .initialize_schema(claim(), &empty.canonical_bytes)
             .unwrap();
         (database, physical, empty)
+    }
+
+    #[test]
+    fn live_and_checkpoint_candidates_use_one_current_schema() {
+        let (_live_path, live, _) = initialized_facade();
+        live.validate_schema_and_claim(claim()).unwrap();
+
+        let checkpoint_path = TestDatabase::new();
+        let checkpoint = PhysicalSqliteDatabase::open_writable(&checkpoint_path.path).unwrap();
+        let (root, anchor) = empty_checkpoint_root_and_anchor();
+        checkpoint
+            .initialize_checkpoint_candidate_schema(claim(), &root, &anchor)
+            .unwrap();
+        checkpoint.validate_schema_and_claim(claim()).unwrap();
+        assert_eq!(
+            checkpoint.read_frontier().unwrap().canonical_bytes,
+            root.canonical_bytes
+        );
+        assert!(checkpoint.load_all_batches().unwrap().is_empty());
+    }
+
+    #[test]
+    fn prior_sqlite_schema_is_refused_instead_of_migrated_or_dually_read() {
+        let (_path, connection, _) = initialized();
+        connection
+            .execute_batch("PRAGMA user_version = 21")
+            .unwrap();
+        let error = validate_schema_and_claim(&connection, claim()).unwrap_err();
+        assert!(matches!(error, FrontierError::Schema(_)));
+        assert!(error.to_string().contains("user_version 21"));
+        let found: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(found, 21, "validation must not rewrite an old schema");
+    }
+
+    #[test]
+    fn live_builds_a_separate_checkpoint_candidate_without_mutation() {
+        let (live_path, mut live, empty_live) = initialized_facade();
+        let scenario = apply_two_part_fresh_bootstrap(&mut live, &empty_live);
+        live.validate_schema_and_claim(claim()).unwrap();
+        let live_frontier = live.read_frontier().unwrap();
+        live.checkpoint_truncate_and_disable_wal().unwrap();
+        drop(live);
+        let live_bytes = std::fs::read(&live_path.path).unwrap();
+
+        let (covered_batch_root_key, covered_batch_root_digest) = map_root(&scenario.batch_entries);
+        let covered_count = scenario.final_root.acceptance_sequence;
+        let sequence_digest = ContentDigest::of(b"checkpoint-sequence");
+        let generation = PhysicalCheckpointGenerationBinding {
+            generation_id: id(2),
+            predecessor_generation_id: Some(id(1)),
+            full_anchor_generation_id: id(2),
+            covered_count,
+            covered_document_count: scenario.final_root.document_count,
+            covered_block_count: 0,
+            covered_retained_bytes_total: 30,
+            covered_semantic_capsules_root_digest: ContentDigest::of(b"capsules"),
+            covered_batch_root_key,
+            covered_batch_root_digest,
+            covered_status_root_key: covered_batch_root_key,
+            covered_status_root_digest: covered_batch_root_digest,
+            covered_sequence_root_digest: Some(sequence_digest),
+            covered_sequence_height: 1,
+            covered_causal_tip_root_key: Some(id(900)),
+            covered_causal_tip_root_digest: ContentDigest::of(b"tip"),
+            covered_head_facts_root_digest: ContentDigest::of(b"heads"),
+            current_projection_payload_pins_root_digest: ContentDigest::of(b"payloads"),
+            nonlinear_state_root_digest: ContentDigest::of(b"nonlinear"),
+            retention_pins_root_digest: ContentDigest::of(b"retention"),
+        };
+        let canonical_bytes = b"current separate checkpoint candidate".to_vec();
+        let checkpoint_root = PhysicalCheckpointFrontierRoot {
+            canonical_bytes: canonical_bytes.clone(),
+            acceptance_sequence: covered_count,
+            document_count: scenario.final_root.document_count,
+            document_overlay_count: 0,
+            retained_bytes_total: 30,
+            document_map_root_key: None,
+            document_map_root_digest: authenticated_map_empty_digest(),
+            batch_map_root_key: covered_batch_root_key,
+            batch_map_root_digest: covered_batch_root_digest,
+            batch_map_count: covered_count,
+            status_map_root_key: covered_batch_root_key,
+            status_map_root_digest: covered_batch_root_digest,
+            status_map_count: covered_count,
+            sequence_root_digest: Some(sequence_digest),
+            sequence_height: 1,
+            sequence_count: covered_count,
+            generation: generation.clone(),
+            state_digest: ContentDigest::of(b"state"),
+        };
+        let anchor = PhysicalCheckpointGenerationAnchor {
+            generation,
+            checkpoint_frontier_root: canonical_bytes,
+            terminal_batch_id: Some(scenario.second_batch_id),
+            terminal_evidence_digest: Some(ContentDigest::of(b"terminal evidence")),
+            materialization_frontier_root_digest: checkpoint_root.digest(),
+        };
+        let checkpoint_path = TestDatabase::new();
+        let checkpoint = PhysicalSqliteDatabase::open_writable(&checkpoint_path.path).unwrap();
+        checkpoint
+            .initialize_checkpoint_candidate_schema(claim(), &checkpoint_root, &anchor)
+            .unwrap();
+        checkpoint.validate_schema_and_claim(claim()).unwrap();
+        assert!(checkpoint.load_all_batches().unwrap().is_empty());
+        assert_eq!(
+            checkpoint.read_frontier().unwrap().applied_batch_count,
+            covered_count
+        );
+        assert_eq!(std::fs::read(&live_path.path).unwrap(), live_bytes);
+        assert_eq!(live_frontier.applied_batch_count, covered_count);
+    }
+
+    #[test]
+    fn checkpoint_covered_reads_use_the_injected_sealed_reader_without_sql_history_rows() {
+        let batch_id = id(101);
+        let peer_id = id(900);
+        let causal = SealedAcceptedCausalRecordV2 {
+            batch_id,
+            manifest_fingerprint: ContentDigest::of(b"manifest"),
+            event_binding_digest: ContentDigest::of(b"event"),
+            causal_peer_id: peer_id,
+            causal_counter: 1,
+            canonical_causal_clock: vec![SealedAcceptedCausalClockEntryV2 {
+                peer_id,
+                counter: 1,
+            }],
+        };
+        let mut store = TestSealedStore::default();
+        let mut writer = SealedAcceptedIndexWriter::new(&mut store);
+        let causal_address = writer.publish_causal(&causal).unwrap();
+        let batch_root = writer
+            .upsert_map(AuthenticatedMapRootV1::empty(), batch_id, causal_address)
+            .unwrap();
+        drop(writer);
+
+        let empty = authenticated_map_empty_digest();
+        let generation = PhysicalCheckpointGenerationBinding {
+            generation_id: id(2),
+            predecessor_generation_id: Some(id(1)),
+            full_anchor_generation_id: id(2),
+            covered_count: 1,
+            covered_document_count: 0,
+            covered_block_count: 0,
+            covered_retained_bytes_total: 10,
+            covered_semantic_capsules_root_digest: ContentDigest::of(b"capsules"),
+            covered_batch_root_key: batch_root.root.map(|link| link.key),
+            covered_batch_root_digest: batch_root.root_digest(),
+            covered_status_root_key: batch_root.root.map(|link| link.key),
+            covered_status_root_digest: batch_root.root_digest(),
+            covered_sequence_root_digest: Some(ContentDigest::of(b"sequence")),
+            covered_sequence_height: 0,
+            covered_causal_tip_root_key: Some(peer_id),
+            covered_causal_tip_root_digest: ContentDigest::of(b"tip"),
+            covered_head_facts_root_digest: ContentDigest::of(b"heads"),
+            current_projection_payload_pins_root_digest: ContentDigest::of(b"payloads"),
+            nonlinear_state_root_digest: ContentDigest::of(b"nonlinear"),
+            retention_pins_root_digest: ContentDigest::of(b"retention"),
+        };
+        let canonical_bytes = b"covered checkpoint frontier".to_vec();
+        let root = PhysicalCheckpointFrontierRoot {
+            canonical_bytes: canonical_bytes.clone(),
+            acceptance_sequence: 1,
+            document_count: 0,
+            document_overlay_count: 0,
+            retained_bytes_total: 10,
+            document_map_root_key: None,
+            document_map_root_digest: empty,
+            batch_map_root_key: batch_root.root.map(|link| link.key),
+            batch_map_root_digest: batch_root.root_digest(),
+            batch_map_count: 1,
+            status_map_root_key: batch_root.root.map(|link| link.key),
+            status_map_root_digest: batch_root.root_digest(),
+            status_map_count: 1,
+            sequence_root_digest: Some(ContentDigest::of(b"sequence")),
+            sequence_height: 0,
+            sequence_count: 1,
+            generation: generation.clone(),
+            state_digest: ContentDigest::of(b"state"),
+        };
+        let anchor = PhysicalCheckpointGenerationAnchor {
+            generation,
+            checkpoint_frontier_root: canonical_bytes,
+            terminal_batch_id: Some(batch_id),
+            terminal_evidence_digest: Some(ContentDigest::of(b"evidence")),
+            materialization_frontier_root_digest: root.digest(),
+        };
+        let path = TestDatabase::new();
+        let database = PhysicalSqliteDatabase::open_writable(&path.path).unwrap();
+        database
+            .initialize_checkpoint_candidate_schema(claim(), &root, &anchor)
+            .unwrap();
+        assert!(database.load_all_batches().unwrap().is_empty());
+
+        {
+            let reader = SealedAcceptedIndexReader::new(&store);
+            assert!(database
+                .contains_checkpoint_batch(&root, &reader, batch_id)
+                .unwrap());
+            assert!(database
+                .authenticate_checkpoint_batch(&root, &reader, batch_id, causal_address)
+                .unwrap());
+            assert!(database
+                .checkpoint_batch_descends_from(&root, &reader, batch_id, batch_id)
+                .unwrap());
+        }
+
+        store
+            .objects
+            .retain(|(kind, _, _)| *kind != SealedAcceptedObjectKind::CausalRecord);
+        let reader = SealedAcceptedIndexReader::new(&store);
+        assert!(matches!(
+            database.contains_checkpoint_batch(&root, &reader, batch_id),
+            Err(FrontierError::SealedAcceptedIndex(
+                SealedAcceptedIndexError::Missing {
+                    kind: SealedAcceptedObjectKind::CausalRecord,
+                    ..
+                }
+            ))
+        ));
     }
 
     fn reference_target_name(source_page_id: [u8; 16]) -> String {
