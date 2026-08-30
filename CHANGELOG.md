@@ -5,6 +5,14 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.8.12] - 2026-08-30
+
+### Fixed
+
+- The API inventory now records the new `sealed_accepted_index` facade without
+  adding a variant to its pre-existing public exhaustive `ExportPath` enum, so
+  the accepted-index addition remains a semver-compatible patch release.
+
 ## [0.8.11] - 2026-08-30
 
 ### Added

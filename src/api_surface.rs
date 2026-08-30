@@ -35,8 +35,6 @@ pub enum ExportPath {
     Formats,
     /// `tine_storage::api_surface::NAME`
     ApiSurface,
-    /// `tine_storage::sealed_accepted_index::NAME`
-    SealedAcceptedIndex,
 }
 
 impl ExportPath {
@@ -46,7 +44,6 @@ impl ExportPath {
             ExportPath::Sqlite => "tine_storage::sqlite",
             ExportPath::Formats => "tine_storage::formats",
             ExportPath::ApiSurface => "tine_storage::api_surface",
-            ExportPath::SealedAcceptedIndex => "tine_storage::sealed_accepted_index",
         }
     }
 }
@@ -222,7 +219,6 @@ pub fn exported_names() -> Vec<ExportedName> {
     let mut names = Vec::new();
     names.extend(parse_exports(ExportPath::Root, &root_region));
     names.extend(parse_exports(ExportPath::Sqlite, sqlite_body));
-    names.extend(parse_exports(ExportPath::SealedAcceptedIndex, sealed_body));
     names.extend(parse_exports(ExportPath::Formats, FORMATS_RS));
 
     // Items *declared* in a public module rather than re-exported into it.
@@ -251,8 +247,32 @@ pub fn exported_names() -> Vec<ExportedName> {
 /// Render the surface in the form stored in `api.txt`.
 pub fn render() -> String {
     let names = exported_names();
-    let production = names.iter().filter(|n| !n.test_support_only).count();
-    let gated = names.len() - production;
+    const LIB_RS: &str = include_str!("lib.rs");
+    let sealed_body = inline_module_body(LIB_RS, "sealed_accepted_index");
+
+    // `ExportPath` predates nested facades and is a public exhaustive enum.
+    // Extending it would turn every new facade into a breaking API change.
+    // Keep the legacy structured inventory stable and add exact nested paths
+    // only at the rendered-inventory boundary.
+    let mut rows: Vec<(String, bool)> = names
+        .iter()
+        .map(|name| (name.row(), name.test_support_only))
+        .collect();
+    let mut sealed_names = parse_exports(ExportPath::Root, sealed_body);
+    sealed_names.sort();
+    sealed_names.dedup();
+    rows.extend(sealed_names.into_iter().map(|name| {
+        (
+            format!("tine_storage::sealed_accepted_index::{}", name.name),
+            name.test_support_only,
+        )
+    }));
+    // `exported_names` is already in the historical ExportPath order. Append
+    // the new nested facade as its own final group, matching that established
+    // inventory layout without changing the public enum that defines it.
+
+    let production = rows.iter().filter(|(_, gated)| !gated).count();
+    let gated = rows.len() - production;
 
     let mut out = String::new();
     out.push_str("# tine-storage public API surface\n");
@@ -261,10 +281,10 @@ pub fn render() -> String {
     out.push_str("# Names only -- see the module docs for why signatures are not covered.\n");
     out.push_str(&format!(
         "# {} public names: {production} in ordinary release builds, {gated} behind `test-support`.\n\n",
-        names.len()
+        rows.len()
     ));
-    for name in &names {
-        out.push_str(&name.row());
+    for (row, _) in &rows {
+        out.push_str(row);
         out.push('\n');
     }
     out
