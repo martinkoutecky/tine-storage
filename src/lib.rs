@@ -142,7 +142,6 @@ pub use local_journal::{
 };
 pub use local_journal_v2::{
     LocalJournalAppendError, LocalJournalSegmentV2, LocalJournalSegmentV2Selection,
-    LockedLocalJournalV1Segment,
 };
 #[cfg(feature = "test-support")]
 pub use packed_patricia::{

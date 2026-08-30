@@ -5,7 +5,7 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
-## [0.8.14] - 2026-08-30
+## [0.9.0] - 2026-08-30
 
 ### Added
 
@@ -27,6 +27,9 @@ independently in `src/formats.rs` and summarized in
   schema. This release adds no production checkpoint marker, selector, or
   cutover path, and a regression proves candidate construction never mutates
   the live file.
+- Removed the obsolete public legacy-journal inspector and its compatibility
+  error. Pre-0.7 Managed Storage has one current journal format; Tine backs up
+  and rebuilds unrecognized private state from Markdown/Org.
 
 ## [0.8.13] - 2026-08-30
 

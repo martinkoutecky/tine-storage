@@ -105,10 +105,6 @@ pub enum LocalJournalError {
         found: u32,
     },
     UnsafeSegmentName(String),
-    AmbiguousLegacySuffix {
-        offset: u64,
-        length: u64,
-    },
     UnsupportedDurableReplacement,
     PreparedArtifactExists(String),
     SegmentAlreadyOpen(String),
@@ -173,10 +169,6 @@ impl fmt::Display for LocalJournalError {
             Self::UnsafeSegmentName(name) => {
                 write!(formatter, "unsafe local journal segment name: {name}")
             }
-            Self::AmbiguousLegacySuffix { offset, length } => write!(
-                formatter,
-                "legacy local journal has an ambiguous {length}-byte suffix at offset {offset}"
-            ),
             Self::UnsupportedDurableReplacement => formatter.write_str(
                 "durable local-journal frontier replacement is unsupported on this target",
             ),
