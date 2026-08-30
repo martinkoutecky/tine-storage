@@ -778,6 +778,28 @@ pub struct SealedAcceptedMembershipProofV2 {
     pub causal: SealedAcceptedCausalRecordV2,
 }
 
+/// Domain fields recovered from one exact canonical accepted-evidence value.
+///
+/// `tine-storage` deliberately does not own Tine's V1/V2 evidence codecs. The
+/// caller-supplied decoder below validates those bytes without causing this
+/// physical crate to depend on the engine crate; the sealed reader then binds
+/// the decoded identity to all three authenticated index edges.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AcceptedEvidenceBindingV2 {
+    pub batch_id: [u8; 16],
+    pub manifest_fingerprint: ContentDigest,
+    pub event_binding_digest: ContentDigest,
+    pub acceptance_sequence: u64,
+}
+
+pub trait SealedAcceptedEvidenceDecoder {
+    fn decode_accepted_evidence(
+        &self,
+        evidence_schema: u32,
+        exact_evidence_bytes: &[u8],
+    ) -> Result<AcceptedEvidenceBindingV2, SealedAcceptedIndexError>;
+}
+
 pub struct SealedAcceptedIndexReader<'a, Store> {
     store: &'a Store,
 }
@@ -794,7 +816,7 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexReader<'a, St
     ) -> Result<Option<ContentDigest>, SealedAcceptedIndexError> {
         validate_map_root(root)?;
         let mut current = root.root;
-        for _ in 0..=MAX_ACCEPTED_INDEX_DEPTH {
+        for _ in 0..MAX_ACCEPTED_INDEX_DEPTH {
             let Some(link) = current else { return Ok(None) };
             let node = self.read_map_node(link)?;
             match key.cmp(&node.key) {
@@ -835,12 +857,12 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexReader<'a, St
         sequence: u64,
     ) -> Result<Option<AcceptedSequenceEntryV2>, SealedAcceptedIndexError> {
         validate_sequence_root(root)?;
-        if sequence >= root.len {
+        if sequence == 0 || sequence > root.len {
             return Ok(None);
         }
         let mut address = root.root_digest.expect("validated nonempty sequence root");
         let mut height = root.height;
-        let mut first = 0_u64;
+        let mut first = 1_u64;
         let mut depth = 0usize;
         while height > 0 {
             if depth >= MAX_ACCEPTED_INDEX_DEPTH {
@@ -864,11 +886,12 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexReader<'a, St
         )?))
     }
 
-    pub fn prove_membership(
+    pub fn prove_membership<Decoder: SealedAcceptedEvidenceDecoder>(
         &self,
         roots: SealedAcceptedIndexRootsV2,
         sequence: u64,
         batch_id: [u8; 16],
+        evidence_decoder: &Decoder,
     ) -> Result<Option<SealedAcceptedMembershipProofV2>, SealedAcceptedIndexError> {
         roots.validate_counts()?;
         let Some(sequence_entry) = self.sequence_entry(roots.sequence, sequence)? else {
@@ -892,6 +915,17 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexReader<'a, St
             return Err(corrupt("status/batch-map causal digest cross-check failed"));
         }
         let causal = self.causal(batch_id, causal_address)?;
+        let evidence = evidence_decoder
+            .decode_accepted_evidence(status.evidence_schema, &status.exact_evidence_bytes)?;
+        if evidence.batch_id != batch_id
+            || evidence.acceptance_sequence != sequence
+            || evidence.manifest_fingerprint != causal.manifest_fingerprint
+            || evidence.event_binding_digest != causal.event_binding_digest
+        {
+            return Err(corrupt(
+                "accepted evidence/status/sequence/causal binding mismatch",
+            ));
+        }
         Ok(Some(SealedAcceptedMembershipProofV2 {
             sequence: sequence_entry,
             status,
@@ -981,9 +1015,13 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexWriter<'a, St
         entry: AcceptedSequenceEntryV2,
     ) -> Result<AcceptedSequenceRootV2, SealedAcceptedIndexError> {
         validate_sequence_root(root)?;
-        if entry.sequence != root.len {
+        let expected = root
+            .len
+            .checked_add(1)
+            .ok_or(SealedAcceptedIndexError::Capacity)?;
+        if entry.sequence != expected {
             return Err(SealedAcceptedIndexError::NonContiguousSequence {
-                expected: root.len,
+                expected,
                 actual: entry.sequence,
             });
         }
@@ -1009,22 +1047,22 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexWriter<'a, St
 
         let old_capacity = sequence_capacity(root.height)?;
         let (height, digest) = if root.len == old_capacity {
-            let right = self.build_sequence_path(root.height, root.len, leaf_digest)?;
+            let right = self.build_sequence_path(root.height, entry.sequence, leaf_digest)?;
             let node = AcceptedSequenceNodeV2 {
                 height: root
                     .height
                     .checked_add(1)
                     .ok_or(SealedAcceptedIndexError::Capacity)?,
-                first_leaf: 0,
+                first_leaf: 1,
                 children: vec![
                     AcceptedSequenceChildV2 {
-                        first: 0,
-                        last: root.len - 1,
+                        first: 1,
+                        last: root.len,
                         digest: root.root_digest.expect("validated sequence root"),
                     },
                     AcceptedSequenceChildV2 {
-                        first: root.len,
-                        last: root.len,
+                        first: entry.sequence,
+                        last: entry.sequence,
                         digest: right,
                     },
                 ],
@@ -1034,9 +1072,9 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexWriter<'a, St
         } else {
             let digest = self.append_sequence_path(
                 root.height,
-                0,
+                1,
                 root.root_digest.expect("validated sequence root"),
-                root.len,
+                entry.sequence,
                 leaf_digest,
                 0,
             )?;
@@ -1058,9 +1096,7 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexWriter<'a, St
         value_digest: ContentDigest,
         depth: usize,
     ) -> Result<(AuthenticatedMapLinkV1, bool), SealedAcceptedIndexError> {
-        if depth > MAX_ACCEPTED_INDEX_DEPTH {
-            return Err(SealedAcceptedIndexError::Capacity);
-        }
+        ensure_index_depth(depth)?;
         let Some(current) = current else {
             return Ok((
                 self.publish_map_node(&SealedAuthenticatedMapNodeV2 {
@@ -1191,7 +1227,8 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexWriter<'a, St
         leaf_digest: ContentDigest,
         depth: usize,
     ) -> Result<ContentDigest, SealedAcceptedIndexError> {
-        if depth > MAX_ACCEPTED_INDEX_DEPTH || height == 0 {
+        ensure_index_depth(depth)?;
+        if height == 0 {
             return Err(SealedAcceptedIndexError::Capacity);
         }
         let bytes = self
@@ -1301,6 +1338,7 @@ fn validate_sequence_root(root: AcceptedSequenceRootV2) -> Result<(), SealedAcce
 
 fn validate_sequence_node(node: &AcceptedSequenceNodeV2) -> Result<(), SealedAcceptedIndexError> {
     if node.height == 0
+        || node.first_leaf == 0
         || node.children.is_empty()
         || node.children.len() > SEALED_ACCEPTED_SEQUENCE_FANOUT
         || node.children[0].first != node.first_leaf
@@ -1347,7 +1385,7 @@ fn validate_causal_clock(
             .iter()
             .any(|entry| entry.counter == 0)
         || !record.canonical_causal_clock.iter().any(|entry| {
-            entry.peer_id == record.causal_peer_id && entry.counter >= record.causal_counter
+            entry.peer_id == record.causal_peer_id && entry.counter == record.causal_counter
         })
     {
         return Err(corrupt("accepted-causal record clock is not canonical"));
@@ -1363,6 +1401,14 @@ fn sequence_capacity(height: u8) -> Result<u64, SealedAcceptedIndexError> {
             .ok_or(SealedAcceptedIndexError::Capacity)?;
     }
     Ok(capacity)
+}
+
+fn ensure_index_depth(depth: usize) -> Result<(), SealedAcceptedIndexError> {
+    if depth >= MAX_ACCEPTED_INDEX_DEPTH {
+        Err(SealedAcceptedIndexError::Capacity)
+    } else {
+        Ok(())
+    }
 }
 
 fn digest_fold(domain: &[u8], fields: &[&[u8]]) -> ContentDigest {
@@ -1399,7 +1445,7 @@ fn corrupt(message: impl Into<String>) -> SealedAcceptedIndexError {
 mod tests {
     use super::*;
 
-    #[derive(Default)]
+    #[derive(Clone, Default)]
     struct MemoryStore {
         objects: Vec<(SealedAcceptedObjectKind, ContentDigest, Vec<u8>)>,
     }
@@ -1446,12 +1492,49 @@ mod tests {
         ContentDigest::from_bytes([byte; 32])
     }
 
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+    struct TestEvidenceWire {
+        schema: u32,
+        batch_id: [u8; 16],
+        manifest_fingerprint: [u8; 32],
+        event_binding_digest: [u8; 32],
+        acceptance_sequence: u64,
+    }
+
+    struct TestEvidenceDecoder;
+
+    impl SealedAcceptedEvidenceDecoder for TestEvidenceDecoder {
+        fn decode_accepted_evidence(
+            &self,
+            evidence_schema: u32,
+            exact_evidence_bytes: &[u8],
+        ) -> Result<AcceptedEvidenceBindingV2, SealedAcceptedIndexError> {
+            let wire: TestEvidenceWire = canonical_decode(exact_evidence_bytes, "test evidence")?;
+            if wire.schema != evidence_schema || !matches!(wire.schema, 1 | 2) {
+                return Err(corrupt("unknown test evidence schema"));
+            }
+            Ok(AcceptedEvidenceBindingV2 {
+                batch_id: wire.batch_id,
+                manifest_fingerprint: ContentDigest::from_bytes(wire.manifest_fingerprint),
+                event_binding_digest: ContentDigest::from_bytes(wire.event_binding_digest),
+                acceptance_sequence: wire.acceptance_sequence,
+            })
+        }
+    }
+
     fn status(batch: [u8; 16], causal: ContentDigest) -> AcceptedStatusRecordV2 {
         AcceptedStatusRecordV2 {
             batch_id: batch,
             no_op: false,
-            evidence_schema: 8,
-            exact_evidence_bytes: vec![0x31, 0x41, 0x59],
+            evidence_schema: 1,
+            exact_evidence_bytes: canonical_encode(&TestEvidenceWire {
+                schema: 1,
+                batch_id: batch,
+                manifest_fingerprint: [0x22; 32],
+                event_binding_digest: [0x33; 32],
+                acceptance_sequence: 1,
+            })
+            .unwrap(),
             accepted_causal_record_digest: causal,
         }
     }
@@ -1511,7 +1594,7 @@ mod tests {
         let mut root = AcceptedSequenceRootV2::empty();
         {
             let mut writer = SealedAcceptedIndexWriter::new(&mut store);
-            for sequence in 0..=1024_u64 {
+            for sequence in 1..=1025_u64 {
                 root = writer
                     .append_sequence(
                         root,
@@ -1533,12 +1616,68 @@ mod tests {
         }
         assert_eq!(root.len, 1025);
         let reader = SealedAcceptedIndexReader::new(&store);
-        for sequence in [0, 1, 31, 32, 33, 1023, 1024] {
+        for sequence in [1, 2, 32, 33, 34, 1024, 1025] {
             let entry = reader.sequence_entry(root, sequence).unwrap().unwrap();
             assert_eq!(entry.sequence, sequence);
             assert_eq!(entry.batch_id, [(sequence % 251) as u8; 16]);
         }
-        assert_eq!(reader.sequence_entry(root, 1025).unwrap(), None);
+        assert_eq!(reader.sequence_entry(root, 0).unwrap(), None);
+        assert_eq!(reader.sequence_entry(root, 1026).unwrap(), None);
+    }
+
+    #[test]
+    fn one_based_sequence_roots_are_frozen_at_growth_boundaries() {
+        let mut store = MemoryStore::default();
+        let mut root = AcceptedSequenceRootV2::empty();
+        let mut roots = Vec::new();
+        {
+            let mut writer = SealedAcceptedIndexWriter::new(&mut store);
+            for sequence in 1..=1025_u64 {
+                root = writer
+                    .append_sequence(
+                        root,
+                        AcceptedSequenceEntryV2 {
+                            sequence,
+                            batch_id: [(sequence % 251) as u8; 16],
+                            accepted_status_value_digest: digest((sequence % 253) as u8),
+                        },
+                    )
+                    .unwrap();
+                if matches!(sequence, 1 | 32 | 33 | 1024 | 1025) {
+                    roots.push((sequence, root.height, root.root_digest.unwrap().to_string()));
+                }
+            }
+        }
+        assert_eq!(
+            roots,
+            vec![
+                (
+                    1,
+                    0,
+                    "26a54cac813394adfb132def56ba1054f46ce1314e4bd1a57d003de08c07bdb1".into()
+                ),
+                (
+                    32,
+                    1,
+                    "2fe1c7e764443227a6acc0641e8d5a6de6b17a8450d145874aa1ae1f85dfdd6c".into()
+                ),
+                (
+                    33,
+                    2,
+                    "c15156bcb38c1317cb34eac5ef1f8033b6c63f82777ca933190e9d93bd563cf4".into()
+                ),
+                (
+                    1024,
+                    2,
+                    "bc937691a47d2ef02488b65437b094632a4e5fb5816f1790e200018a02663250".into()
+                ),
+                (
+                    1025,
+                    3,
+                    "3d6bc3cb03eef88484a27a64dbf134c795843c7b0ab162de69facba4ca079d67".into()
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -1562,7 +1701,7 @@ mod tests {
                 .append_sequence(
                     AcceptedSequenceRootV2::empty(),
                     AcceptedSequenceEntryV2 {
-                        sequence: 0,
+                        sequence: 1,
                         batch_id: batch,
                         accepted_status_value_digest: status_address,
                     },
@@ -1576,8 +1715,9 @@ mod tests {
                     status_map: status_root,
                     sequence: sequence_root,
                 },
-                0,
+                1,
                 batch,
+                &TestEvidenceDecoder,
             )
             .unwrap()
             .unwrap();
@@ -1595,8 +1735,138 @@ mod tests {
                     status_map: wrong_status_root,
                     sequence: sequence_root,
                 },
-                0,
+                1,
                 batch,
+                &TestEvidenceDecoder,
+            )
+            .is_err());
+
+        let evidence_variants = [
+            vec![1, 2, 3],
+            canonical_encode(&TestEvidenceWire {
+                schema: 3,
+                batch_id: batch,
+                manifest_fingerprint: [0x22; 32],
+                event_binding_digest: [0x33; 32],
+                acceptance_sequence: 1,
+            })
+            .unwrap(),
+            canonical_encode(&TestEvidenceWire {
+                schema: 1,
+                batch_id: [0x52; 16],
+                manifest_fingerprint: [0x22; 32],
+                event_binding_digest: [0x33; 32],
+                acceptance_sequence: 1,
+            })
+            .unwrap(),
+            canonical_encode(&TestEvidenceWire {
+                schema: 1,
+                batch_id: batch,
+                manifest_fingerprint: [0x23; 32],
+                event_binding_digest: [0x33; 32],
+                acceptance_sequence: 1,
+            })
+            .unwrap(),
+            canonical_encode(&TestEvidenceWire {
+                schema: 1,
+                batch_id: batch,
+                manifest_fingerprint: [0x22; 32],
+                event_binding_digest: [0x34; 32],
+                acceptance_sequence: 1,
+            })
+            .unwrap(),
+            canonical_encode(&TestEvidenceWire {
+                schema: 1,
+                batch_id: batch,
+                manifest_fingerprint: [0x22; 32],
+                event_binding_digest: [0x33; 32],
+                acceptance_sequence: 2,
+            })
+            .unwrap(),
+        ];
+        for (index, exact_evidence_bytes) in evidence_variants.into_iter().enumerate() {
+            let mut bad = status_record.clone();
+            bad.exact_evidence_bytes = exact_evidence_bytes;
+            if index == 1 {
+                bad.evidence_schema = 3;
+            }
+            let (bad_status_root, bad_sequence_root) = {
+                let mut writer = SealedAcceptedIndexWriter::new(&mut store);
+                let address = writer.publish_status(&bad).unwrap();
+                let status_root = writer
+                    .upsert_map(AuthenticatedMapRootV1::empty(), batch, address)
+                    .unwrap();
+                let sequence_root = writer
+                    .append_sequence(
+                        AcceptedSequenceRootV2::empty(),
+                        AcceptedSequenceEntryV2 {
+                            sequence: 1,
+                            batch_id: batch,
+                            accepted_status_value_digest: address,
+                        },
+                    )
+                    .unwrap();
+                (status_root, sequence_root)
+            };
+            assert!(SealedAcceptedIndexReader::new(&store)
+                .prove_membership(
+                    SealedAcceptedIndexRootsV2 {
+                        batch_map: batch_root,
+                        status_map: bad_status_root,
+                        sequence: bad_sequence_root,
+                    },
+                    1,
+                    batch,
+                    &TestEvidenceDecoder,
+                )
+                .is_err());
+        }
+
+        let sequence_status_mismatch = {
+            let mut writer = SealedAcceptedIndexWriter::new(&mut store);
+            writer
+                .append_sequence(
+                    AcceptedSequenceRootV2::empty(),
+                    AcceptedSequenceEntryV2 {
+                        sequence: 1,
+                        batch_id: batch,
+                        accepted_status_value_digest: digest(0xfd),
+                    },
+                )
+                .unwrap()
+        };
+        assert!(SealedAcceptedIndexReader::new(&store)
+            .prove_membership(
+                SealedAcceptedIndexRootsV2 {
+                    batch_map: batch_root,
+                    status_map: status_root,
+                    sequence: sequence_status_mismatch,
+                },
+                1,
+                batch,
+                &TestEvidenceDecoder,
+            )
+            .is_err());
+
+        let mut other_causal = causal.clone();
+        other_causal.event_binding_digest = digest(0x35);
+        let wrong_batch_root = {
+            let mut writer = SealedAcceptedIndexWriter::new(&mut store);
+            let address = writer.publish_causal(&other_causal).unwrap();
+            writer
+                .upsert_map(AuthenticatedMapRootV1::empty(), batch, address)
+                .unwrap()
+        };
+        assert!(SealedAcceptedIndexReader::new(&store)
+            .prove_membership(
+                SealedAcceptedIndexRootsV2 {
+                    batch_map: wrong_batch_root,
+                    status_map: status_root,
+                    sequence: sequence_root,
+                },
+                1,
+                batch,
+                &TestEvidenceDecoder,
             )
             .is_err());
     }
@@ -1617,6 +1887,16 @@ mod tests {
             &bytes,
         )
         .is_err());
+
+        let mut later_dot = causal([0x64; 16]);
+        later_dot.canonical_causal_clock[1].counter += 1;
+        assert!(later_dot.encode().is_err());
+
+        assert!(ensure_index_depth(MAX_ACCEPTED_INDEX_DEPTH - 1).is_ok());
+        assert_eq!(
+            ensure_index_depth(MAX_ACCEPTED_INDEX_DEPTH),
+            Err(SealedAcceptedIndexError::Capacity)
+        );
     }
 
     fn hex(bytes: &[u8]) -> String {
@@ -1652,10 +1932,10 @@ mod tests {
         let leaf_digest = leaf.leaf_digest().unwrap().to_string();
         let node_bytes = hex(&AcceptedSequenceNodeV2 {
             height: 1,
-            first_leaf: 0,
+            first_leaf: 1,
             children: vec![AcceptedSequenceChildV2 {
-                first: 0,
-                last: 0,
+                first: 1,
+                last: 1,
                 digest: leaf.leaf_digest().unwrap(),
             }],
         }
@@ -1687,16 +1967,16 @@ mod tests {
             clock_root.root_digest().to_string(),
             "effa60f99d8c9c9560c9f6d176ce457070460af5152e813d6affdd6cb48496d2"
         );
-        assert_eq!(status_bytes, "02515151515151515151515151515151510008033141597f4986b2491f46879adadfd66a4f7c3f516006c123868ad7ecff6d5791b80756");
+        assert_eq!(status_bytes, "0251515151515151515151515151515151000152015151515151515151515151515151515122222222222222222222222222222222222222222222222222222222222222223333333333333333333333333333333333333333333333333333333333333333017f4986b2491f46879adadfd66a4f7c3f516006c123868ad7ecff6d5791b80756");
         assert_eq!(
             status_digest,
-            "c22436995e5fdf2fcd7d7757f79c828dce875f9a2b3dc572cfad6cf9400317e8"
+            "6bdd768fa218e9f43ad0cf93530f2a8fb951f77403d989e78bfd8cb8a6b3a2c1"
         );
-        assert_eq!(leaf_bytes, "02010203040506070851515151515151515151515151515151c22436995e5fdf2fcd7d7757f79c828dce875f9a2b3dc572cfad6cf9400317e8");
+        assert_eq!(leaf_bytes, "020102030405060708515151515151515151515151515151516bdd768fa218e9f43ad0cf93530f2a8fb951f77403d989e78bfd8cb8a6b3a2c1");
         assert_eq!(
             leaf_digest,
-            "086cae84ab85242c38ebb5811e03db342f4c690fe3560da58db91a1c8f7af399"
+            "e75ae7327f31bc853a826ce6386c6786f0452da204cecb25f4f0ef7c883bac74"
         );
-        assert_eq!(node_bytes, "020100000000000000000100000000000000000000000000000000086cae84ab85242c38ebb5811e03db342f4c690fe3560da58db91a1c8f7af399");
+        assert_eq!(node_bytes, "020100000000000000010100000000000000010000000000000001e75ae7327f31bc853a826ce6386c6786f0452da204cecb25f4f0ef7c883bac74");
     }
 }

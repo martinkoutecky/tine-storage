@@ -12,7 +12,8 @@ use std::fmt;
 use rusqlite::{params, Connection, OptionalExtension as _, Transaction, TransactionBehavior};
 
 use crate::sealed_accepted_index_impl::{
-    authenticated_map_node_digest, authenticated_map_priority_order,
+    accepted_causal_record_digest, authenticated_map_empty_digest, authenticated_map_node_digest,
+    authenticated_map_priority_order, causal_clock_counter_digest, AuthenticatedMapLinkV1,
 };
 use crate::sqlite_materialization::{
     self, ApplyChangeInstrumentation, MaterializationError, PhysicalMaterializationChange,
@@ -884,27 +885,21 @@ struct MapLink {
     digest: ContentDigest,
 }
 
-fn causal_clock_counter_digest(peer: [u8; 16], counter: u64) -> ContentDigest {
-    let mut bytes = b"tine/oplog/causal-clock-entry/v1\0".to_vec();
-    bytes.extend_from_slice(&peer);
-    bytes.extend_from_slice(&counter.to_be_bytes());
-    ContentDigest::of(&bytes)
-}
-
-fn accepted_causal_record_digest(
+fn accepted_batch_causal_record_digest(
     batch: &PhysicalAcceptedBatch,
     clock_root: &MapLink,
 ) -> ContentDigest {
-    let mut bytes = b"tine/oplog/accepted-causal-record/v1\0".to_vec();
-    bytes.extend_from_slice(&batch.batch_id);
-    bytes.extend_from_slice(batch.manifest_digest.as_bytes());
-    bytes.extend_from_slice(batch.event_binding_digest.as_bytes());
-    bytes.extend_from_slice(&batch.causal_peer_id);
-    bytes.extend_from_slice(&batch.causal_counter.to_be_bytes());
-    bytes.push(1);
-    bytes.extend_from_slice(&clock_root.key);
-    bytes.extend_from_slice(clock_root.digest.as_bytes());
-    ContentDigest::of(&bytes)
+    accepted_causal_record_digest(
+        batch.batch_id,
+        batch.manifest_digest,
+        batch.event_binding_digest,
+        batch.causal_peer_id,
+        batch.causal_counter,
+        Some(AuthenticatedMapLinkV1 {
+            key: clock_root.key,
+            digest: clock_root.digest,
+        }),
+    )
 }
 
 fn valid_map_children(key: [u8; 16], left: Option<&MapLink>, right: Option<&MapLink>) -> bool {
@@ -1484,7 +1479,7 @@ fn upsert_frontier_map(
             value_digest,
             left: None,
             right: None,
-            node_digest: ContentDigest::of(b"tine/oplog/authenticated-map/v1/empty"),
+            node_digest: authenticated_map_empty_digest(),
         };
         node.node_digest = node.recompute_digest();
         store_frontier_map_node(transaction, &node)?;
@@ -1651,7 +1646,7 @@ fn seed_terminal_frontier_documents_candidate_with_policy(
         return Err(FrontierError::FrontierRegression);
     }
     if documents.is_empty() {
-        let empty = ContentDigest::of(b"tine/oplog/authenticated-map/v1/empty");
+        let empty = authenticated_map_empty_digest();
         if expected_root.document_map_root_key.is_some()
             || expected_root.document_map_root_digest != empty
         {
@@ -1720,7 +1715,7 @@ fn seed_terminal_frontier_documents_candidate_with_policy(
             value_digest: ContentDigest::of(&documents[index].canonical_bytes),
             left,
             right,
-            node_digest: ContentDigest::of(b"tine/oplog/authenticated-map/v1/empty"),
+            node_digest: authenticated_map_empty_digest(),
         };
         node.node_digest = node.recompute_digest();
         digests[index] = Some(node.node_digest);
@@ -1768,7 +1763,7 @@ pub fn seed_genesis_frontier_candidate(
         connection.query_row("SELECT COUNT(*) FROM accepted_batch_nodes", [], |row| {
             row.get(0)
         })?;
-    let empty_map = ContentDigest::of(b"tine/oplog/authenticated-map/v1/empty");
+    let empty_map = authenticated_map_empty_digest();
     if stored.applied_batch_count != 0
         || stored_documents != 0
         || stored_batches != 0
@@ -2265,7 +2260,7 @@ fn insert_event(
 }
 
 fn validate_root_shape(root: &PhysicalFrontierRoot) -> Result<(), FrontierError> {
-    let empty_digest = ContentDigest::of(b"tine/oplog/authenticated-map/v1/empty");
+    let empty_digest = authenticated_map_empty_digest();
     if (root.document_map_root_key.is_none() && root.document_map_root_digest != empty_digest)
         || (root.acceptance_sequence == 0) != root.batch_map_root_key.is_none()
         || (root.batch_map_root_key.is_none() && root.batch_map_root_digest != empty_digest)
@@ -2345,7 +2340,7 @@ pub fn preflight(
         }
         if stored_matches_request(&existing, batch)? {
             if batch_map_value(connection, current_root, batch.batch_id)?
-                != Some(accepted_causal_record_digest(batch, &clock_root))
+                != Some(accepted_batch_causal_record_digest(batch, &clock_root))
             {
                 return Err(FrontierError::Corrupt(format!(
                     "accepted batch {} differs from its authenticated causal record",
@@ -2470,7 +2465,10 @@ fn apply_with_transaction_policy(
         }
         if stored_matches_request(&existing, batch)? {
             if batch_map_value(connection, current_root, batch.batch_id)?
-                != Some(accepted_causal_record_digest(batch, &existing_clock_root))
+                != Some(accepted_batch_causal_record_digest(
+                    batch,
+                    &existing_clock_root,
+                ))
             {
                 return Err(FrontierError::Corrupt(format!(
                     "accepted batch {} differs from its authenticated causal record",
@@ -2595,7 +2593,7 @@ fn apply_in_open_transaction(
         ));
     }
     let clock_root = derive_causal_clock_root(connection, current_root, batch)?;
-    let causal_record_digest = accepted_causal_record_digest(batch, &clock_root);
+    let causal_record_digest = accepted_batch_causal_record_digest(batch, &clock_root);
     let post_batch_root = upsert_batch_map(
         connection,
         current_root.batch_map_root_key.map(|key| MapLink {
@@ -2755,10 +2753,7 @@ mod tests {
 
     fn map_root(entries: &[([u8; 16], ContentDigest)]) -> (Option<[u8; 16]>, ContentDigest) {
         if entries.is_empty() {
-            return (
-                None,
-                ContentDigest::of(b"tine/oplog/authenticated-map/v1/empty"),
-            );
+            return (None, authenticated_map_empty_digest());
         }
         let root_index = (0..entries.len())
             .min_by(|left, right| {
@@ -2894,7 +2889,7 @@ mod tests {
             key: peer,
             digest: authenticated_map_node_digest(peer, clock_value, None, None),
         };
-        let record_digest = accepted_causal_record_digest(&batch, &clock_root);
+        let record_digest = accepted_batch_causal_record_digest(&batch, &clock_root);
         let mut batch_entries = prior_batch_entries.to_vec();
         batch_entries.push((batch_id, record_digest));
         batch_entries.sort_unstable_by_key(|entry| entry.0);
