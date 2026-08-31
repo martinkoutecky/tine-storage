@@ -5,6 +5,16 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.9.1] - 2026-08-31
+
+### Added
+
+- `DurableDirectoryPublication::move_exact_no_replace` durably moves a
+  caller-owned staged or recovery file to a previously absent same-directory
+  name. On Windows it uses the already certified write-through name operation;
+  on every platform it verifies exact bytes, preserves no-replace races, and
+  supports an idempotent retry after the source name has disappeared.
+
 ## [0.9.0] - 2026-08-30
 
 ### Added

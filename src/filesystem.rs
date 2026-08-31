@@ -10,6 +10,8 @@ use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 #[cfg(windows)]
@@ -376,6 +378,47 @@ impl DurableDirectoryPublication {
         }
     }
 
+    /// Move one existing exact regular file to a previously absent name in the
+    /// same retained directory, without replacing a concurrent target.
+    ///
+    /// The source bytes and identity are verified before and after the move.
+    /// A retry after the source has disappeared accepts the destination only
+    /// when it contains the exact expected bytes. The caller owns the source
+    /// name as a single writer for the duration of the call, and destination
+    /// names must be content-determined: an existing destination with the exact
+    /// expected bytes is accepted as the same completed move. This is the
+    /// generic durable name-transition primitive for caller-owned staged and
+    /// recovery files; unlike [`Self::retire_exact`], the destination need not
+    /// be a retired authority name.
+    pub fn move_exact_no_replace(
+        &self,
+        source_name: &str,
+        destination_name: &str,
+        expected: &[u8],
+    ) -> Result<(), FilesystemError> {
+        validate_single_entry_name(source_name)?;
+        validate_single_entry_name(destination_name)?;
+        if source_name == destination_name {
+            return Err(FilesystemError::UnsafeEntry(
+                "source and destination names must differ".into(),
+            ));
+        }
+        #[cfg(windows)]
+        {
+            self.windows.validate()?;
+            return self.windows.move_exact_no_replace(
+                &self.dir,
+                source_name,
+                destination_name,
+                expected,
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            move_regular_exact_no_replace_unix(&self.dir, source_name, destination_name, expected)
+        }
+    }
+
     /// Retire an authority by a no-replace same-directory rename to a fresh
     /// name outside that authority's selector grammar.
     ///
@@ -388,24 +431,7 @@ impl DurableDirectoryPublication {
         retired_name: &str,
         expected: &[u8],
     ) -> Result<(), FilesystemError> {
-        validate_single_entry_name(active_name)?;
-        validate_single_entry_name(retired_name)?;
-        if active_name == retired_name {
-            return Err(FilesystemError::UnsafeEntry(
-                "active and retired authority names must differ".into(),
-            ));
-        }
-        #[cfg(windows)]
-        {
-            self.windows.validate()?;
-            return self
-                .windows
-                .retire_exact(&self.dir, active_name, retired_name, expected);
-        }
-        #[cfg(not(windows))]
-        {
-            retire_regular_exact_unix(&self.dir, active_name, retired_name, expected)
-        }
+        self.move_exact_no_replace(active_name, retired_name, expected)
     }
 }
 
@@ -424,12 +450,15 @@ fn read_regular_for_transition(
     name: &str,
     expected_or_replacement_limit: usize,
 ) -> Result<Option<Vec<u8>>, FilesystemError> {
-    read_optional_regular(
+    match read_optional_regular(
         dir,
         name,
         expected_or_replacement_limit.saturating_add(1) as u64,
         None,
-    )
+    ) {
+        Err(FilesystemError::StoredFileTooLarge { .. }) => Err(FilesystemError::ByteCollision),
+        result => result,
+    }
 }
 
 #[cfg(not(windows))]
@@ -476,30 +505,74 @@ fn replace_regular_exact_unix(
 }
 
 #[cfg(not(windows))]
-fn retire_regular_exact_unix(
+fn move_regular_exact_no_replace_unix(
     dir: &Dir,
-    active_name: &str,
-    retired_name: &str,
+    source_name: &str,
+    destination_name: &str,
     expected: &[u8],
 ) -> Result<(), FilesystemError> {
-    match read_regular_for_transition(dir, active_name, expected.len())? {
+    match read_regular_for_transition(dir, source_name, expected.len())? {
         Some(active) if active == expected => {
-            rename_noreplace(dir, active_name, retired_name)?;
+            match rename_noreplace(dir, source_name, destination_name) {
+                Ok(()) => {}
+                #[cfg(any(target_os = "macos", target_os = "android"))]
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    finish_interrupted_hard_link_move(
+                        dir,
+                        source_name,
+                        destination_name,
+                        expected,
+                    )?;
+                }
+                Err(error) => return Err(error.into()),
+            }
             sync_dir_required(dir)?;
         }
         Some(_) => return Err(FilesystemError::ByteCollision),
         None => {
             // An interrupted caller may retry after the durable rename
             // completed but before it observed the result.
-            verify_existing(dir, retired_name, expected)?;
+            verify_existing(dir, destination_name, expected)?;
             sync_dir_required(dir)?;
             return Ok(());
         }
     }
-    verify_existing(dir, retired_name, expected)?;
-    if read_regular_for_transition(dir, active_name, expected.len())?.is_some() {
+    verify_existing(dir, destination_name, expected)?;
+    if read_regular_for_transition(dir, source_name, expected.len())?.is_some() {
         return Err(FilesystemError::ByteCollision);
     }
+    Ok(())
+}
+
+/// macOS and Android implement no-replace as hard-link then unlink. If the
+/// process stops between those calls, both names identify the same exact file.
+/// Completing that interrupted move is safe under the public single-writer,
+/// content-determined-name contract; any different inode or bytes fail closed.
+#[cfg(unix)]
+fn finish_interrupted_hard_link_move(
+    dir: &Dir,
+    source_name: &str,
+    destination_name: &str,
+    expected: &[u8],
+) -> Result<(), FilesystemError> {
+    let source = open_file_nofollow(dir, source_name)?;
+    let destination = open_file_nofollow(dir, destination_name)?;
+    let source_metadata = source.metadata()?;
+    let destination_metadata = destination.metadata()?;
+    if !source_metadata.is_file()
+        || !destination_metadata.is_file()
+        || source_metadata.len() != expected.len() as u64
+        || destination_metadata.len() != expected.len() as u64
+        || source_metadata.dev() != destination_metadata.dev()
+        || source_metadata.ino() != destination_metadata.ino()
+    {
+        return Err(FilesystemError::ByteCollision);
+    }
+    drop(source);
+    drop(destination);
+    verify_existing(dir, source_name, expected)?;
+    verify_existing(dir, destination_name, expected)?;
+    dir.remove_file(source_name)?;
     Ok(())
 }
 
@@ -664,18 +737,18 @@ impl WindowsWriteThroughDirectory {
         result
     }
 
-    fn retire_exact(
+    fn move_exact_no_replace(
         &self,
         dir: &Dir,
-        active_name: &str,
-        retired_name: &str,
+        source_name: &str,
+        destination_name: &str,
         expected: &[u8],
     ) -> Result<(), FilesystemError> {
-        match read_windows_regular_with_identity(dir, active_name, expected.len())? {
+        match read_windows_regular_with_identity(dir, source_name, expected.len())? {
             Some((bytes, identity)) if bytes == expected => {
-                self.move_write_through(active_name, retired_name, false)?;
-                verify_windows_regular_exact(dir, retired_name, expected, Some(identity))?;
-                if read_windows_regular_with_identity(dir, active_name, expected.len())?.is_some() {
+                self.move_write_through(source_name, destination_name, false)?;
+                verify_windows_regular_exact(dir, destination_name, expected, Some(identity))?;
+                if read_windows_regular_with_identity(dir, source_name, expected.len())?.is_some() {
                     return Err(FilesystemError::ByteCollision);
                 }
                 Ok(())
@@ -683,7 +756,7 @@ impl WindowsWriteThroughDirectory {
             Some(_) => Err(FilesystemError::ByteCollision),
             None => {
                 // Idempotent retry after a successful write-through retirement.
-                verify_windows_regular_exact(dir, retired_name, expected, None)
+                verify_windows_regular_exact(dir, destination_name, expected, None)
             }
         }
     }
@@ -2036,6 +2109,81 @@ mod tests {
             Err(FilesystemError::ByteCollision)
         ));
         assert_eq!(fixture.dir.read("entry").unwrap(), b"exact bytes");
+    }
+
+    #[test]
+    fn durable_exact_move_preserves_the_winner_and_is_idempotent() {
+        let fixture = TestDirectory::new("durable-exact-move");
+        let publication = DurableDirectoryPublication::open(&fixture.dir).unwrap();
+        fixture.dir.write("source", b"exact bytes").unwrap();
+
+        publication
+            .move_exact_no_replace("source", "destination", b"exact bytes")
+            .unwrap();
+        assert!(fixture.dir.symlink_metadata("source").is_err());
+        assert_eq!(fixture.dir.read("destination").unwrap(), b"exact bytes");
+
+        publication
+            .move_exact_no_replace("source", "destination", b"exact bytes")
+            .unwrap();
+        fixture.dir.write("other", b"replacement").unwrap();
+        assert!(matches!(
+            publication.move_exact_no_replace("other", "destination", b"replacement"),
+            Err(FilesystemError::Io(error)) if error.kind() == ErrorKind::AlreadyExists
+        ));
+        assert_eq!(fixture.dir.read("other").unwrap(), b"replacement");
+        assert_eq!(fixture.dir.read("destination").unwrap(), b"exact bytes");
+
+        fixture.dir.write("wrong-source", b"wrong bytes").unwrap();
+        assert!(matches!(
+            publication.move_exact_no_replace("wrong-source", "unused", b"expected"),
+            Err(FilesystemError::ByteCollision)
+        ));
+        assert_eq!(fixture.dir.read("wrong-source").unwrap(), b"wrong bytes");
+        assert!(fixture.dir.symlink_metadata("unused").is_err());
+        assert!(matches!(
+            publication.move_exact_no_replace("missing", "also-missing", b"expected"),
+            Err(FilesystemError::Io(error)) if error.kind() == ErrorKind::NotFound
+        ));
+        assert!(matches!(
+            publication.move_exact_no_replace("same", "same", b"expected"),
+            Err(FilesystemError::UnsafeEntry(_))
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn interrupted_hard_link_move_finishes_only_for_the_same_exact_inode() {
+        let fixture = TestDirectory::new("interrupted-hard-link-move");
+        fixture.dir.write("source", b"exact bytes").unwrap();
+        fixture
+            .dir
+            .hard_link("source", &fixture.dir, "destination")
+            .unwrap();
+        finish_interrupted_hard_link_move(&fixture.dir, "source", "destination", b"exact bytes")
+            .unwrap();
+        assert!(fixture.dir.symlink_metadata("source").is_err());
+        assert_eq!(fixture.dir.read("destination").unwrap(), b"exact bytes");
+
+        fixture.dir.write("foreign-source", b"same bytes").unwrap();
+        fixture
+            .dir
+            .write("foreign-destination", b"same bytes")
+            .unwrap();
+        assert!(matches!(
+            finish_interrupted_hard_link_move(
+                &fixture.dir,
+                "foreign-source",
+                "foreign-destination",
+                b"same bytes",
+            ),
+            Err(FilesystemError::ByteCollision)
+        ));
+        assert_eq!(fixture.dir.read("foreign-source").unwrap(), b"same bytes");
+        assert_eq!(
+            fixture.dir.read("foreign-destination").unwrap(),
+            b"same bytes"
+        );
     }
 
     #[test]

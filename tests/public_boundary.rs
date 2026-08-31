@@ -333,7 +333,7 @@ fn journal_v2_can_be_prepared_opened_and_appended_from_the_public_api() {
 
 #[test]
 #[cfg(any(unix, windows))]
-fn durable_publication_exposes_create_replace_and_retire_to_a_consumer() {
+fn durable_publication_exposes_create_replace_move_and_retire_to_a_consumer() {
     let root = std::env::temp_dir().join(format!("tine-storage-public-durable-{}", Uuid::new_v4()));
     std::fs::create_dir(&root).unwrap();
     let dir = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
@@ -347,6 +347,10 @@ fn durable_publication_exposes_create_replace_and_retire_to_a_consumer() {
     publication
         .replace_exact("schema-2-anchor", b"old", b"new")
         .unwrap();
+    dir.write("staged", b"staged").unwrap();
+    publication
+        .move_exact_no_replace("staged", "published", b"staged")
+        .unwrap();
     publication
         .retire_exact("schema-2-anchor", ".retired-schema-2-anchor", b"new")
         .unwrap();
@@ -359,6 +363,7 @@ fn durable_publication_exposes_create_replace_and_retire_to_a_consumer() {
         std::fs::read(root.join("private-schema-2-anchor")).unwrap(),
         b"private"
     );
+    assert_eq!(std::fs::read(root.join("published")).unwrap(), b"staged");
     drop(publication);
     drop(dir);
     std::fs::remove_dir_all(root).unwrap();
