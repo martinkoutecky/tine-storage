@@ -5,6 +5,17 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.9.2] - 2026-08-31
+
+### Fixed
+
+- Repeated durable publications on Windows now reuse the successful
+  write-through capability proof for the same retained directory identity.
+  Each open still validates its own no-follow directory capability, while
+  ordinary Direct Files saves no longer create and retire four probe files
+  before every authority update. The process cache is bounded; uncached
+  directories retain the conservative prove-on-open behavior.
+
 ## [0.9.1] - 2026-08-31
 
 ### Added
@@ -408,7 +419,10 @@ independently in `src/formats.rs` and summarized in
 - Generated public-API inventory and a production/test-support boundary gate.
 - Machine-readable persistent-format manifest.
 
-[Unreleased]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.7...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine-storage/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/martinkoutecky/tine-storage/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/martinkoutecky/tine-storage/compare/v0.9.0...v0.9.1
+[0.9.0]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.13...v0.9.0
 [0.8.7]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.6...v0.8.7
 [0.8.6]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.4...v0.8.5

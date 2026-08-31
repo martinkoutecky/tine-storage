@@ -20,6 +20,8 @@ use std::os::windows::fs::MetadataExt as _;
 use std::os::windows::io::AsRawHandle as _;
 #[cfg(windows)]
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 #[cfg(test)]
@@ -278,7 +280,10 @@ pub fn sync_dir_required(dir: &Dir) -> io::Result<()> {
 /// that retained the exact no-follow directory capability used by the probe.
 /// On Windows, [`DurableDirectoryPublication::open`] refuses if the documented
 /// `MoveFileExW(..., MOVEFILE_WRITE_THROUGH)` protocol cannot be demonstrated;
-/// it never falls back to `std::fs::rename`.
+/// it never falls back to `std::fs::rename`. The first retained capability for
+/// one exact directory proves the protocol; later opens of that same live
+/// directory identity reuse the process-local proof while still revalidating
+/// their own retained no-follow capability.
 pub struct DurableDirectoryPublication {
     dir: Dir,
     #[cfg(windows)]
@@ -295,7 +300,7 @@ impl DurableDirectoryPublication {
                 dir: dir.try_clone()?,
                 windows: WindowsWriteThroughDirectory::open(dir)?,
             };
-            publication.probe_windows_write_through()?;
+            publication.probe_windows_write_through_once_per_directory()?;
             return Ok(publication);
         }
 
@@ -577,10 +582,17 @@ fn finish_interrupted_hard_link_move(
 }
 
 #[cfg(windows)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct WindowsFileIdentity {
     volume_serial: u32,
     file_index: u64,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct WindowsDirectoryProbeKey {
+    path: PathBuf,
+    identity: WindowsFileIdentity,
 }
 
 #[cfg(windows)]
@@ -595,6 +607,13 @@ struct WindowsWriteThroughDirectory {
 
 #[cfg(windows)]
 impl WindowsWriteThroughDirectory {
+    fn probe_key(&self) -> WindowsDirectoryProbeKey {
+        WindowsDirectoryProbeKey {
+            path: self.path.clone(),
+            identity: self.identity,
+        }
+    }
+
     fn open(dir: &Dir) -> Result<Self, FilesystemError> {
         use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
@@ -764,8 +783,43 @@ impl WindowsWriteThroughDirectory {
 
 #[cfg(windows)]
 impl DurableDirectoryPublication {
-    fn probe_windows_write_through(&self) -> Result<(), FilesystemError> {
+    fn probe_windows_write_through_once_per_directory(&self) -> Result<(), FilesystemError> {
+        const MAX_CACHED_DIRECTORIES: usize = 1_024;
+        static PROBED_DIRECTORIES: OnceLock<
+            Mutex<std::collections::HashSet<WindowsDirectoryProbeKey>>,
+        > = OnceLock::new();
+        let directories =
+            PROBED_DIRECTORIES.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+        let mut directories = directories
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.windows.validate()?;
+        let key = self.windows.probe_key();
+        if directories.contains(&key) {
+            return Ok(());
+        }
+        self.probe_windows_write_through()?;
+        // The cache is only an optimization. Once bounded capacity is reached,
+        // keep proving new directories on every open rather than allowing a
+        // long-running multi-graph process to grow without limit.
+        if directories.len() < MAX_CACHED_DIRECTORIES {
+            directories.insert(key);
+        }
+        Ok(())
+    }
+
+    fn probe_windows_write_through(&self) -> Result<(), FilesystemError> {
+        #[cfg(test)]
+        {
+            let probes = WINDOWS_WRITE_THROUGH_PROBES.get_or_init(|| {
+                Mutex::new(std::collections::HashMap::<WindowsDirectoryProbeKey, usize>::new())
+            });
+            *probes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(self.windows.probe_key())
+                .or_default() += 1;
+        }
         let source = format!(
             ".tine-storage-write-through-probe-source-{}",
             Uuid::new_v4()
@@ -827,6 +881,11 @@ impl DurableDirectoryPublication {
         })
     }
 }
+
+#[cfg(all(test, windows))]
+static WINDOWS_WRITE_THROUGH_PROBES: OnceLock<
+    Mutex<std::collections::HashMap<WindowsDirectoryProbeKey, usize>>,
+> = OnceLock::new();
 
 #[cfg(windows)]
 fn cleanup_temp(dir: &Dir, name: &str) {
@@ -2109,6 +2168,56 @@ mod tests {
             Err(FilesystemError::ByteCollision)
         ));
         assert_eq!(fixture.dir.read("entry").unwrap(), b"exact bytes");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn durable_directory_reuses_the_exact_directory_write_through_probe() {
+        let fixture = TestDirectory::new("durable-directory-probe-cache");
+        let first = DurableDirectoryPublication::open(&fixture.dir).unwrap();
+        let key = first.windows.probe_key();
+        let probe_count = || {
+            WINDOWS_WRITE_THROUGH_PROBES
+                .get()
+                .and_then(|probes| {
+                    probes
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get(&key)
+                        .copied()
+                })
+                .unwrap_or(0)
+        };
+        assert_eq!(probe_count(), 1);
+
+        let second = DurableDirectoryPublication::open(&fixture.dir).unwrap();
+        assert_eq!(second.windows.probe_key(), key);
+        assert_eq!(probe_count(), 1);
+        second
+            .publish_new_exact_single_writer("cached-publication", b"exact bytes")
+            .unwrap();
+        assert_eq!(
+            fixture.dir.read("cached-publication").unwrap(),
+            b"exact bytes"
+        );
+
+        let other = TestDirectory::new("durable-directory-distinct-probe");
+        let distinct = DurableDirectoryPublication::open(&other.dir).unwrap();
+        let distinct_key = distinct.windows.probe_key();
+        assert_ne!(distinct_key, key);
+        assert_eq!(
+            WINDOWS_WRITE_THROUGH_PROBES
+                .get()
+                .and_then(|probes| {
+                    probes
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get(&distinct_key)
+                        .copied()
+                })
+                .unwrap_or(0),
+            1
+        );
     }
 
     #[test]
