@@ -14,6 +14,14 @@ independently in `src/formats.rs` and summarized in
   after Tine retired its final consumers. This is an API and private-format
   break on the pre-1.0 line: Tine preserves unrecognized Managed Storage state
   as a backup and rebuilds its one current representation from Markdown/Org.
+- Removed the remaining zero-consumer pre-0.7 layout vocabulary for detached
+  bootstrap publication, resume points, promoted-runtime state, projection-work
+  indexes, reconciliation, shadow/migration staging, legacy lazy-genesis packs,
+  and their obsolete claims, proofs, receipts, and temporary names. Current
+  engine history, clean source capture, enrollment, journal, projection-receipt,
+  scratch, SQLite, and provider layouts remain unchanged. As above, Tine backs
+  up unrecognized Managed Storage state and rebuilds from Markdown/Org rather
+  than carrying a migration for unreleased private layouts.
 
 ## [0.9.2] - 2026-08-31
 

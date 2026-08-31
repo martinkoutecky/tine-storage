@@ -258,7 +258,7 @@ fn format_constants_are_reachable_through_formats() {
         formats::LOCAL_ACTIVATION_RESERVATION_FILE,
         "local-activation-v1.reservation"
     );
-    assert_eq!(formats::RECONCILIATION_DATABASE_WAL_FILE, "scan.sqlite-wal");
+    assert_eq!(formats::ENGINE_HISTORY_HEAD_FILE, "engine-history.head");
 }
 
 #[test]
