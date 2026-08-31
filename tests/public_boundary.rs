@@ -247,7 +247,6 @@ fn a_receipt_can_be_generated_from_the_public_manifest() {
 /// nonexistent path cannot be named in code that has to compile.
 #[test]
 fn format_constants_are_reachable_through_formats() {
-    assert_eq!(formats::SCRATCH_DIR, "engine-scratch-v2");
     assert!(formats::MAX_OBJECT_BYTES > 0);
     assert_eq!(formats::SQLITE_SCHEMA_VERSION, 22);
     assert_eq!(formats::LOCAL_JOURNAL_SEGMENT_PROTOCOL_VERSION, 2);
@@ -258,7 +257,6 @@ fn format_constants_are_reachable_through_formats() {
         formats::LOCAL_ACTIVATION_RESERVATION_FILE,
         "local-activation-v1.reservation"
     );
-    assert_eq!(formats::ENGINE_HISTORY_HEAD_FILE, "engine-history.head");
 }
 
 #[test]

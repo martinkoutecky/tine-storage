@@ -31,14 +31,6 @@ pub const ARCHIVE_BATCHES_DIR: &str = "batches";
 pub const LAZY_GENESIS_MANIFEST_FILE: &str = "manifest.postcard";
 pub const LAZY_GENESIS_COMMIT_FILE: &str = "commit.postcard";
 pub const LINEAGE_CLAIM_FILE: &str = "lineage.claim";
-pub const ENGINE_HISTORY_DIR: &str = "engine-history";
-pub const ENGINE_HISTORY_NODES_DIR: &str = "nodes";
-pub const ENGINE_HISTORY_ROOTS_DIR: &str = "roots";
-pub const ENGINE_HISTORY_CLAIM_FILE: &str = "engine-history.claim";
-pub const ENGINE_HISTORY_HEAD_FILE: &str = "engine-history.head";
-pub const ENGINE_HISTORY_TRANSITION_LOCK_FILE: &str = "engine-history.transition.lock";
-pub const ENGINE_HISTORY_ROOT_SUFFIX: &str = ".history-root";
-
 // Derived receipts/work indexes.
 pub const PROJECTION_STORE_CLAIM_FILE: &str = "projection-receipts.claim";
 pub const PROJECTION_STORE_INIT_FILE: &str = "projection-receipts.init";

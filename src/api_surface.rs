@@ -326,7 +326,11 @@ mod tests {
             "parsed only {} exported names; the parser has stopped seeing the surface",
             names.len()
         );
-        for expected in ["ContentDigest", "OperationBatch", "ScratchRun"] {
+        for expected in [
+            "ContentDigest",
+            "OperationBatch",
+            "DurableDirectoryPublication",
+        ] {
             assert!(
                 names
                     .iter()

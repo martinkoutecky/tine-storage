@@ -520,7 +520,7 @@ fn move_regular_exact_no_replace_unix(
         Some(active) if active == expected => {
             match rename_noreplace(dir, source_name, destination_name) {
                 Ok(()) => {}
-                #[cfg(any(target_os = "macos", target_os = "android"))]
+                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     finish_interrupted_hard_link_move(
                         dir,
@@ -549,11 +549,16 @@ fn move_regular_exact_no_replace_unix(
     Ok(())
 }
 
-/// macOS and Android implement no-replace as hard-link then unlink. If the
+/// Apple platforms and Android implement no-replace as hard-link then unlink. If the
 /// process stops between those calls, both names identify the same exact file.
 /// Completing that interrupted move is safe under the public single-writer,
 /// content-determined-name contract; any different inode or bytes fail closed.
-#[cfg(unix)]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    all(test, unix)
+))]
 fn finish_interrupted_hard_link_move(
     dir: &Dir,
     source_name: &str,
@@ -1652,6 +1657,10 @@ fn verify_existing(dir: &Dir, filename: &str, expected: &[u8]) -> Result<(), Fil
     }
 }
 
+#[cfg(test)]
+const RENAME_NOREPLACE_SUPPORTED_TARGETS: &[&str] =
+    &["linux", "macos", "ios", "android", "windows"];
+
 #[cfg(target_os = "linux")]
 fn rename_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     let from = CString::new(from)
@@ -1676,7 +1685,7 @@ fn rename_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "android", windows))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "android", windows))]
 fn rename_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     dir.hard_link(from, dir, to)?;
     dir.remove_file(from)
@@ -1685,6 +1694,7 @@ fn rename_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
 #[cfg(not(any(
     target_os = "linux",
     target_os = "macos",
+    target_os = "ios",
     target_os = "android",
     windows
 )))]
@@ -2604,6 +2614,14 @@ mod tests {
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn no_replace_supported_target_set_is_pinned() {
+        assert_eq!(
+            RENAME_NOREPLACE_SUPPORTED_TARGETS,
+            ["linux", "macos", "ios", "android", "windows"]
         );
     }
 }

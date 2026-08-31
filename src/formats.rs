@@ -45,7 +45,6 @@ pub use crate::local_journal_v2::{
     LOCAL_JOURNAL_SEGMENT_HEADER_BYTES, LOCAL_JOURNAL_SEGMENT_PROTOCOL_VERSION,
     LOCAL_JOURNAL_SEGMENT_V2_MAGIC,
 };
-pub use crate::scratch::{SCRATCH_PAGE_SCHEMA_VERSION, SCRATCH_SCHEMA_VERSION};
 pub use crate::sealed_accepted_index_impl::{
     SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION, SEALED_ACCEPTED_INDEX_SCHEMA_VERSION,
     SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION, SEALED_ACCEPTED_SEQUENCE_FANOUT,
@@ -59,11 +58,8 @@ pub use crate::managed_layout::{
     ARCHIVE_BATCHES_DIR, ARCHIVE_OBJECTS_DIR, BOOTSTRAP_SOURCE_CAPTURE_CHUNKS_DIR,
     BOOTSTRAP_SOURCE_CAPTURE_DIR, BOOTSTRAP_SOURCE_CAPTURE_MANIFEST_FILE,
     BOOTSTRAP_SOURCE_CHUNKS_FILE, BOOTSTRAP_SOURCE_ENTRIES_FILE, BOOTSTRAP_SOURCE_INVENTORY_FILE,
-    ENGINE_HISTORY_CLAIM_FILE, ENGINE_HISTORY_DIR, ENGINE_HISTORY_HEAD_FILE,
-    ENGINE_HISTORY_NODES_DIR, ENGINE_HISTORY_ROOTS_DIR, ENGINE_HISTORY_ROOT_SUFFIX,
-    ENGINE_HISTORY_TRANSITION_LOCK_FILE, ENROLLMENT_AUTHORITY_FILE,
-    ENROLLMENT_AUTHORITY_TEMP_PREFIX, ENROLLMENT_DIR, ENROLLMENT_HEAD_FILE,
-    ENROLLMENT_HEAD_TEMP_PREFIX, ENROLLMENT_LEASE_FILE, ENROLLMENT_LOCAL_DIR,
+    ENROLLMENT_AUTHORITY_FILE, ENROLLMENT_AUTHORITY_TEMP_PREFIX, ENROLLMENT_DIR,
+    ENROLLMENT_HEAD_FILE, ENROLLMENT_HEAD_TEMP_PREFIX, ENROLLMENT_LEASE_FILE, ENROLLMENT_LOCAL_DIR,
     ENROLLMENT_RECORDS_DIR, ENROLLMENT_RECORD_SUFFIX, ENROLLMENT_STORAGE_DIR,
     ENROLLMENT_VERSION_DIR, LAZY_GENESIS_COMMIT_FILE, LAZY_GENESIS_MANIFEST_FILE,
     LINEAGE_CLAIM_FILE, LOCAL_ACTIVATION_RESERVATION_FILE, MANAGED_LOCAL_JOURNAL_DIR,
@@ -80,10 +76,6 @@ pub use crate::managed_layout::{
     SHARED_PUBLICATION_INTENTS_DIR, SHARED_REMOVED_DIR, SHARED_RENAME_EVIDENCE_DIR,
     SHARED_TEMP_DIR, SQLITE_APPLIER_LOCK_FILE, SQLITE_RUNTIME_DIR, SQLITE_WORKSPACES_DIR,
 };
-pub use crate::scratch::{
-    SCRATCH_BLOBS_FILE, SCRATCH_DIR, SCRATCH_LEASE_FILE, SCRATCH_LSM_LEVELS, SCRATCH_MARKER_FILE,
-    SCRATCH_PAGES_FILE,
-};
 
 // --- bounds a writer may legally have produced -------------------------------
 pub use crate::durable_batch::{MAX_MANIFEST_BYTES, MAX_OBJECT_BYTES};
@@ -91,7 +83,6 @@ pub use crate::local_journal::{
     MAX_LOCAL_JOURNAL_FRAME_BYTES, MAX_LOCAL_JOURNAL_FRAME_HEADER_BYTES,
     MAX_LOCAL_JOURNAL_SEGMENT_BYTES,
 };
-pub use crate::scratch::{MAX_SCRATCH_BLOB_BYTES, MAX_SCRATCH_PAGE_BYTES};
 
 // --- checkpoint fingerprint geometry -----------------------------------------
 // A stored checkpoint is only comparable to a fresh one computed with the same
@@ -212,18 +203,6 @@ pub const FORMAT_MANIFEST: &[FormatConstant] = &[
         LOCAL_JOURNAL_FRONTIER_V2_MAGIC,
     ),
     num(
-        "SCRATCH_SCHEMA_VERSION",
-        "engine scratch run",
-        FormatKind::Identity,
-        SCRATCH_SCHEMA_VERSION as u64,
-    ),
-    num(
-        "SCRATCH_PAGE_SCHEMA_VERSION",
-        "engine scratch page",
-        FormatKind::Identity,
-        SCRATCH_PAGE_SCHEMA_VERSION as u64,
-    ),
-    num(
         "SQLITE_APPLICATION_ID",
         "SQLite projection header",
         FormatKind::Identity,
@@ -283,42 +262,6 @@ pub const FORMAT_MANIFEST: &[FormatConstant] = &[
         "local journal v2 frontier",
         FormatKind::Layout,
         LOCAL_JOURNAL_FRONTIER_SUFFIX,
-    ),
-    name_of(
-        "SCRATCH_DIR",
-        "engine scratch directory",
-        FormatKind::Layout,
-        SCRATCH_DIR,
-    ),
-    name_of(
-        "SCRATCH_MARKER_FILE",
-        "engine scratch directory",
-        FormatKind::Layout,
-        SCRATCH_MARKER_FILE,
-    ),
-    name_of(
-        "SCRATCH_LEASE_FILE",
-        "engine scratch directory",
-        FormatKind::Layout,
-        SCRATCH_LEASE_FILE,
-    ),
-    name_of(
-        "SCRATCH_PAGES_FILE",
-        "engine scratch directory",
-        FormatKind::Layout,
-        SCRATCH_PAGES_FILE,
-    ),
-    name_of(
-        "SCRATCH_BLOBS_FILE",
-        "engine scratch directory",
-        FormatKind::Layout,
-        SCRATCH_BLOBS_FILE,
-    ),
-    num(
-        "SCRATCH_LSM_LEVELS",
-        "engine scratch LSM",
-        FormatKind::Layout,
-        SCRATCH_LSM_LEVELS as u64,
     ),
     num(
         "SEALED_ACCEPTED_SEQUENCE_FANOUT",
@@ -466,48 +409,6 @@ pub const FORMAT_MANIFEST: &[FormatConstant] = &[
         "managed storage layout",
         FormatKind::Layout,
         LINEAGE_CLAIM_FILE,
-    ),
-    name_of(
-        "ENGINE_HISTORY_DIR",
-        "managed storage layout",
-        FormatKind::Layout,
-        ENGINE_HISTORY_DIR,
-    ),
-    name_of(
-        "ENGINE_HISTORY_NODES_DIR",
-        "managed storage layout",
-        FormatKind::Layout,
-        ENGINE_HISTORY_NODES_DIR,
-    ),
-    name_of(
-        "ENGINE_HISTORY_ROOTS_DIR",
-        "managed storage layout",
-        FormatKind::Layout,
-        ENGINE_HISTORY_ROOTS_DIR,
-    ),
-    name_of(
-        "ENGINE_HISTORY_CLAIM_FILE",
-        "managed storage layout",
-        FormatKind::Layout,
-        ENGINE_HISTORY_CLAIM_FILE,
-    ),
-    name_of(
-        "ENGINE_HISTORY_HEAD_FILE",
-        "managed storage layout",
-        FormatKind::Layout,
-        ENGINE_HISTORY_HEAD_FILE,
-    ),
-    name_of(
-        "ENGINE_HISTORY_TRANSITION_LOCK_FILE",
-        "managed storage layout",
-        FormatKind::Layout,
-        ENGINE_HISTORY_TRANSITION_LOCK_FILE,
-    ),
-    name_of(
-        "ENGINE_HISTORY_ROOT_SUFFIX",
-        "managed storage layout",
-        FormatKind::Layout,
-        ENGINE_HISTORY_ROOT_SUFFIX,
     ),
     name_of(
         "PROJECTION_STORE_CLAIM_FILE",
@@ -768,18 +669,6 @@ pub const FORMAT_MANIFEST: &[FormatConstant] = &[
         FormatKind::WriterBound,
         MAX_LOCAL_JOURNAL_SEGMENT_BYTES,
     ),
-    num(
-        "MAX_SCRATCH_PAGE_BYTES",
-        "engine scratch page",
-        FormatKind::WriterBound,
-        MAX_SCRATCH_PAGE_BYTES as u64,
-    ),
-    num(
-        "MAX_SCRATCH_BLOB_BYTES",
-        "engine scratch blob",
-        FormatKind::WriterBound,
-        MAX_SCRATCH_BLOB_BYTES as u64,
-    ),
     // checkpoint geometry
     num(
         "MAX_SQLITE_CHECKPOINT_BYTES",
@@ -824,8 +713,6 @@ mod tests {
         assert_eq!(LOCAL_JOURNAL_SEGMENT_PROTOCOL_VERSION, 2);
         assert_eq!(LOCAL_JOURNAL_SEGMENT_V2_MAGIC, "TINEJNL2");
         assert_eq!(LOCAL_JOURNAL_FRONTIER_V2_MAGIC, "TINEFRT2");
-        assert_eq!(SCRATCH_SCHEMA_VERSION, 13);
-        assert_eq!(SCRATCH_PAGE_SCHEMA_VERSION, 1);
         assert_eq!(SQLITE_APPLICATION_ID, 0x5449_4e45);
         assert_eq!(SQLITE_SCHEMA_VERSION, 22);
         assert_eq!(SEALED_ACCEPTED_INDEX_SCHEMA_VERSION, 2);
@@ -837,12 +724,6 @@ mod tests {
         assert_eq!(LOCAL_JOURNAL_SEGMENT_HEADER_BYTES, 136);
         assert_eq!(LOCAL_JOURNAL_FRONTIER_BYTES, 240);
         assert_eq!(LOCAL_JOURNAL_FRONTIER_SUFFIX, ".frontier-v2");
-        assert_eq!(SCRATCH_DIR, "engine-scratch-v2");
-        assert_eq!(SCRATCH_MARKER_FILE, "marker");
-        assert_eq!(SCRATCH_LEASE_FILE, "lease");
-        assert_eq!(SCRATCH_PAGES_FILE, "pages.index");
-        assert_eq!(SCRATCH_BLOBS_FILE, "blobs.data");
-        assert_eq!(SCRATCH_LSM_LEVELS, 32);
         assert_eq!(SEALED_ACCEPTED_SEQUENCE_FANOUT, 32);
         assert_eq!(SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY, 1);
 
@@ -851,8 +732,6 @@ mod tests {
         assert_eq!(MAX_LOCAL_JOURNAL_FRAME_BYTES, 64 * 1024 * 1024);
         assert_eq!(MAX_LOCAL_JOURNAL_FRAME_HEADER_BYTES, 4 * 1024);
         assert_eq!(MAX_LOCAL_JOURNAL_SEGMENT_BYTES, 4 * 1024 * 1024 * 1024);
-        assert_eq!(MAX_SCRATCH_PAGE_BYTES, 256 * 1024 * 1024);
-        assert_eq!(MAX_SCRATCH_BLOB_BYTES, 256 * 1024 * 1024);
 
         assert_eq!(MAX_SQLITE_CHECKPOINT_BYTES, 64 * 1024);
         assert_eq!(SQLITE_CHECKPOINT_EDGE_BYTES, 64 * 1024);
@@ -895,14 +774,6 @@ mod tests {
                 FormatValue::Name(LOCAL_JOURNAL_FRONTIER_V2_MAGIC),
             ),
             (
-                "SCRATCH_SCHEMA_VERSION",
-                FormatValue::Number(SCRATCH_SCHEMA_VERSION as u64),
-            ),
-            (
-                "SCRATCH_PAGE_SCHEMA_VERSION",
-                FormatValue::Number(SCRATCH_PAGE_SCHEMA_VERSION as u64),
-            ),
-            (
                 "SQLITE_APPLICATION_ID",
                 FormatValue::Number(SQLITE_APPLICATION_ID as u64),
             ),
@@ -942,18 +813,6 @@ mod tests {
                 "LOCAL_JOURNAL_FRONTIER_SUFFIX",
                 FormatValue::Name(LOCAL_JOURNAL_FRONTIER_SUFFIX),
             ),
-            ("SCRATCH_DIR", FormatValue::Name(SCRATCH_DIR)),
-            (
-                "SCRATCH_MARKER_FILE",
-                FormatValue::Name(SCRATCH_MARKER_FILE),
-            ),
-            ("SCRATCH_LEASE_FILE", FormatValue::Name(SCRATCH_LEASE_FILE)),
-            ("SCRATCH_PAGES_FILE", FormatValue::Name(SCRATCH_PAGES_FILE)),
-            ("SCRATCH_BLOBS_FILE", FormatValue::Name(SCRATCH_BLOBS_FILE)),
-            (
-                "SCRATCH_LSM_LEVELS",
-                FormatValue::Number(SCRATCH_LSM_LEVELS as u64),
-            ),
             (
                 "SEALED_ACCEPTED_SEQUENCE_FANOUT",
                 FormatValue::Number(SEALED_ACCEPTED_SEQUENCE_FANOUT as u64),
@@ -981,14 +840,6 @@ mod tests {
             (
                 "MAX_LOCAL_JOURNAL_SEGMENT_BYTES",
                 FormatValue::Number(MAX_LOCAL_JOURNAL_SEGMENT_BYTES),
-            ),
-            (
-                "MAX_SCRATCH_PAGE_BYTES",
-                FormatValue::Number(MAX_SCRATCH_PAGE_BYTES as u64),
-            ),
-            (
-                "MAX_SCRATCH_BLOB_BYTES",
-                FormatValue::Number(MAX_SCRATCH_BLOB_BYTES as u64),
             ),
             (
                 "MAX_SQLITE_CHECKPOINT_BYTES",
@@ -1049,7 +900,7 @@ mod tests {
         assert_eq!(actual, expected, "managed-storage path vocabulary drifted");
         assert_eq!(
             FORMAT_MANIFEST.len(),
-            38 + expected.len(),
+            28 + expected.len(),
             "a format row was added outside the pinned base or managed-layout inventories",
         );
     }

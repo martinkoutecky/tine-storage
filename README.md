@@ -54,7 +54,6 @@ Package-local test ownership is intentionally divided as follows:
 - Durability and filesystem publication invariants: `filesystem::tests`.
 - Sealed accepted-history index invariants:
   `sealed_accepted_index_impl::tests`.
-- Scratch lifecycle and retained-run invariants: `scratch::tests`.
 - SQLite transaction and schema invariants: `sqlite_frontier::tests` and
   `sqlite_materialization::tests`.
 - SQLite facade, connection ownership, and test-support-gate invariants:

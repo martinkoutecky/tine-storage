@@ -5,6 +5,21 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.11.0] - 2026-08-31
+
+### Fixed
+
+- iOS now uses the same no-clobber hard-link publication and interrupted-move
+  recovery as macOS, fixing page creation and Direct Files saves on iPhone and
+  iPad.
+
+### Removed
+
+- Removed the unused scratch store and obsolete engine-history layout
+  vocabulary after Tine retired their final production consumers. Managed
+  Storage remains pre-0.7 with one current private format: unrecognized state
+  is preserved as a backup and rebuilt from Markdown/Org rather than migrated.
+
 ## [0.10.0] - 2026-08-31
 
 ### Removed

@@ -28,7 +28,6 @@ pub mod formats;
 mod local_journal;
 mod local_journal_v2;
 mod managed_layout;
-mod scratch;
 mod sealed_accepted_index_impl;
 mod sqlite_database;
 mod sqlite_fileset;
@@ -133,11 +132,4 @@ pub use local_journal::{
 };
 pub use local_journal_v2::{
     LocalJournalAppendError, LocalJournalSegmentV2, LocalJournalSegmentV2Selection,
-};
-pub use scratch::{
-    census_retained_runs, reclaim_unreachable_retained_runs, RetainedRunCensus,
-    RetainedRunReclamation, ScratchBlobRef, ScratchConstructionBoundary, ScratchLookupSession,
-    ScratchLookupSessionStats, ScratchLsmRoot, ScratchOperationStats, ScratchPageReader,
-    ScratchPageRef, ScratchPageTag, ScratchRetention, ScratchRun, ScratchRunError,
-    ScratchRunLifecycleStats, ScratchSegmentRef,
 };
