@@ -29,15 +29,6 @@ jobs:
       # the physical suite removes that harness interaction without weakening
       # any protocol assertion.
       - run: cargo test --locked --all-features -- --test-threads=1
-      - name: Timed Patricia 4096-record physical burn-in
-        shell: bash
-        run: |
-          started=$SECONDS
-          cargo test --locked -p tine-storage \
-            authenticated_patricia::tests::physical_publication_reopens_exactly_for_4096_records_burn_in \
-            -- --exact --ignored --nocapture
-          elapsed=$((SECONDS - started))
-          echo "Linux Patricia 4096-record physical burn-in: ${elapsed}s" | tee -a "$GITHUB_STEP_SUMMARY"
 
   windows-complete:
     name: Windows complete physical suite
@@ -67,18 +58,6 @@ jobs:
           local_journal_v2::windows_tests::injected_windows_replacement_error_reopens_to_old_or_successor_once
           -- --exact --nocapture
       - run: cargo nextest run --locked --all-features --no-fail-fast
-      - name: Timed Patricia 4096-record physical burn-in
-        shell: pwsh
-        run: |
-          $started = Get-Date
-          cargo test --locked -p tine-storage `
-            authenticated_patricia::tests::physical_publication_reopens_exactly_for_4096_records_burn_in `
-            -- --exact --ignored --nocapture
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $elapsed = [math]::Round(((Get-Date) - $started).TotalSeconds, 2)
-          $summary = "Windows Patricia 4096-record physical burn-in: ${elapsed}s"
-          Write-Host $summary
-          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
   android-compile:
     name: Android arm64 compile

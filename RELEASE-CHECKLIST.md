@@ -19,10 +19,10 @@ when that pin is unchanged.
 - [ ] `cargo fmt --all -- --check`.
 - [ ] Linux: complete default-feature and all-feature test suites, including
       public-boundary, format, crash-cut, path/no-follow, local-journal,
-      authenticated-index, SQLite, and corruption tests.
+      sealed accepted-index, SQLite, and corruption tests.
 - [ ] Windows: compile every target and run the complete applicable suite,
-      including locking, restart, path/reparse, journal, packed-index crash
-      windows, and SQLite behavior.
+      including locking, restart, path/reparse, journal, sealed accepted-index,
+      and SQLite behavior.
 - [ ] Android: compile the library for the Tine Android target with the same
       minimum API/toolchain used by Tine.
 - [ ] The API golden and public-boundary fixture pass.

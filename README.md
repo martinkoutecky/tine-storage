@@ -52,7 +52,6 @@ Package-local test ownership is intentionally divided as follows:
 
 - Persistent-format invariants: `durable_batch::tests` and `digest_sealed::tests`.
 - Durability and filesystem publication invariants: `filesystem::tests`.
-- Authenticated-index invariants: `authenticated_patricia::tests`.
 - Sealed accepted-history index invariants:
   `sealed_accepted_index_impl::tests`.
 - Scratch lifecycle and retained-run invariants: `scratch::tests`.

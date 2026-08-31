@@ -20,7 +20,6 @@
 //! single-path rule against this file.
 
 pub mod api_surface;
-mod authenticated_patricia;
 mod content_digest;
 mod digest_sealed;
 mod durable_batch;
@@ -29,7 +28,6 @@ pub mod formats;
 mod local_journal;
 mod local_journal_v2;
 mod managed_layout;
-mod packed_patricia;
 mod scratch;
 mod sealed_accepted_index_impl;
 mod sqlite_database;
@@ -115,13 +113,6 @@ pub mod sealed_accepted_index {
     };
 }
 
-pub use authenticated_patricia::{
-    CompletedPatriciaIndexConstruction, PatriciaError, PatriciaIndexConstruction,
-    PatriciaIndexConstructionStats, PatriciaIndexReclamationError, PatriciaIndexReclamationReport,
-    PatriciaIndexRoot, PatriciaIndexStats, PatriciaIndexStore, PatriciaNodePublisher,
-    PatriciaPublicationError, DEFAULT_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
-    MAX_PATRICIA_CONSTRUCTION_BULK_RECORDS, MAX_PATRICIA_CONSTRUCTION_RESIDENT_BYTES,
-};
 pub use content_digest::ContentDigest;
 pub use digest_sealed::{DigestSealedError, DigestSealedPayload};
 pub use durable_batch::{
@@ -142,11 +133,6 @@ pub use local_journal::{
 };
 pub use local_journal_v2::{
     LocalJournalAppendError, LocalJournalSegmentV2, LocalJournalSegmentV2Selection,
-};
-#[cfg(feature = "test-support")]
-pub use packed_patricia::{
-    fail_head_transition_after_for_test, fail_next_head_transition_for_test,
-    HeadTransitionFailureForTest,
 };
 pub use scratch::{
     census_retained_runs, reclaim_unreachable_retained_runs, RetainedRunCensus,

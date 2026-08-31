@@ -181,8 +181,8 @@ pub struct PhysicalBlockHomeClaim {
 ///
 /// Storage deliberately treats the record as opaque bytes: tine-core owns the
 /// conflict semantics and encoding, while SQLite supplies the bounded point
-/// lookup and atomic replacement that previously required a custom Patricia
-/// tree.
+/// lookup and atomic replacement that previously required a custom
+/// content-addressed tree.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalIdentityRecord {
     pub key_digest: ContentDigest,

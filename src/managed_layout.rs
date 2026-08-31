@@ -54,11 +54,6 @@ pub const ENGINE_HISTORY_HEAD_FILE: &str = "engine-history.head";
 pub const ENGINE_HISTORY_TRANSITION_LOCK_FILE: &str = "engine-history.transition.lock";
 pub const ENGINE_HISTORY_ROOT_SUFFIX: &str = ".history-root";
 pub const PROMOTED_RUNTIME_STATE_FILE: &str = "promoted-runtime.state";
-pub const BLOCK_CLAIM_INDEX_DIR: &str = "block-claim-index";
-pub const BLOCK_CLAIM_INDEX_FILE: &str = "pages.index";
-pub const LOGSEQ_CLAIM_INDEX_DIR: &str = "logseq-uuid-claim-index-v1";
-pub const PORTABLE_PATH_INDEX_DIR: &str = "portable-path-index-v1";
-pub const PAGE_NAME_OWNERSHIP_INDEX_DIR: &str = "page-name-ownership-index-v1";
 pub const REFERENCE_CATALOG_DIR: &str = "reference-catalog-v2";
 pub const PROJECTION_WORK_DIR: &str = "projection-work-index-v1";
 pub const ARCHIVE_INSTANCE_CLAIM_FILE: &str = "archive-instance-v1.claim";
@@ -148,11 +143,7 @@ pub const RESTORE_PROOF_STAGE_FILE: &str = ".restore-proof.bin.staging";
 pub const COMMIT_MARKER_FILE: &str = "committed.bin";
 pub const COMMIT_MARKER_STAGE_FILE: &str = ".committed.bin.staging";
 
-// Page-name index and Direct-to-managed source capture.
-pub const PAGE_NAME_EXACT_BLOB_SUFFIX: &str = ".exact-page-name";
-pub const PAGE_NAME_STORE_CLAIM_FILE: &str = "page-name-index.claim";
-pub const PAGE_NAME_NODES_DIR: &str = "nodes";
-pub const PAGE_NAME_EXACT_NAMES_DIR: &str = "exact-names";
+// Direct-to-managed source capture.
 pub const BOOTSTRAP_SOURCE_CAPTURE_DIR: &str = "bootstrap-source-capture-v1";
 pub const BOOTSTRAP_SOURCE_CAPTURE_CHUNKS_DIR: &str = "source-chunks";
 pub const BOOTSTRAP_SOURCE_CAPTURE_MANIFEST_FILE: &str = "capture-manifest.bin";

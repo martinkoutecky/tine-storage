@@ -5,6 +5,16 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.10.0] - 2026-08-31
+
+### Removed
+
+- Removed the unused generic Patricia index, packed Patricia publication,
+  test-only head-transition API, and their obsolete private-layout vocabulary
+  after Tine retired its final consumers. This is an API and private-format
+  break on the pre-1.0 line: Tine preserves unrecognized Managed Storage state
+  as a backup and rebuilds its one current representation from Markdown/Org.
+
 ## [0.9.2] - 2026-08-31
 
 ### Fixed
@@ -419,7 +429,8 @@ independently in `src/formats.rs` and summarized in
 - Generated public-API inventory and a production/test-support boundary gate.
 - Machine-readable persistent-format manifest.
 
-[Unreleased]: https://github.com/martinkoutecky/tine-storage/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine-storage/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/martinkoutecky/tine-storage/compare/v0.9.2...v0.10.0
 [0.9.2]: https://github.com/martinkoutecky/tine-storage/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/martinkoutecky/tine-storage/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/martinkoutecky/tine-storage/compare/v0.8.13...v0.9.0
