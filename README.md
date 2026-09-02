@@ -25,6 +25,30 @@ caller-supplied decoder validates Tine's exact current evidence bytes and lets
 the shared reader bind their batch, sequence, manifest, and event fields
 without making this physical crate depend on the engine crate.
 
+## Immutable package publication
+
+`publish_package_noclobber`, `retire_package`, and `recover_package_store`
+compose the crate's no-follow and durable-name primitives into one
+staged-directory protocol for app-private immutable packages:
+
+- every staged regular file is written and synchronized before the staging
+  directory is synchronized;
+- the complete staging directory is moved from the store root to its
+  package-id directory with a native no-replace operation on Linux, Windows,
+  macOS, iOS, and Android;
+- Windows requests write-through name operations, while Unix synchronizes both
+  changed parent directories after publication or retirement;
+- an existing version is idempotent only when its complete file set and exact
+  bytes match; any other concurrent destination is an immutable collision;
+- removal first moves the active package to a caller-supplied `.retired-*`
+  root name, then reclaims it; and
+- reopen removes `.install-*`, `.retired-*`, and incomplete active package
+  shapes so every crash cut converges to one exact package or absence.
+
+Callers define the package identity grammar, transient suffixes, required file
+set, and semantic validation. Transient names are deliberately supplied rather
+than invented here so the application contract can pin and test its grammar.
+
 ## Persistent-format identity
 
 `tine_storage::formats` collects every constant that describes bytes already on
@@ -52,6 +76,7 @@ Package-local test ownership is intentionally divided as follows:
 
 - Persistent-format invariants: `durable_batch::tests` and `digest_sealed::tests`.
 - Durability and filesystem publication invariants: `filesystem::tests`.
+- Immutable package crash-cut and recovery invariants: `package_store::tests`.
 - Sealed accepted-history index invariants:
   `sealed_accepted_index_impl::tests`.
 - SQLite transaction and schema invariants: `sqlite_frontier::tests` and

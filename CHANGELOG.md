@@ -5,6 +5,15 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.12.0] - 2026-09-02
+
+### Added
+
+- Added an audited immutable-package protocol with durably flushed staged
+  files, five-target no-clobber whole-directory publication, exact-byte
+  idempotent retries, retire-then-reclaim removal, and reopen recovery for
+  staged, retired, and incomplete package residues.
+
 ## [0.11.0] - 2026-08-31
 
 ### Fixed

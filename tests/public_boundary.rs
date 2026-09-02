@@ -26,9 +26,10 @@ use tine_storage::sqlite::{
     SqliteMaterializedRead,
 };
 use tine_storage::{
-    ContentDigest, DigestSealedError, DigestSealedPayload, DurableDirectoryPublication,
-    LocalJournalAppendError, LocalJournalError, LocalJournalSegmentV2,
-    LocalJournalSegmentV2Selection,
+    publish_package_noclobber, recover_package_store, retire_package, ContentDigest,
+    DigestSealedError, DigestSealedPayload, DurableDirectoryPublication, LocalJournalAppendError,
+    LocalJournalError, LocalJournalSegmentV2, LocalJournalSegmentV2Selection, PackageFile,
+    PackagePublishOutcome,
 };
 use uuid::Uuid;
 
@@ -70,6 +71,45 @@ fn content_digests_are_usable_from_outside_the_crate() {
     assert_eq!(digest.as_bytes().len(), 32);
     assert_eq!(digest, ContentDigest::of(b"bytes"));
     assert_ne!(digest, ContentDigest::of(b"other bytes"));
+}
+
+#[test]
+fn immutable_package_protocol_is_usable_from_the_public_api() {
+    let root = std::env::temp_dir().join(format!("tine-storage-public-package-{}", Uuid::new_v4()));
+    std::fs::create_dir(&root).unwrap();
+    let store = root.join("plugins");
+    let files = [
+        PackageFile {
+            name: "manifest.json",
+            bytes: br#"{"id":"dev.tine.example","version":"1.0.0"}"#,
+        },
+        PackageFile {
+            name: "plugin.wasm",
+            bytes: b"\0asm\x01\0\0\0",
+        },
+    ];
+    assert_eq!(
+        publish_package_noclobber(
+            &store,
+            "dev.tine.example",
+            "1.0.0",
+            ".install-dev.tine.example-1.0.0-1-1",
+            &files,
+        )
+        .unwrap(),
+        PackagePublishOutcome::Published
+    );
+    recover_package_store(&store, &["manifest.json", "plugin.wasm"]).unwrap();
+    assert!(retire_package(
+        &store,
+        "dev.tine.example",
+        "1.0.0",
+        ".retired-dev.tine.example-1.0.0-1-2",
+        &["manifest.json", "plugin.wasm"],
+    )
+    .unwrap());
+    assert!(!store.join("dev.tine.example").exists());
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

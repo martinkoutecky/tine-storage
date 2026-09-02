@@ -10,7 +10,12 @@ use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
-#[cfg(unix)]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    all(test, unix)
+))]
 use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
@@ -1660,6 +1665,163 @@ fn verify_existing(dir: &Dir, filename: &str, expected: &[u8]) -> Result<(), Fil
 #[cfg(test)]
 const RENAME_NOREPLACE_SUPPORTED_TARGETS: &[&str] =
     &["linux", "macos", "ios", "android", "windows"];
+
+#[cfg(test)]
+pub(crate) const PACKAGE_DIRECTORY_MOVE_SUPPORTED_TARGETS: &[&str] =
+    &["linux", "macos", "ios", "android", "windows"];
+
+/// Move one real directory between two retained parent capabilities without
+/// replacing a concurrent destination.
+///
+/// Package-store staging lives at the store root while immutable versions live
+/// below their package-id directory, so this is deliberately a cross-parent
+/// primitive. Every shipped target uses its native no-replace name operation;
+/// Windows additionally requests write-through completion. Callers own the
+/// directory-content validation and synchronize both parents after success.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) fn move_directory_no_replace(
+    source_parent: &Dir,
+    source_name: &str,
+    destination_parent: &Dir,
+    destination_name: &str,
+) -> Result<(), FilesystemError> {
+    validate_single_entry_name(source_name)?;
+    validate_single_entry_name(destination_name)?;
+    let source = CString::new(source_name)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid source directory name"))?;
+    let destination = CString::new(destination_name).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "invalid destination directory name",
+        )
+    })?;
+    // Android's libc does not expose a stable renameat2 wrapper on every NDK,
+    // but the shipped arm64 target provides the Linux-compatible syscall.
+    // SAFETY: both directory descriptors and C strings remain live for the
+    // call; RENAME_NOREPLACE forbids replacement of an existing destination.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            source_parent.as_fd().as_raw_fd(),
+            source.as_ptr(),
+            destination_parent.as_fd().as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error().into())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) fn move_directory_no_replace(
+    source_parent: &Dir,
+    source_name: &str,
+    destination_parent: &Dir,
+    destination_name: &str,
+) -> Result<(), FilesystemError> {
+    validate_single_entry_name(source_name)?;
+    validate_single_entry_name(destination_name)?;
+    let source = CString::new(source_name)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid source directory name"))?;
+    let destination = CString::new(destination_name).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "invalid destination directory name",
+        )
+    })?;
+    // SAFETY: the retained parent descriptors and C strings remain live for
+    // renameatx_np; RENAME_EXCL supplies the Darwin no-replace contract.
+    let result = unsafe {
+        libc::renameatx_np(
+            source_parent.as_fd().as_raw_fd(),
+            source.as_ptr(),
+            destination_parent.as_fd().as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error().into())
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn move_directory_no_replace(
+    source_parent: &Dir,
+    source_name: &str,
+    destination_parent: &Dir,
+    destination_name: &str,
+) -> Result<(), FilesystemError> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, FILE_ATTRIBUTE_REPARSE_POINT, MOVEFILE_WRITE_THROUGH,
+    };
+
+    validate_single_entry_name(source_name)?;
+    validate_single_entry_name(destination_name)?;
+    let source_capability = source_parent.try_clone()?.into_std_file();
+    let destination_capability = destination_parent.try_clone()?.into_std_file();
+    for (capability, label) in [
+        (&source_capability, "source"),
+        (&destination_capability, "destination"),
+    ] {
+        let metadata = capability.metadata()?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(FilesystemError::UnsafeEntry(format!(
+                "package {label} parent is not a real no-follow directory"
+            )));
+        }
+    }
+    let source = windows_final_path(&source_capability)?
+        .join(source_name)
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = windows_final_path(&destination_capability)?
+        .join(destination_name)
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: both paths are zero-terminated and derived from retained,
+    // no-follow parent capabilities. Omitting REPLACE_EXISTING is the
+    // no-clobber guarantee; WRITE_THROUGH is the certified Windows contract.
+    if unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    windows
+)))]
+pub(crate) fn move_directory_no_replace(
+    _source_parent: &Dir,
+    _source_name: &str,
+    _destination_parent: &Dir,
+    _destination_name: &str,
+) -> Result<(), FilesystemError> {
+    Err(FilesystemError::DurableNameOperationUnavailable(
+        "staged-directory publication is unsupported on this target".into(),
+    ))
+}
 
 #[cfg(target_os = "linux")]
 fn rename_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {

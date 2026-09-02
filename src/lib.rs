@@ -28,6 +28,7 @@ pub mod formats;
 mod local_journal;
 mod local_journal_v2;
 mod managed_layout;
+mod package_store;
 mod sealed_accepted_index_impl;
 mod sqlite_database;
 mod sqlite_fileset;
@@ -132,4 +133,8 @@ pub use local_journal::{
 };
 pub use local_journal_v2::{
     LocalJournalAppendError, LocalJournalSegmentV2, LocalJournalSegmentV2Selection,
+};
+pub use package_store::{
+    publish_package_noclobber, recover_package_store, retire_package, PackageFile,
+    PackagePublishOutcome, PackageStoreError,
 };
