@@ -629,11 +629,11 @@ impl WindowsWriteThroughDirectory {
 
         let capability = dir.try_clone()?.into_std_file();
         let metadata = capability.metadata()?;
-        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(FilesystemError::UnsafeEntry(
-                "directory durability handle is not a real no-follow directory".into(),
-            ));
-        }
+        validated_windows_directory_entry_durability(
+            metadata.is_dir(),
+            metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+        )
+        .map_err(|error| FilesystemError::UnsafeEntry(error.to_string()))?;
         let identity = windows_file_identity(&capability)?;
         let path = windows_final_path(&capability)?;
         Ok(Self {
@@ -702,13 +702,24 @@ impl WindowsWriteThroughDirectory {
         to: &str,
         replace_existing: bool,
     ) -> Result<(), FilesystemError> {
+        self.move_to_write_through(from, self, to, replace_existing)
+    }
+
+    fn move_to_write_through(
+        &self,
+        from: &str,
+        destination: &Self,
+        to: &str,
+        replace_existing: bool,
+    ) -> Result<(), FilesystemError> {
         use windows_sys::Win32::Storage::FileSystem::{
             MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
         };
 
         self.validate()?;
+        destination.validate()?;
         let from = self.path_for(from)?;
-        let to = self.path_for(to)?;
+        let to = destination.path_for(to)?;
         let flags = MOVEFILE_WRITE_THROUGH
             | if replace_existing {
                 MOVEFILE_REPLACE_EXISTING
@@ -1670,6 +1681,35 @@ const RENAME_NOREPLACE_SUPPORTED_TARGETS: &[&str] =
 pub(crate) const PACKAGE_DIRECTORY_MOVE_SUPPORTED_TARGETS: &[&str] =
     &["linux", "macos", "ios", "android", "windows"];
 
+#[cfg(target_os = "linux")]
+fn linux_renameat2_noreplace(
+    source_parent: &Dir,
+    source_name: &str,
+    destination_parent: &Dir,
+    destination_name: &str,
+) -> io::Result<()> {
+    let source = CString::new(source_name)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid source name"))?;
+    let destination = CString::new(destination_name)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid destination name"))?;
+    // SAFETY: both directory descriptors and C strings remain live for the
+    // call; RENAME_NOREPLACE forbids replacement of an existing destination.
+    let result = unsafe {
+        libc::renameat2(
+            source_parent.as_fd().as_raw_fd(),
+            source.as_ptr(),
+            destination_parent.as_fd().as_raw_fd(),
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Move one real directory between two retained parent capabilities without
 /// replacing a concurrent destination.
 ///
@@ -1678,7 +1718,25 @@ pub(crate) const PACKAGE_DIRECTORY_MOVE_SUPPORTED_TARGETS: &[&str] =
 /// primitive. Every shipped target uses its native no-replace name operation;
 /// Windows additionally requests write-through completion. Callers own the
 /// directory-content validation and synchronize both parents after success.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
+pub(crate) fn move_directory_no_replace(
+    source_parent: &Dir,
+    source_name: &str,
+    destination_parent: &Dir,
+    destination_name: &str,
+) -> Result<(), FilesystemError> {
+    validate_single_entry_name(source_name)?;
+    validate_single_entry_name(destination_name)?;
+    linux_renameat2_noreplace(
+        source_parent,
+        source_name,
+        destination_parent,
+        destination_name,
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(target_os = "android")]
 pub(crate) fn move_directory_no_replace(
     source_parent: &Dir,
     source_name: &str,
@@ -1758,51 +1816,11 @@ pub(crate) fn move_directory_no_replace(
     destination_parent: &Dir,
     destination_name: &str,
 ) -> Result<(), FilesystemError> {
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, FILE_ATTRIBUTE_REPARSE_POINT, MOVEFILE_WRITE_THROUGH,
-    };
-
     validate_single_entry_name(source_name)?;
     validate_single_entry_name(destination_name)?;
-    let source_capability = source_parent.try_clone()?.into_std_file();
-    let destination_capability = destination_parent.try_clone()?.into_std_file();
-    for (capability, label) in [
-        (&source_capability, "source"),
-        (&destination_capability, "destination"),
-    ] {
-        let metadata = capability.metadata()?;
-        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(FilesystemError::UnsafeEntry(format!(
-                "package {label} parent is not a real no-follow directory"
-            )));
-        }
-    }
-    let source = windows_final_path(&source_capability)?
-        .join(source_name)
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = windows_final_path(&destination_capability)?
-        .join(destination_name)
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    // SAFETY: both paths are zero-terminated and derived from retained,
-    // no-follow parent capabilities. Omitting REPLACE_EXISTING is the
-    // no-clobber guarantee; WRITE_THROUGH is the certified Windows contract.
-    if unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_WRITE_THROUGH,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error().into());
-    }
-    Ok(())
+    let source = WindowsWriteThroughDirectory::open(source_parent)?;
+    let destination = WindowsWriteThroughDirectory::open(destination_parent)?;
+    source.move_to_write_through(source_name, &destination, destination_name, false)
 }
 
 #[cfg(not(any(
@@ -1825,26 +1843,7 @@ pub(crate) fn move_directory_no_replace(
 
 #[cfg(target_os = "linux")]
 fn rename_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
-    let from = CString::new(from)
-        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid temporary name"))?;
-    let to = CString::new(to)
-        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid target name"))?;
-    // SAFETY: both C strings are alive for the call, contain no interior NUL,
-    // and both relative paths are resolved beneath the already-open directory.
-    let result = unsafe {
-        libc::renameat2(
-            dir.as_fd().as_raw_fd(),
-            from.as_ptr(),
-            dir.as_fd().as_raw_fd(),
-            to.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    linux_renameat2_noreplace(dir, from, dir, to)
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android", windows))]
@@ -2784,6 +2783,27 @@ mod tests {
         assert_eq!(
             RENAME_NOREPLACE_SUPPORTED_TARGETS,
             ["linux", "macos", "ios", "android", "windows"]
+        );
+    }
+
+    #[test]
+    fn native_name_operation_bodies_are_single_sourced() {
+        let source = include_str!("filesystem.rs");
+        let linux_call = ["libc::rename", "at2("].concat();
+        assert_eq!(
+            source.matches(&linux_call).count(),
+            1,
+            "I-12: Linux no-replace name operations must reuse linux_renameat2_noreplace; imitate that helper"
+        );
+        let windows_call = [
+            "if unsafe { MoveFileExW(from.as_ptr(), ",
+            "to.as_ptr(), flags) }",
+        ]
+        .concat();
+        assert_eq!(
+            source.matches(&windows_call).count(),
+            1,
+            "I-12: Windows name moves must reuse WindowsWriteThroughDirectory::move_to_write_through; imitate that method"
         );
     }
 }

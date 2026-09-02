@@ -79,6 +79,25 @@ jobs:
           echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/aarch64-linux-android24-clang" >> "$GITHUB_ENV"
       - run: cargo check --locked --target aarch64-linux-android
 
+  macos-compile:
+    name: macOS compile
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: swatinem/rust-cache@v2
+      - run: cargo check --locked
+
+  ios-compile:
+    name: iOS arm64 compile
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: swatinem/rust-cache@v2
+      - run: rustup target add aarch64-apple-ios --toolchain 1.96.0
+      - run: cargo check --locked --target aarch64-apple-ios
+
   api-semver:
     name: Public API and semver
     runs-on: ubuntu-22.04
@@ -116,7 +135,13 @@ jobs:
 
   receipt:
     name: Immutable certification receipt
-    needs: [linux-complete, windows-complete, android-compile, api-semver]
+    needs:
+      - linux-complete
+      - windows-complete
+      - android-compile
+      - macos-compile
+      - ios-compile
+      - api-semver
     runs-on: ubuntu-22.04
     permissions:
       contents: write

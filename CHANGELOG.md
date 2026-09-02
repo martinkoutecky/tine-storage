@@ -5,6 +5,22 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.12.1] - 2026-09-02
+
+### Fixed
+
+- Package-store recovery now classifies a package as torn only when a required
+  regular file is missing, preserving complete packages that contain unrelated
+  extra entries. Crash-cut tests now pin the authoritative publish and reclaim
+  boundaries.
+- The package-store second-writer test is now named for the sequential refusal
+  it actually proves; the attempted two-process harness was not deterministic
+  enough to become certification evidence.
+- Linux and Windows directory moves now reuse their certified no-replace and
+  write-through name-operation bodies, with source guards against duplication.
+- Certification now compiles both the macOS and iOS Apple publication arms in
+  addition to the existing Linux, Windows, and Android gates.
+
 ## [0.12.0] - 2026-09-02
 
 ### Added

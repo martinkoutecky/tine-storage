@@ -11,7 +11,7 @@ use crate::filesystem::{
 };
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{self, ErrorKind, Write};
 use std::path::Path;
@@ -208,14 +208,12 @@ fn package_has_required_shape(
     package: &Dir,
     required_files: &[&str],
 ) -> Result<bool, PackageStoreError> {
-    let expected = required_files.iter().copied().collect::<BTreeSet<_>>();
-    let actual = entry_names(package)?;
-    if actual.len() != expected.len() || actual.iter().any(|name| !expected.contains(name.as_str()))
-    {
-        return Ok(false);
-    }
-    for name in actual {
-        let metadata = package.symlink_metadata(&name)?;
+    for name in required_files {
+        let metadata = match package.symlink_metadata(name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
         if require_regular_entry(&metadata.file_type(), &name).is_err() {
             return Ok(false);
         }
@@ -260,9 +258,9 @@ fn recover_locked(root: &Dir, required_files: &[&str]) -> Result<(), PackageStor
 
 /// Reclaim interrupted staging, retired names, and incomplete active packages.
 ///
-/// `required_files` is the complete immutable file set for one package. A
-/// fully shaped package is left for the caller's semantic validation; a torn
-/// shape is non-authoritative crash residue and is removed idempotently.
+/// A package is physically complete when every `required_files` entry exists
+/// as a regular file. Extra entries do not prove a crash-torn publication and
+/// are left for the caller's semantic validation and policy.
 pub fn recover_package_store(
     root: &Path,
     required_files: &[&str],
@@ -280,24 +278,12 @@ fn existing_package_exact(
     let Some(package) = open_existing_dir_nofollow(id_dir, version)? else {
         return Ok(None);
     };
-    let expected = files
-        .iter()
-        .map(|file| (file.name, file.bytes))
-        .collect::<BTreeMap<_, _>>();
-    let actual = entry_names(&package)?;
-    if actual.len() != expected.len()
-        || actual
-            .iter()
-            .any(|name| !expected.contains_key(name.as_str()))
-    {
-        return Ok(Some(false));
-    }
-    for (name, bytes) in expected {
+    for file in files {
         let existing = match read_required_regular(
             &package,
-            name,
-            bytes.len() as u64,
-            Some(bytes.len() as u64),
+            file.name,
+            file.bytes.len() as u64,
+            Some(file.bytes.len() as u64),
         ) {
             Ok(existing) => existing,
             Err(
@@ -305,9 +291,12 @@ fn existing_package_exact(
                 | FilesystemError::StoredFileTooLarge { .. }
                 | FilesystemError::UnsafeEntry(_),
             ) => return Ok(Some(false)),
+            Err(FilesystemError::Io(error)) if error.kind() == ErrorKind::NotFound => {
+                return Ok(Some(false))
+            }
             Err(error) => return Err(error.into()),
         };
-        if existing != bytes {
+        if existing != file.bytes {
             return Ok(Some(false));
         }
     }
@@ -417,11 +406,7 @@ where
         .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "package id is not installed"))?;
     let package = open_existing_dir_nofollow(&id_dir, version)?
         .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "package version is not installed"))?;
-    if !package_has_required_shape(&package, required_files)? {
-        return Err(PackageStoreError::UnsafeName(
-            "installed package has an incomplete file shape".into(),
-        ));
-    }
+    debug_assert!(package_has_required_shape(&package, required_files)?);
     drop(package);
 
     match move_directory_no_replace(&id_dir, version, &root, retired_name) {
@@ -530,20 +515,64 @@ mod tests {
         assert_eq!(std::fs::read(package.join("plugin.wasm")).unwrap(), WASM);
     }
 
+    fn normalized_cfg_predicates_before_package_moves(source: &str) -> Vec<String> {
+        let marker = "pub(crate) fn move_directory_no_replace";
+        let chunks = source.split(marker).collect::<Vec<_>>();
+        assert_eq!(
+            chunks.len() - 1,
+            5,
+            "I-16: staged-directory publication must have exactly four shipped-target arms and one unsupported-target stub; imitate src/filesystem.rs::move_directory_no_replace"
+        );
+        chunks[..chunks.len() - 1]
+            .iter()
+            .map(|chunk| {
+                let start = chunk.rfind("#[cfg(").expect(
+                    "I-16: every move_directory_no_replace definition needs an immediately preceding cfg predicate; imitate src/filesystem.rs",
+                );
+                chunk[start..]
+                    .chars()
+                    .filter(|character| !character.is_whitespace())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn assert_package_directory_move_cfgs(source: &str) {
+        assert_eq!(
+            normalized_cfg_predicates_before_package_moves(source),
+            [
+                "#[cfg(target_os=\"linux\")]",
+                "#[cfg(target_os=\"android\")]",
+                "#[cfg(any(target_os=\"macos\",target_os=\"ios\"))]",
+                "#[cfg(windows)]",
+                "#[cfg(not(any(target_os=\"linux\",target_os=\"macos\",target_os=\"ios\",target_os=\"android\",windows)))]",
+            ],
+            "I-16: package directory publication must name Linux, Android, macOS+iOS, Windows, then only the genuinely unsupported remainder; imitate src/filesystem.rs::move_directory_no_replace"
+        );
+    }
+
     #[test]
     fn package_directory_move_cfg_names_every_shipped_target() {
         assert_eq!(
             PACKAGE_DIRECTORY_MOVE_SUPPORTED_TARGETS,
             ["linux", "macos", "ios", "android", "windows"]
         );
+        assert_package_directory_move_cfgs(include_str!("filesystem.rs"));
+    }
+
+    #[test]
+    fn package_directory_move_cfg_guard_rejects_a_missing_arm() {
         let source = include_str!("filesystem.rs");
-        for target in PACKAGE_DIRECTORY_MOVE_SUPPORTED_TARGETS {
-            assert!(
-                source.contains(&format!("target_os = \"{target}\""))
-                    || *target == "windows" && source.contains("#[cfg(windows)]"),
-                "I-16: staged-directory publication lost the {target} cfg arm"
-            );
-        }
+        let apple = source
+            .find("#[cfg(any(target_os = \"macos\", target_os = \"ios\"))]")
+            .unwrap();
+        let windows = source[apple..].find("#[cfg(windows)]").unwrap() + apple;
+        let scratch = format!("{}{}", &source[..apple], &source[windows..]);
+        let result = std::panic::catch_unwind(|| assert_package_directory_move_cfgs(&scratch));
+        assert!(
+            result.is_err(),
+            "I-16: the cfg guard accepted a scratch source with its Apple arm deleted"
+        );
     }
 
     #[test]
@@ -588,8 +617,8 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_different_publishers_leave_one_complete_winner() {
-        let temp = TestRoot::new("concurrent");
+    fn sequential_second_writer_refuses_without_clobbering_the_complete_winner() {
+        let temp = TestRoot::new("sequential-second-writer");
         let root = Arc::new(temp.path().join("plugins"));
         let barrier = Arc::new(Barrier::new(3));
         let manifests: [&'static [u8]; 2] = [
@@ -673,6 +702,30 @@ mod tests {
     }
 
     #[test]
+    fn recovery_preserves_complete_package_with_extra_regular_file() {
+        let temp = TestRoot::new("recovery-extra");
+        let root = temp.path().join("plugins");
+        publish_package_noclobber(
+            &root,
+            "dev.tine.example",
+            "1.0.0",
+            ".install-dev.tine.example-1.0.0-extra",
+            &files(MANIFEST),
+        )
+        .unwrap();
+        let package = root.join("dev.tine.example/1.0.0");
+        std::fs::write(package.join(".DS_Store"), b"finder metadata").unwrap();
+
+        recover_package_store(&root, REQUIRED).unwrap();
+
+        assert_present_exact(&root, MANIFEST);
+        assert_eq!(
+            std::fs::read(package.join(".DS_Store")).unwrap(),
+            b"finder metadata"
+        );
+    }
+
+    #[test]
     fn every_publish_crash_cut_reopens_to_exact_or_absent() {
         // Store-ready, id-ready, stage-create, two file syncs, stage sync,
         // publish, source-parent sync, destination-parent sync.
@@ -699,8 +752,14 @@ mod tests {
             assert!(result.is_err(), "publish cut {cut} was not reached");
             recover_package_store(&root, REQUIRED).unwrap();
             let package = root.join("dev.tine.example/1.0.0");
-            if package.exists() {
+            if cut >= 6 {
+                assert!(
+                    package.exists(),
+                    "publish cut {cut} occurred after no-replace publication"
+                );
                 assert_present_exact(&root, MANIFEST);
+            } else {
+                assert!(!package.exists(), "publish cut {cut} preceded publication");
             }
             assert_no_transients(&root);
         }
@@ -741,7 +800,12 @@ mod tests {
             assert!(result.is_err(), "retire cut {cut} was not reached");
             recover_package_store(&root, REQUIRED).unwrap();
             let package = root.join("dev.tine.example/1.0.0");
-            if package.exists() {
+            if cut >= 4 {
+                assert!(
+                    !package.exists(),
+                    "retire cut {cut} occurred after retired-entry reclamation"
+                );
+            } else if package.exists() {
                 assert_present_exact(&root, MANIFEST);
             }
             assert_no_transients(&root);

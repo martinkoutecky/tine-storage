@@ -38,16 +38,26 @@ staged-directory protocol for app-private immutable packages:
   macOS, iOS, and Android;
 - Windows requests write-through name operations, while Unix synchronizes both
   changed parent directories after publication or retirement;
-- an existing version is idempotent only when its complete file set and exact
-  bytes match; any other concurrent destination is an immutable collision;
+- an existing version is idempotent when every required file has the expected
+  exact bytes; unrelated extra entries neither invalidate nor get deleted from
+  an otherwise complete package;
 - removal first moves the active package to a caller-supplied `.retired-*`
   root name, then reclaims it; and
-- reopen removes `.install-*`, `.retired-*`, and incomplete active package
-  shapes so every crash cut converges to one exact package or absence.
+- reopen removes `.install-*`, `.retired-*`, and active packages missing a
+  required regular file, so every crash cut converges to one complete package
+  or absence.
 
 Callers define the package identity grammar, transient suffixes, required file
 set, and semantic validation. Transient names are deliberately supplied rather
 than invented here so the application contract can pin and test its grammar.
+
+### Package recovery and refusal scenarios
+
+| Boundary outcome | In-scope scenario | Contract |
+| --- | --- | --- |
+| Recovery reclaims an active package missing a required regular file | A crash or power loss interrupted publication before the complete staged directory became authoritative | Reclaim the torn package idempotently. Extra entries alone are not crash evidence and are preserved. |
+| `PackageStoreError::TransientNameCollision` | An honest concurrent Tine process claimed the caller-supplied `.install-*` or `.retired-*` name after recovery | Retry with a fresh transient name; this refusal is retryable and never permits replacement. |
+| `PackageStoreError::ImmutableVersionCollision` | Honest concurrent publishers supplied different bytes for one immutable package identity | Refuse the second publication and preserve the first complete winner. |
 
 ## Persistent-format identity
 
