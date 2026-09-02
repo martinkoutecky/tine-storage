@@ -5,6 +5,14 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.12.2] - 2026-09-02
+
+### Fixed
+
+- Immutable certification receipts now name the required macOS and iOS compile
+  jobs alongside Linux, Windows, Android, and API/semver certification. The
+  v0.12.1 code passed those jobs, but its published receipt omitted their names.
+
 ## [0.12.1] - 2026-09-02
 
 ### Fixed
