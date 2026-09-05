@@ -5,6 +5,60 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.14.0] - 2026-09-05
+
+### Added
+
+- `block_planning`, holding each block's `[#A]` / `SCHEDULED:` / `DEADLINE:`
+  facets INDEPENDENTLY of its task marker, with the five lookup indexes
+  `(priority, page_id, block_id)`, `(scheduled_day, ...)`, `(deadline_day,
+  ...)`, `(scheduled, ...)` and `(deadline, ...)`. `tasks` cannot answer these
+  questions: a row is written there only under a marker, so a markerless
+  `SCHEDULED:` block is absent from it entirely. The `*_day` columns hold the
+  `yyyymmdd` ordinal and are NULL when the timestamp text is not a calendar
+  day, so presence survives a malformed date -- which is why the two presence
+  indexes exist beside the two day indexes rather than being folded into them.
+  `PhysicalBlock` carries `planning: Option<PhysicalPlanning>`.
+- `blocks.query_visible` and `blocks.query_visible_folded`: the block's exact
+  visible text and that text canonically folded. `searchable_text` cannot serve
+  the query engine because both producers collapse whitespace in it for the
+  existing search consumers, and a content predicate has to be able to tell
+  `a  b` from `a b`. Those columns and their FTS are unchanged.
+- `tags.tag_key`, the page-name key `tag('x')` compares on, supplied by the
+  caller because this crate does not know Tine's page-identity normalization.
+  `PhysicalPage`/`PhysicalBlock` now carry `Vec<PhysicalTag>` rather than
+  `Vec<String>`.
+- `pages.journal_day` plus `pages_journal_day_idx`: the `yyyymmdd` ordinal of a
+  journal page, NULL for every other page.
+- `PhysicalProjectionQueryReader`, a read-only statement seam over the graph
+  projection: `run_projection_query(sql, &[PhysicalQueryValue])` and
+  `explain_query_plan(sql, &[PhysicalQueryValue])`. Raw SQL crosses this
+  boundary; authority does not. The projection is a disposable cache derived
+  from the oplog, so a malformed statement fails a read and can never corrupt
+  truth -- which is precisely why the projection may have a statement seam
+  while the oplog, the frontier and the Markdown/Org tree keep their curated
+  typed boundaries and must never gain one.
+  The restriction is the ENGINE's: the type owns a connection opened
+  `SQLITE_OPEN_READ_ONLY` and no constructor accepts an existing writable
+  handle, so it cannot be reached from one. There is deliberately no SQL-text
+  parser or "single SELECT only" check -- SQLite already refuses every write
+  through a read-only connection, and a redundant text check would be a runtime
+  refusal with no in-scope failure to name that could also reject a legitimate
+  statement. Values travel as bound parameters in the signature, so an
+  interpolated statement is not expressible. `explain_query_plan` binds the same
+  parameters as the query it explains, because with `sqlite_stat4` present an
+  unbound explain can report a plan for a statement the caller never runs.
+
+### Changed
+
+- `tags_lookup_idx` moves from `(tag, ...)` to `(tag_key, page_id, owner_type,
+  owner_id)`. A case-insensitive tag probe cannot search an index led by the
+  original spelling.
+- SQLite projection schema 23 -> 24, and `PhysicalBlock`/`PhysicalPage` change
+  shape. As with every prior schema change there is no older-schema reader and
+  no migration: an unrecognized store is preserved as a backup and rebuilt from
+  the untouched Markdown/Org tree.
+
 ## [0.13.0] - 2026-09-05
 
 ### Added

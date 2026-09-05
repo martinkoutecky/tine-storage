@@ -85,12 +85,38 @@ pub struct PhysicalPropertyAtom {
     pub atom_day: Option<i64>,
 }
 
+/// One inline tag of one owner, carrying both the spelling the source used and
+/// the page-name key `tag('x')` compares on (SPEC §3.2 K18). The key is the
+/// caller's -- this crate does not know Tine's page-identity normalization.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalTag {
+    pub tag: String,
+    pub tag_key: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalTask {
     pub marker: String,
     pub priority: Option<String>,
     pub scheduled: Option<String>,
     pub deadline: Option<String>,
+}
+
+/// One block's `[#A]` / `SCHEDULED:` / `DEADLINE:` planning facets, held
+/// INDEPENDENTLY of the task marker (SPEC §3.2 M2).
+///
+/// `tasks` carries a row only when a marker exists, so a markerless
+/// `SCHEDULED:` block is invisible there while the tree walk evaluates it. The
+/// day columns are `None` when the timestamp text does not parse to a calendar
+/// day: a malformed date has presence and no day, and presence has to be
+/// physically representable (E1).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalPlanning {
+    pub priority: Option<String>,
+    pub scheduled: Option<String>,
+    pub scheduled_day: Option<i64>,
+    pub deadline: Option<String>,
+    pub deadline_day: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -102,14 +128,24 @@ pub struct PhysicalBlock {
     pub content: String,
     pub searchable_text: String,
     pub normalized_searchable_text: String,
+    /// The block's exact visible text -- `BlockProjection.visible` -- and that
+    /// text canonically folded, the two columns every content predicate reads
+    /// (SPEC §5.8, §5.10).
+    ///
+    /// Deliberately NOT `searchable_text`, which both producers collapse
+    /// whitespace in for the existing search consumers: a query for a phrase
+    /// with two spaces has to be able to tell those apart.
+    pub query_visible: String,
+    pub query_visible_folded: String,
     pub heading_level: Option<u8>,
     pub collapsed: bool,
     pub logseq_uuid: Option<[u8; 16]>,
     pub logseq_identity_origin: Option<i64>,
     pub references: Vec<PhysicalReference>,
     pub properties: Vec<PhysicalProperty>,
-    pub tags: Vec<String>,
+    pub tags: Vec<PhysicalTag>,
     pub task: Option<PhysicalTask>,
+    pub planning: Option<PhysicalPlanning>,
     /// This block's `:block/path-refs` closure -- its own normalized refs, every
     /// ancestor's, and its page's -- as the ONE tine-core closure function
     /// emitted it (SPEC §5.8 K22). Sorted and de-duplicated by that producer.
@@ -125,12 +161,15 @@ pub struct PhysicalPage {
     pub name_key: String,
     pub path: String,
     pub text_kind: i64,
+    /// `yyyymmdd` when this page is a journal whose name parses under the
+    /// graph's journal formats, else `None` (SPEC §3.2, §5.8).
+    pub journal_day: Option<i64>,
     pub preamble: Option<String>,
     pub searchable_text: String,
     pub normalized_searchable_text: String,
     pub references: Vec<PhysicalReference>,
     pub properties: Vec<PhysicalProperty>,
-    pub tags: Vec<String>,
+    pub tags: Vec<PhysicalTag>,
     pub property_atoms: Vec<PhysicalPropertyAtom>,
     pub blocks: Vec<PhysicalBlock>,
 }
@@ -444,6 +483,7 @@ pub const PAGES_DDL: &str = "CREATE TABLE pages (
     name_key TEXT NOT NULL CHECK (length(CAST(name_key AS BLOB)) BETWEEN 1 AND 4194304),
     path TEXT NOT NULL CHECK (length(CAST(path AS BLOB)) BETWEEN 1 AND 4194304),
     text_kind INTEGER NOT NULL CHECK (text_kind IN (0, 1)),
+    journal_day INTEGER,
     preamble TEXT CHECK (preamble IS NULL OR length(CAST(preamble AS BLOB)) <= 16777216),
     searchable_text TEXT NOT NULL CHECK (length(CAST(searchable_text AS BLOB)) <= 4194304),
     normalized_searchable_text TEXT NOT NULL CHECK (
@@ -468,6 +508,10 @@ pub const BLOCKS_DDL: &str = "CREATE TABLE blocks (
     searchable_text TEXT NOT NULL CHECK (length(CAST(searchable_text AS BLOB)) <= 4194304),
     normalized_searchable_text TEXT NOT NULL CHECK (
         length(CAST(normalized_searchable_text AS BLOB)) <= 4194304
+    ),
+    query_visible TEXT NOT NULL CHECK (length(CAST(query_visible AS BLOB)) <= 4194304),
+    query_visible_folded TEXT NOT NULL CHECK (
+        length(CAST(query_visible_folded AS BLOB)) <= 4194304
     ),
     heading_level INTEGER CHECK (
         heading_level IS NULL OR heading_level BETWEEN 1 AND 6
@@ -564,6 +608,7 @@ pub const TAGS_DDL: &str = "CREATE TABLE tags (
     owner_id BLOB NOT NULL CHECK (length(owner_id) = 16),
     page_id BLOB NOT NULL CHECK (length(page_id) = 16),
     tag TEXT NOT NULL CHECK (length(CAST(tag AS BLOB)) BETWEEN 1 AND 4194304),
+    tag_key TEXT NOT NULL CHECK (length(CAST(tag_key AS BLOB)) BETWEEN 1 AND 4194304),
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
     PRIMARY KEY (owner_type, owner_id, ordinal)
 ) WITHOUT ROWID, STRICT";
@@ -574,6 +619,28 @@ pub const TASKS_DDL: &str = "CREATE TABLE tasks (
     priority TEXT CHECK (priority IS NULL OR length(CAST(priority AS BLOB)) <= 4194304),
     scheduled TEXT CHECK (scheduled IS NULL OR length(CAST(scheduled AS BLOB)) <= 4194304),
     deadline TEXT CHECK (deadline IS NULL OR length(CAST(deadline AS BLOB)) <= 4194304)
+) STRICT";
+/// The `[#A]` / `SCHEDULED:` / `DEADLINE:` facets of every block that has any
+/// of them, written independently of the task marker (SPEC §3.2 M2).
+///
+/// `tasks` cannot answer these: both producers write a `tasks` row only under a
+/// marker, so a markerless `SCHEDULED:` block is absent from it while the tree
+/// walk still evaluates the date. The text columns carry the projected
+/// bracketless timestamp exactly as the projection stores it and the `*_day`
+/// columns carry its `yyyymmdd` ordinal, NULL when the text is not a calendar
+/// day -- so presence (`scheduled IS NOT NULL`) survives a malformed date that
+/// has no day at all (E1).
+pub const BLOCK_PLANNING_DDL: &str = "CREATE TABLE block_planning (
+    block_id BLOB PRIMARY KEY CHECK (length(block_id) = 16),
+    page_id BLOB NOT NULL CHECK (length(page_id) = 16),
+    priority TEXT CHECK (priority IS NULL OR length(CAST(priority AS BLOB)) <= 4194304),
+    scheduled TEXT CHECK (scheduled IS NULL OR length(CAST(scheduled AS BLOB)) <= 4194304),
+    scheduled_day INTEGER,
+    deadline TEXT CHECK (deadline IS NULL OR length(CAST(deadline AS BLOB)) <= 4194304),
+    deadline_day INTEGER,
+    CHECK (priority IS NOT NULL OR scheduled IS NOT NULL OR deadline IS NOT NULL),
+    CHECK (scheduled IS NOT NULL OR scheduled_day IS NULL),
+    CHECK (deadline IS NOT NULL OR deadline_day IS NULL)
 ) STRICT";
 /// OG's materialized `:block/path-refs`: one row per (block, normalized name)
 /// in the block's ancestor closure. The rows come from the ONE tine-core
@@ -627,6 +694,8 @@ pub const SEARCH_FTS_OWNERS_DDL: &str = "CREATE TABLE search_fts_owners (
 pub const PAGES_NAME_INDEX_DDL: &str = "CREATE INDEX pages_name_idx ON pages(name, page_id)";
 pub const PAGES_NAME_KEY_INDEX_DDL: &str =
     "CREATE INDEX pages_name_key_idx ON pages(name_key, page_id)";
+pub const PAGES_JOURNAL_DAY_INDEX_DDL: &str =
+    "CREATE INDEX pages_journal_day_idx ON pages(journal_day, page_id)";
 pub const PAGES_PATH_INDEX_DDL: &str = "CREATE INDEX pages_path_idx ON pages(path, page_id)";
 pub const PAGES_HOME_DOCUMENT_ID_INDEX_DDL: &str =
     "CREATE INDEX pages_home_document_id_idx ON pages(home_document_id, page_id)";
@@ -663,7 +732,7 @@ pub const PROPERTIES_LOOKUP_INDEX_DDL: &str = "CREATE INDEX properties_lookup_id
 pub const PROPERTIES_PAGE_INDEX_DDL: &str = "CREATE INDEX properties_page_idx
     ON properties(page_id, owner_type, owner_id, name, ordinal)";
 pub const TAGS_LOOKUP_INDEX_DDL: &str =
-    "CREATE INDEX tags_lookup_idx ON tags(tag, page_id, owner_type, owner_id)";
+    "CREATE INDEX tags_lookup_idx ON tags(tag_key, page_id, owner_type, owner_id)";
 pub const TAGS_PAGE_INDEX_DDL: &str =
     "CREATE INDEX tags_page_idx ON tags(page_id, owner_type, owner_id, ordinal)";
 pub const TASKS_MARKER_INDEX_DDL: &str =
@@ -671,6 +740,21 @@ pub const TASKS_MARKER_INDEX_DDL: &str =
 pub const TASKS_DEADLINE_INDEX_DDL: &str =
     "CREATE INDEX tasks_deadline_idx ON tasks(deadline, scheduled, page_id, block_id)";
 pub const TASKS_PAGE_INDEX_DDL: &str = "CREATE INDEX tasks_page_idx ON tasks(page_id, block_id)";
+pub const BLOCK_PLANNING_PRIORITY_INDEX_DDL: &str =
+    "CREATE INDEX block_planning_priority_idx ON block_planning(priority, page_id, block_id)";
+pub const BLOCK_PLANNING_SCHEDULED_DAY_INDEX_DDL: &str =
+    "CREATE INDEX block_planning_scheduled_day_idx
+     ON block_planning(scheduled_day, page_id, block_id)";
+pub const BLOCK_PLANNING_DEADLINE_DAY_INDEX_DDL: &str =
+    "CREATE INDEX block_planning_deadline_day_idx
+     ON block_planning(deadline_day, page_id, block_id)";
+// Presence, not day: `scheduled IS NOT NULL` cannot search a `*_day` index --
+// the malformed-date rows have a NULL day and are exactly the rows presence
+// must still find (SPEC §5.7 C2).
+pub const BLOCK_PLANNING_SCHEDULED_INDEX_DDL: &str =
+    "CREATE INDEX block_planning_scheduled_idx ON block_planning(scheduled, page_id, block_id)";
+pub const BLOCK_PLANNING_DEADLINE_INDEX_DDL: &str =
+    "CREATE INDEX block_planning_deadline_idx ON block_planning(deadline, page_id, block_id)";
 pub const BLOCK_PATH_REFS_LOOKUP_INDEX_DDL: &str = "CREATE INDEX block_path_refs_lookup_idx
     ON block_path_refs(normalized_name, page_id, block_id)";
 pub const BLOCK_PATH_REFS_PAGE_INDEX_DDL: &str = "CREATE INDEX block_path_refs_page_idx
@@ -690,9 +774,10 @@ pub const PROPERTY_ATOMS_PAGE_INDEX_DDL: &str = "CREATE INDEX property_atoms_pag
 // indexes and both FTS virtual tables remain live throughout construction.
 // This list must reproduce the exact normal schema before the terminal stamp
 // can advance.
-const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 28] = [
+const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 34] = [
     ("pages_name_idx", PAGES_NAME_INDEX_DDL),
     ("pages_name_key_idx", PAGES_NAME_KEY_INDEX_DDL),
+    ("pages_journal_day_idx", PAGES_JOURNAL_DAY_INDEX_DDL),
     ("pages_path_idx", PAGES_PATH_INDEX_DDL),
     (
         "pages_home_document_id_idx",
@@ -738,6 +823,26 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 28] = [
     ("tasks_deadline_idx", TASKS_DEADLINE_INDEX_DDL),
     ("tasks_page_idx", TASKS_PAGE_INDEX_DDL),
     (
+        "block_planning_priority_idx",
+        BLOCK_PLANNING_PRIORITY_INDEX_DDL,
+    ),
+    (
+        "block_planning_scheduled_day_idx",
+        BLOCK_PLANNING_SCHEDULED_DAY_INDEX_DDL,
+    ),
+    (
+        "block_planning_deadline_day_idx",
+        BLOCK_PLANNING_DEADLINE_DAY_INDEX_DDL,
+    ),
+    (
+        "block_planning_scheduled_idx",
+        BLOCK_PLANNING_SCHEDULED_INDEX_DDL,
+    ),
+    (
+        "block_planning_deadline_idx",
+        BLOCK_PLANNING_DEADLINE_INDEX_DDL,
+    ),
+    (
         "block_path_refs_lookup_idx",
         BLOCK_PATH_REFS_LOOKUP_INDEX_DDL,
     ),
@@ -748,7 +853,7 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 28] = [
     ("property_atoms_page_idx", PROPERTY_ATOMS_PAGE_INDEX_DDL),
 ];
 
-const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 21] = [
+const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 22] = [
     (
         "materialization_stamp",
         &[
@@ -804,6 +909,7 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 21] = [
             "name_key",
             "path",
             "text_kind",
+            "journal_day",
             "preamble",
             "searchable_text",
             "normalized_searchable_text",
@@ -824,6 +930,8 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 21] = [
             "content",
             "searchable_text",
             "normalized_searchable_text",
+            "query_visible",
+            "query_visible_folded",
             "heading_level",
             "collapsed",
             "logseq_uuid",
@@ -883,7 +991,14 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 21] = [
     ),
     (
         "tags",
-        &["owner_type", "owner_id", "page_id", "tag", "ordinal"],
+        &[
+            "owner_type",
+            "owner_id",
+            "page_id",
+            "tag",
+            "tag_key",
+            "ordinal",
+        ],
     ),
     (
         "tasks",
@@ -894,6 +1009,18 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 21] = [
             "priority",
             "scheduled",
             "deadline",
+        ],
+    ),
+    (
+        "block_planning",
+        &[
+            "block_id",
+            "page_id",
+            "priority",
+            "scheduled",
+            "scheduled_day",
+            "deadline",
+            "deadline_day",
         ],
     ),
     (
@@ -943,7 +1070,7 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 21] = [
     ),
 ];
 
-const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 50] = [
+const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 57] = [
     ("table", "materialization_stamp", MATERIALIZATION_STAMP_DDL),
     (
         "table",
@@ -988,6 +1115,7 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 50] = [
     ("table", "properties", PROPERTIES_DDL),
     ("table", "tags", TAGS_DDL),
     ("table", "tasks", TASKS_DDL),
+    ("table", "block_planning", BLOCK_PLANNING_DDL),
     ("table", "block_path_refs", BLOCK_PATH_REFS_DDL),
     ("table", "property_atoms", PROPERTY_ATOMS_DDL),
     ("table", "search_fts_owners", SEARCH_FTS_OWNERS_DDL),
@@ -997,6 +1125,11 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 50] = [
     ("table", "search_fts_outbox", SEARCH_FTS_OUTBOX_DDL),
     ("index", "pages_name_idx", PAGES_NAME_INDEX_DDL),
     ("index", "pages_name_key_idx", PAGES_NAME_KEY_INDEX_DDL),
+    (
+        "index",
+        "pages_journal_day_idx",
+        PAGES_JOURNAL_DAY_INDEX_DDL,
+    ),
     ("index", "pages_path_idx", PAGES_PATH_INDEX_DDL),
     (
         "index",
@@ -1068,6 +1201,31 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 50] = [
     ("index", "tags_page_idx", TAGS_PAGE_INDEX_DDL),
     ("index", "tasks_marker_idx", TASKS_MARKER_INDEX_DDL),
     ("index", "tasks_page_idx", TASKS_PAGE_INDEX_DDL),
+    (
+        "index",
+        "block_planning_priority_idx",
+        BLOCK_PLANNING_PRIORITY_INDEX_DDL,
+    ),
+    (
+        "index",
+        "block_planning_scheduled_day_idx",
+        BLOCK_PLANNING_SCHEDULED_DAY_INDEX_DDL,
+    ),
+    (
+        "index",
+        "block_planning_deadline_day_idx",
+        BLOCK_PLANNING_DEADLINE_DAY_INDEX_DDL,
+    ),
+    (
+        "index",
+        "block_planning_scheduled_idx",
+        BLOCK_PLANNING_SCHEDULED_INDEX_DDL,
+    ),
+    (
+        "index",
+        "block_planning_deadline_idx",
+        BLOCK_PLANNING_DEADLINE_INDEX_DDL,
+    ),
     (
         "index",
         "block_path_refs_lookup_idx",
@@ -1163,6 +1321,7 @@ pub(crate) fn initialize_graph_projection_schema(
          {PROPERTIES_DDL};
          {TAGS_DDL};
          {TASKS_DDL};
+         {BLOCK_PLANNING_DDL};
          {BLOCK_PATH_REFS_DDL};
          {PROPERTY_ATOMS_DDL};
          {SEARCH_FTS_OWNERS_DDL};
@@ -1172,6 +1331,7 @@ pub(crate) fn initialize_graph_projection_schema(
          {SEARCH_FTS_OUTBOX_DDL};
          {PAGES_NAME_INDEX_DDL};
          {PAGES_NAME_KEY_INDEX_DDL};
+         {PAGES_JOURNAL_DAY_INDEX_DDL};
          {PAGES_PATH_INDEX_DDL};
          {PAGES_HOME_DOCUMENT_ID_INDEX_DDL};
          {PAGE_PORTABLE_PATH_CLAIMS_KEY_INDEX_DDL};
@@ -1192,6 +1352,11 @@ pub(crate) fn initialize_graph_projection_schema(
          {TASKS_MARKER_INDEX_DDL};
          {TASKS_DEADLINE_INDEX_DDL};
          {TASKS_PAGE_INDEX_DDL};
+         {BLOCK_PLANNING_PRIORITY_INDEX_DDL};
+         {BLOCK_PLANNING_SCHEDULED_DAY_INDEX_DDL};
+         {BLOCK_PLANNING_DEADLINE_DAY_INDEX_DDL};
+         {BLOCK_PLANNING_SCHEDULED_INDEX_DDL};
+         {BLOCK_PLANNING_DEADLINE_INDEX_DDL};
          {BLOCK_PATH_REFS_LOOKUP_INDEX_DDL};
          {BLOCK_PATH_REFS_PAGE_INDEX_DDL};
          {PROPERTY_ATOMS_KEY_INDEX_DDL};
@@ -2708,6 +2873,7 @@ pub(crate) fn reset_graph_projection_rows(
          DELETE FROM search_fts_owners;
          DELETE FROM property_atoms;
          DELETE FROM block_path_refs;
+         DELETE FROM block_planning;
          DELETE FROM tasks;
          DELETE FROM tags;
          DELETE FROM properties;
@@ -2804,6 +2970,12 @@ fn delete_page(
     instrumentation.owned_rows = instrumentation
         .owned_rows
         .saturating_add(transaction.execute(
+            "DELETE FROM block_planning WHERE page_id = ?1",
+            params![page.as_slice()],
+        )?);
+    instrumentation.owned_rows = instrumentation
+        .owned_rows
+        .saturating_add(transaction.execute(
             "DELETE FROM tags WHERE page_id = ?1",
             params![page.as_slice()],
         )?);
@@ -2848,8 +3020,8 @@ fn insert_page(transaction: &Connection, page: &PhysicalPage) -> Result<(), Mate
         transaction,
         "INSERT INTO pages (
              page_id, home_document_id, name, name_key, path, text_kind,
-             preamble, searchable_text, normalized_searchable_text
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             journal_day, preamble, searchable_text, normalized_searchable_text
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             page_id.as_slice(),
             page.home_document_id.as_slice(),
@@ -2857,6 +3029,7 @@ fn insert_page(transaction: &Connection, page: &PhysicalPage) -> Result<(), Mate
             &page.name_key,
             page.path.as_str(),
             page.text_kind,
+            page.journal_day,
             &page.preamble,
             &page.searchable_text,
             &page.normalized_searchable_text,
@@ -2911,9 +3084,10 @@ fn insert_block(
         transaction,
         "INSERT INTO blocks (
              block_id, page_id, home_document_id, parent_block_id, order_key,
-             content, searchable_text, normalized_searchable_text, heading_level,
+             content, searchable_text, normalized_searchable_text,
+             query_visible, query_visible_folded, heading_level,
              collapsed, logseq_uuid, logseq_identity_origin
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             block.block_id.as_slice(),
             page_id.as_slice(),
@@ -2923,6 +3097,8 @@ fn insert_block(
             &block.content,
             &block.searchable_text,
             &block.normalized_searchable_text,
+            &block.query_visible,
+            &block.query_visible_folded,
             block.heading_level.map(i64::from),
             i64::from(block.collapsed),
             logseq_uuid,
@@ -2948,6 +3124,33 @@ fn insert_block(
                 &task.priority,
                 &task.scheduled,
                 &task.deadline,
+            ],
+        )?;
+    }
+    if let Some(planning) = &block.planning {
+        if planning.priority.is_none()
+            && planning.scheduled.is_none()
+            && planning.deadline.is_none()
+        {
+            return Err(MaterializationError::InvalidInput(format!(
+                "block {} carries an empty planning facet",
+                uuid::Uuid::from_bytes(block.block_id)
+            )));
+        }
+        execute_cached(
+            transaction,
+            "INSERT INTO block_planning (
+                 block_id, page_id, priority, scheduled, scheduled_day,
+                 deadline, deadline_day
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                block.block_id.as_slice(),
+                page_id.as_slice(),
+                &planning.priority,
+                &planning.scheduled,
+                planning.scheduled_day,
+                &planning.deadline,
+                planning.deadline_day,
             ],
         )?;
     }
@@ -3291,19 +3494,20 @@ fn insert_tags(
     transaction: &Connection,
     owner: PhysicalEntityId,
     page_id: [u8; 16],
-    tags: &[String],
+    tags: &[PhysicalTag],
 ) -> Result<(), MaterializationError> {
     let (owner_type, owner_id) = owner.sql_parts();
     for (ordinal, tag) in tags.iter().enumerate() {
         execute_cached(
             transaction,
-            "INSERT INTO tags (owner_type, owner_id, page_id, tag, ordinal)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO tags (owner_type, owner_id, page_id, tag, tag_key, ordinal)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 owner_type,
                 owner_id.as_slice(),
                 page_id.as_slice(),
-                tag,
+                &tag.tag,
+                &tag.tag_key,
                 i64::try_from(ordinal).map_err(|_| {
                     MaterializationError::InvalidInput("tag ordinal overflowed".into())
                 })?,
@@ -5896,6 +6100,16 @@ mod tests {
         ContentDigest::of(label)
     }
 
+    /// A tag whose key is the caller's, as every real producer supplies it.
+    /// Written out rather than defaulted to the spelling so a fixture cannot
+    /// accidentally assert that `tag_key` equals `tag`.
+    fn tag(value: &str) -> PhysicalTag {
+        PhysicalTag {
+            tag: value.into(),
+            tag_key: value.to_lowercase(),
+        }
+    }
+
     fn page(value: u128, text: &str) -> PhysicalPage {
         let page_id = id(value);
         let block_id = id(value + 0x1000);
@@ -5906,6 +6120,7 @@ mod tests {
             name_key: format!("page {value}"),
             path: format!("pages/{value}.md"),
             text_kind: 0,
+            journal_day: None,
             preamble: Some("preamble".into()),
             searchable_text: text.into(),
             normalized_searchable_text: text.to_lowercase(),
@@ -5915,7 +6130,7 @@ mod tests {
                 normalized_name: "category".into(),
                 value: "test".into(),
             }],
-            tags: vec!["storage".into()],
+            tags: vec![tag("storage")],
             property_atoms: vec![PhysicalPropertyAtom {
                 normalized_name: "category".into(),
                 ordinal: 0,
@@ -5933,6 +6148,8 @@ mod tests {
                 content: "block content".into(),
                 searchable_text: format!("{text} block"),
                 normalized_searchable_text: format!("{} block", text.to_lowercase()),
+                query_visible: format!("{text}  block"),
+                query_visible_folded: format!("{}  block", text.to_lowercase()),
                 heading_level: None,
                 collapsed: false,
                 logseq_uuid: None,
@@ -5943,12 +6160,19 @@ mod tests {
                     normalized_name: "block-property".into(),
                     value: "value".into(),
                 }],
-                tags: vec!["block-tag".into()],
+                tags: vec![tag("block-tag")],
                 task: Some(PhysicalTask {
                     marker: "TODO".into(),
                     priority: Some("A".into()),
                     scheduled: None,
                     deadline: None,
+                }),
+                planning: Some(PhysicalPlanning {
+                    priority: Some("A".into()),
+                    scheduled: None,
+                    scheduled_day: None,
+                    deadline: None,
+                    deadline_day: None,
                 }),
                 path_refs: vec![format!("page {value}"), "block-tag".into()],
                 property_atoms: vec![PhysicalPropertyAtom {
@@ -5962,6 +6186,121 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    /// A markerless block's planning facets reach `block_planning` and nothing
+    /// else, and a page replacement takes them with it.
+    ///
+    /// This is the whole reason the table exists (SPEC §3.2 M2): `tasks` is
+    /// written only under a marker, so before `block_planning` a block whose
+    /// only planning evidence was `SCHEDULED:` was physically unrepresentable
+    /// and no SQL answer over it could agree with the tree walk.
+    #[test]
+    fn markerless_planning_reaches_block_planning_and_not_tasks() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
+
+        let mut replaced = page(1, "planning");
+        replaced.blocks[0].task = None;
+        replaced.blocks[0].planning = Some(PhysicalPlanning {
+            priority: Some("A".into()),
+            scheduled: Some("2026-13-45 Xxx".into()),
+            scheduled_day: None,
+            deadline: Some("2026-07-01 Wed".into()),
+            deadline_day: Some(20_260_701),
+        });
+        let block_id = replaced.blocks[0].block_id;
+        apply_and_commit(
+            &mut connection,
+            &change(1, vec![replaced], Vec::new()),
+            1,
+            digest(b"after"),
+        );
+
+        let row: (
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+        ) = connection
+            .query_row(
+                "SELECT priority, scheduled, scheduled_day, deadline, deadline_day
+                     FROM block_planning WHERE block_id = ?1",
+                params![block_id.as_slice()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        // The malformed scheduled text has presence and no day; the well-formed
+        // deadline has both. A day-only table could not hold the first row.
+        assert_eq!(
+            row,
+            (
+                Some("A".to_owned()),
+                Some("2026-13-45 Xxx".to_owned()),
+                None,
+                Some("2026-07-01 Wed".to_owned()),
+                Some(20_260_701),
+            )
+        );
+        let tasks: i64 = connection
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(tasks, 0, "a markerless block writes no tasks row");
+
+        // Replacing the page carries the row with it rather than orphaning it.
+        let mut replacement = page(1, "planning");
+        replacement.blocks[0].task = None;
+        replacement.blocks[0].planning = None;
+        apply_and_commit(
+            &mut connection,
+            &change(2, vec![replacement], Vec::new()),
+            2,
+            digest(b"after-2"),
+        );
+        let remaining: i64 = connection
+            .query_row("SELECT COUNT(*) FROM block_planning", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0, "the replaced page's planning rows are gone");
+    }
+
+    /// A planning facet with nothing in it is refused rather than written as a
+    /// row that the table's own CHECK would reject anyway -- so the producer
+    /// gets a named error instead of a constraint code.
+    #[test]
+    fn an_empty_planning_facet_is_refused() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
+        let mut empty = page(1, "planning");
+        empty.blocks[0].planning = Some(PhysicalPlanning {
+            priority: None,
+            scheduled: None,
+            scheduled_day: None,
+            deadline: None,
+            deadline_day: None,
+        });
+        let transaction = connection.transaction().unwrap();
+        let error = apply_change(
+            &transaction,
+            &change(1, vec![empty], Vec::new()),
+            1,
+            digest(b"input"),
+            digest(b"after"),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, MaterializationError::InvalidInput(message)
+                if message.contains("empty planning facet")),
+            "{error:?}"
+        );
     }
 
     fn change(
@@ -6448,8 +6787,9 @@ mod tests {
                     "INSERT INTO blocks (
                          block_id, page_id, home_document_id, parent_block_id,
                          order_key, content, searchable_text, normalized_searchable_text,
+                         query_visible, query_visible_folded,
                          heading_level, collapsed, logseq_uuid, logseq_identity_origin
-                     ) VALUES (?1, ?2, ?3, NULL, 'a', '', '', '', NULL, 0, ?4, 0)",
+                     ) VALUES (?1, ?2, ?3, NULL, 'a', '', '', '', '', '', NULL, 0, ?4, 0)",
                     params![
                         id(value).as_slice(),
                         id(10).as_slice(),
@@ -6498,7 +6838,7 @@ mod tests {
             normalized_name: "\u{00fc}nicode".into(),
             value: "\u{0}value\u{1f680}".into(),
         }];
-        first.tags = vec!["\u{00e9}tiquette".into()];
+        first.tags = vec![tag("\u{00e9}tiquette")];
         first.blocks[0].references = vec![PhysicalReference {
             target: PhysicalEntityId::Block(id(0x1202)),
             kind: 2,
@@ -6508,7 +6848,7 @@ mod tests {
             normalized_name: "edge".into(),
             value: "\u{0}\u{1f9ea}".into(),
         }];
-        first.blocks[0].tags = vec!["\u{1f3f7}\u{fe0f}".into()];
+        first.blocks[0].tags = vec![tag("\u{1f3f7}\u{fe0f}")];
         first.blocks[0].task = Some(PhysicalTask {
             marker: "TODO".into(),
             priority: Some("A".into()),
@@ -6571,7 +6911,7 @@ mod tests {
         first.blocks[0].content = "replacement block \u{0}".into();
         first.blocks[0].searchable_text = "replacement block \u{1f680}".into();
         first.properties[0].value = "replaced".into();
-        first.tags = vec!["replaced".into()];
+        first.tags = vec![tag("replaced")];
         apply_and_commit(
             &mut connection,
             &change(0x302, vec![first], vec![second.page_id]),

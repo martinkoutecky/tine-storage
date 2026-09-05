@@ -58,7 +58,7 @@ pub mod sqlite {
     };
     pub use crate::sqlite_graph_projection::{
         PhysicalGraphProjectionDatabase, PhysicalGraphProjectionSourceDelta,
-        PhysicalGraphProjectionSourceRevision,
+        PhysicalGraphProjectionSourceRevision, PhysicalProjectionQueryReader, PhysicalQueryValue,
     };
     pub use crate::sqlite_materialization::{
         ApplyChangeInstrumentation, MaterializationError, PhysicalAliasDeclaration, PhysicalBlock,
@@ -70,11 +70,11 @@ pub mod sqlite {
         PhysicalMaterializationChange, PhysicalNavigationAliasRow, PhysicalNavigationPageRow,
         PhysicalNavigationReferenceNameRow, PhysicalPage, PhysicalPageInventoryRow,
         PhysicalPagePortablePathClaim, PhysicalPageReferrerCandidateRow, PhysicalPageRow,
-        PhysicalPlainTextCandidatePageRow, PhysicalProperty, PhysicalPropertyAtom,
-        PhysicalPropertyFacetRow, PhysicalPropertyRow, PhysicalReference, PhysicalReferencePosting,
-        PhysicalReferenceTarget, PhysicalReferrerRow, PhysicalSearchHit,
-        PhysicalSearchIndexBuildStep, PhysicalSearchIndexStatus, PhysicalTagRow, PhysicalTask,
-        PhysicalTaskCandidateBlockRow, PhysicalTaskCandidateLocatorRow,
+        PhysicalPlainTextCandidatePageRow, PhysicalPlanning, PhysicalProperty,
+        PhysicalPropertyAtom, PhysicalPropertyFacetRow, PhysicalPropertyRow, PhysicalReference,
+        PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalReferrerRow, PhysicalSearchHit,
+        PhysicalSearchIndexBuildStep, PhysicalSearchIndexStatus, PhysicalTag, PhysicalTagRow,
+        PhysicalTask, PhysicalTaskCandidateBlockRow, PhysicalTaskCandidateLocatorRow,
         PhysicalTaskCandidatePageRow, PhysicalTaskRow, PhysicalTerminalConstructionBatch,
         PhysicalTerminalMaterializationChunk, PhysicalTerminalProjectionStamp,
         SqliteGraphProjectionRead, SqliteMaterializedRead, MAX_MATERIALIZATION_QUERY_BYTES,

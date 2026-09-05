@@ -324,6 +324,137 @@ fn validated_source_revisions(
     Ok(validated)
 }
 
+/// One bound parameter, or one returned column.
+///
+/// The seam takes VALUES, never a formatted fragment, so
+/// "parameters are bound, never interpolated" holds by SIGNATURE rather than by
+/// the caller's discipline: there is no way to spell an interpolated statement
+/// through this API.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PhysicalQueryValue {
+    Null,
+    Integer(i64),
+    Real(f64),
+    Text(String),
+    Blob(Vec<u8>),
+}
+
+impl rusqlite::ToSql for PhysicalQueryValue {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        use rusqlite::types::{ToSqlOutput, Value, ValueRef};
+        Ok(match self {
+            PhysicalQueryValue::Null => ToSqlOutput::Borrowed(ValueRef::Null),
+            PhysicalQueryValue::Integer(value) => ToSqlOutput::Owned(Value::Integer(*value)),
+            PhysicalQueryValue::Real(value) => ToSqlOutput::Owned(Value::Real(*value)),
+            PhysicalQueryValue::Text(value) => {
+                ToSqlOutput::Borrowed(ValueRef::Text(value.as_ref()))
+            }
+            PhysicalQueryValue::Blob(value) => ToSqlOutput::Borrowed(ValueRef::Blob(value)),
+        })
+    }
+}
+
+/// The read-only statement seam over the graph projection.
+///
+/// **Raw SQL crosses this boundary; authority does not.** The projection is a
+/// disposable cache derived from the oplog, so a malformed statement fails a
+/// read and can never corrupt truth — which is exactly why the projection may
+/// have a statement seam and the oplog, the frontier and the Markdown/Org tree
+/// may not.
+///
+/// The restriction is the ENGINE's, not a validator's: this type owns a
+/// connection opened `SQLITE_OPEN_READ_ONLY`, and there is no constructor that
+/// takes an existing writable handle, so a caller cannot reach it from one.
+/// Deliberately there is **no** SQL-text parser or "single SELECT only" check:
+/// SQLite already refuses every write through a read-only connection, and a
+/// redundant text check would be a runtime refusal with no in-scope failure to
+/// name — a future availability bug — that could also reject a legitimate
+/// statement.
+pub struct PhysicalProjectionQueryReader {
+    connection: Connection,
+}
+
+impl PhysicalProjectionQueryReader {
+    /// Open the projection read-only. The file must already exist; this seam
+    /// never creates or upgrades one.
+    pub fn open(path: &Path) -> Result<Self, MaterializationError> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_STATEMENTS);
+        connection.execute_batch("PRAGMA trusted_schema = OFF;")?;
+        Ok(Self { connection })
+    }
+
+    /// Run one statement with bound parameters and collect its rows.
+    pub fn run_projection_query(
+        &self,
+        sql: &str,
+        parameters: &[PhysicalQueryValue],
+    ) -> Result<Vec<Vec<PhysicalQueryValue>>, MaterializationError> {
+        let mut statement = self.connection.prepare_cached(sql)?;
+        let columns = statement.column_count();
+        let bound: Vec<&dyn rusqlite::ToSql> = parameters
+            .iter()
+            .map(|value| value as &dyn rusqlite::ToSql)
+            .collect();
+        let rows = statement
+            .query_map(bound.as_slice(), |row| {
+                (0..columns)
+                    .map(|index| {
+                        Ok(match row.get_ref(index)? {
+                            rusqlite::types::ValueRef::Null => PhysicalQueryValue::Null,
+                            rusqlite::types::ValueRef::Integer(value) => {
+                                PhysicalQueryValue::Integer(value)
+                            }
+                            rusqlite::types::ValueRef::Real(value) => {
+                                PhysicalQueryValue::Real(value)
+                            }
+                            rusqlite::types::ValueRef::Text(value) => PhysicalQueryValue::Text(
+                                String::from_utf8_lossy(value).into_owned(),
+                            ),
+                            rusqlite::types::ValueRef::Blob(value) => {
+                                PhysicalQueryValue::Blob(value.to_vec())
+                            }
+                        })
+                    })
+                    .collect::<Result<Vec<_>, rusqlite::Error>>()
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// `EXPLAIN QUERY PLAN` for one statement, one `detail` string per step.
+    ///
+    /// This exists so the campaign's plan gate can be an ordinary repository
+    /// test instead of a scratch harness: a bounded query must show `SEARCH`
+    /// on its anchor table and never `SCAN`.
+    ///
+    /// It takes the same parameters as the query it explains, and binds them,
+    /// because with `ANALYZE`/`sqlite_stat4` present the planner may choose a
+    /// different plan for a bound value than for an unbound one. An explain
+    /// that left them unbound would measure a statement the caller never runs.
+    pub fn explain_query_plan(
+        &self,
+        sql: &str,
+        parameters: &[PhysicalQueryValue],
+    ) -> Result<Vec<String>, MaterializationError> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        let bound: Vec<&dyn rusqlite::ToSql> = parameters
+            .iter()
+            .map(|value| value as &dyn rusqlite::ToSql)
+            .collect();
+        let details = statement
+            .query_map(bound.as_slice(), |row| row.get::<_, String>(3))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(details)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,7 +463,7 @@ mod tests {
     use crate::sqlite_materialization::test_parse_config_hash;
     use crate::sqlite_materialization::{
         PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityId, PhysicalMaterializationChange,
-        PhysicalPage, PhysicalPagePortablePathClaim, PhysicalReferencePosting,
+        PhysicalPage, PhysicalPagePortablePathClaim, PhysicalPlanning, PhysicalReferencePosting,
         PhysicalReferenceTarget, PhysicalTask,
     };
     use crate::ContentDigest;
@@ -345,6 +476,7 @@ mod tests {
             name_key: format!("page {page_id}"),
             path: format!("pages/page-{page_id}.md"),
             text_kind: 0,
+            journal_day: None,
             preamble: None,
             searchable_text: content.into(),
             normalized_searchable_text: content.to_lowercase(),
@@ -360,6 +492,8 @@ mod tests {
                 content: content.into(),
                 searchable_text: content.into(),
                 normalized_searchable_text: content.to_lowercase(),
+                query_visible: content.into(),
+                query_visible_folded: content.to_lowercase(),
                 heading_level: None,
                 collapsed: false,
                 logseq_uuid: None,
@@ -373,9 +507,96 @@ mod tests {
                     scheduled: None,
                     deadline: None,
                 }),
+                planning: Some(PhysicalPlanning {
+                    priority: Some("A".into()),
+                    scheduled: None,
+                    scheduled_day: None,
+                    deadline: None,
+                    deadline_day: None,
+                }),
                 path_refs: Vec::new(),
                 property_atoms: Vec::new(),
             }],
+        }
+    }
+
+    /// The statement seam's restriction is the ENGINE's, not a validator's.
+    /// If this ever passes a write, the read-only open has been lost and the
+    /// whole justification for the seam (raw SQL crosses, authority does not)
+    /// is gone — so the write must be attempted for real, not assumed to fail.
+    #[test]
+    fn the_query_seam_can_read_the_projection_and_cannot_write_it() {
+        let path = std::env::temp_dir().join(format!(
+            "tine-storage-query-seam-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.initialize_schema().unwrap();
+        drop(database);
+
+        let reader = PhysicalProjectionQueryReader::open(&path).unwrap();
+
+        // Reads work, and parameters come back as values.
+        let rows = reader
+            .run_projection_query(
+                "SELECT COUNT(*) FROM pages WHERE name_key = ?1",
+                &[PhysicalQueryValue::Text("absent".into())],
+            )
+            .unwrap();
+        assert_eq!(rows, vec![vec![PhysicalQueryValue::Integer(0)]]);
+
+        // Every write shape is refused by SQLite itself.
+        for write in [
+            "DELETE FROM pages",
+            "INSERT INTO pages (page_id, name, name_key, text_kind)
+             VALUES (zeroblob(16), 'x', 'x', 0)",
+            "UPDATE pages SET name = 'x'",
+            "DROP TABLE pages",
+            "CREATE TABLE smuggled (x INTEGER)",
+        ] {
+            let error = reader.run_projection_query(write, &[]).unwrap_err();
+            assert!(
+                matches!(&error, MaterializationError::Sqlite(message)
+                    if message.contains("readonly") || message.contains("read-only")),
+                "{write} must be refused by the read-only connection, got {error:?}"
+            );
+        }
+
+        // A value that looks like SQL stays a value: it is bound, not spliced.
+        let hostile = "'; DROP TABLE pages; --";
+        let rows = reader
+            .run_projection_query(
+                "SELECT COUNT(*) FROM pages WHERE name_key = ?1",
+                &[PhysicalQueryValue::Text(hostile.into())],
+            )
+            .unwrap();
+        assert_eq!(rows, vec![vec![PhysicalQueryValue::Integer(0)]]);
+        assert_eq!(
+            reader
+                .run_projection_query(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'pages'",
+                    &[]
+                )
+                .unwrap(),
+            vec![vec![PhysicalQueryValue::Integer(1)]],
+            "the bound value must not have been executed as SQL"
+        );
+
+        // The plan accessor answers, which is what lets the campaign's plan
+        // gate live in the repository instead of a scratch harness.
+        let plan = reader
+            .explain_query_plan(
+                "SELECT page_id FROM pages WHERE name_key = ?1",
+                &[PhysicalQueryValue::Text("x".into())],
+            )
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| step.contains("SEARCH")),
+            "a keyed lookup must plan as a SEARCH, got {plan:?}"
+        );
+
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }
     }
 

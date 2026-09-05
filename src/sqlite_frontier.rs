@@ -22,7 +22,7 @@ use crate::sqlite_materialization::{
 use crate::ContentDigest;
 
 pub const SQLITE_APPLICATION_ID: u32 = 0x5449_4e45;
-pub const SQLITE_SCHEMA_VERSION: u32 = 23;
+pub const SQLITE_SCHEMA_VERSION: u32 = 24;
 const MAX_AUTHENTICATED_MAP_DEPTH: usize = 256;
 
 pub const META_DDL: &str = "CREATE TABLE meta (
@@ -159,11 +159,12 @@ pub const BATCH_ID_INDEX_DDL: &str =
 pub const ACCEPTANCE_SEQUENCE_INDEX_DDL: &str = "CREATE UNIQUE INDEX \
     applied_batches_acceptance_sequence_uq ON applied_batches(acceptance_sequence)";
 
-const EXPECTED_TABLES: [&str; 40] = [
+const EXPECTED_TABLES: [&str; 41] = [
     "accepted_batch_nodes",
     "applied_batches",
     "block_home_claims",
     "block_path_refs",
+    "block_planning",
     "blocks",
     "causal_clock_nodes",
     "checkpoint_generation_anchor",
@@ -201,16 +202,22 @@ const EXPECTED_TABLES: [&str; 40] = [
     "tags",
     "tasks",
 ];
-const EXPECTED_INDEXES: [&str; 30] = [
+const EXPECTED_INDEXES: [&str; 36] = [
     "applied_batches_acceptance_sequence_uq",
     "applied_batches_batch_id_uq",
     "block_path_refs_lookup_idx",
     "block_path_refs_page_idx",
+    "block_planning_deadline_day_idx",
+    "block_planning_deadline_idx",
+    "block_planning_priority_idx",
+    "block_planning_scheduled_day_idx",
+    "block_planning_scheduled_idx",
     "blocks_logseq_uuid_idx",
     "blocks_page_order_idx",
     "page_portable_path_claims_key_idx",
     "pages_home_document_id_idx",
     "pages_name_idx",
+    "pages_journal_day_idx",
     "pages_name_key_idx",
     "pages_path_idx",
     "properties_lookup_idx",
@@ -3587,6 +3594,7 @@ mod tests {
                 name_key: format!("page-{}", u128::from_be_bytes(batch_id)),
                 path: format!("pages/{}.md", u128::from_be_bytes(batch_id)),
                 text_kind: 0,
+                journal_day: None,
                 preamble: None,
                 searchable_text: "frontier materialization".into(),
                 normalized_searchable_text: "frontier materialization".into(),
