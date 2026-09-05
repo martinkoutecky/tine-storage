@@ -69,6 +69,22 @@ pub struct PhysicalProperty {
     pub value: String,
 }
 
+/// One atom of one property element (SPEC §3.3), already flattened and
+/// renumbered by the single tine-core producer. The physical layer stores what
+/// it is handed; it never atomizes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhysicalPropertyAtom {
+    pub normalized_name: String,
+    pub ordinal: u32,
+    pub atom: String,
+    pub atom_key: String,
+    /// `0` = the atom came from an explicit page reference in the value,
+    /// `1` = a plain text segment.
+    pub origin: i64,
+    pub atom_num: Option<f64>,
+    pub atom_day: Option<i64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalTask {
     pub marker: String,
@@ -77,7 +93,7 @@ pub struct PhysicalTask {
     pub deadline: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalBlock {
     pub block_id: [u8; 16],
     pub home_document_id: [u8; 16],
@@ -94,9 +110,14 @@ pub struct PhysicalBlock {
     pub properties: Vec<PhysicalProperty>,
     pub tags: Vec<String>,
     pub task: Option<PhysicalTask>,
+    /// This block's `:block/path-refs` closure -- its own normalized refs, every
+    /// ancestor's, and its page's -- as the ONE tine-core closure function
+    /// emitted it (SPEC §5.8 K22). Sorted and de-duplicated by that producer.
+    pub path_refs: Vec<String>,
+    pub property_atoms: Vec<PhysicalPropertyAtom>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalPage {
     pub page_id: [u8; 16],
     pub home_document_id: [u8; 16],
@@ -110,6 +131,7 @@ pub struct PhysicalPage {
     pub references: Vec<PhysicalReference>,
     pub properties: Vec<PhysicalProperty>,
     pub tags: Vec<String>,
+    pub property_atoms: Vec<PhysicalPropertyAtom>,
     pub blocks: Vec<PhysicalBlock>,
 }
 
@@ -205,7 +227,7 @@ pub struct PhysicalLogseqUuidIntroduction {
     pub causal_counter: Option<u64>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalMaterializationChange {
     pub batch_id: [u8; 16],
     pub replacements: Vec<PhysicalPage>,
@@ -242,7 +264,7 @@ pub struct PhysicalMaterializationChange {
 /// from an observed file change; managed storage applies the same rows only
 /// after its own accepted-frontier checks. No oplog sequence, authority stamp,
 /// or sync state crosses this boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalGraphProjectionChange {
     pub replacements: Vec<PhysicalPage>,
     pub deletions: Vec<[u8; 16]>,
@@ -304,7 +326,8 @@ impl FtsEntityRow {
 pub const MATERIALIZATION_STAMP_DDL: &str = "CREATE TABLE materialization_stamp (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     acceptance_sequence INTEGER NOT NULL CHECK (acceptance_sequence >= 0),
-    frontier_root_digest BLOB NOT NULL CHECK (length(frontier_root_digest) = 32)
+    frontier_root_digest BLOB NOT NULL CHECK (length(frontier_root_digest) = 32),
+    parse_config_hash BLOB NOT NULL CHECK (length(parse_config_hash) = 32)
 ) WITHOUT ROWID, STRICT";
 pub const MATERIALIZATION_BATCHES_DDL: &str = "CREATE TABLE materialization_batches (
     acceptance_sequence INTEGER PRIMARY KEY CHECK (acceptance_sequence > 0),
@@ -552,6 +575,35 @@ pub const TASKS_DDL: &str = "CREATE TABLE tasks (
     scheduled TEXT CHECK (scheduled IS NULL OR length(CAST(scheduled AS BLOB)) <= 4194304),
     deadline TEXT CHECK (deadline IS NULL OR length(CAST(deadline AS BLOB)) <= 4194304)
 ) STRICT";
+/// OG's materialized `:block/path-refs`: one row per (block, normalized name)
+/// in the block's ancestor closure. The rows come from the ONE tine-core
+/// closure function; nothing here recomputes them (SPEC §5.8).
+pub const BLOCK_PATH_REFS_DDL: &str = "CREATE TABLE block_path_refs (
+    block_id BLOB NOT NULL CHECK (length(block_id) = 16),
+    page_id BLOB NOT NULL CHECK (length(page_id) = 16),
+    normalized_name TEXT NOT NULL CHECK (
+        length(CAST(normalized_name AS BLOB)) BETWEEN 1 AND 4194304
+    ),
+    PRIMARY KEY (block_id, normalized_name)
+) WITHOUT ROWID, STRICT";
+/// The atoms of every property element (SPEC §3.3, §5.8). `properties` keeps
+/// the unsplit source value for presence, autocomplete and display; this table
+/// carries the flattened, renumbered atom list a value comparison searches.
+pub const PROPERTY_ATOMS_DDL: &str = "CREATE TABLE property_atoms (
+    owner_type INTEGER NOT NULL CHECK (owner_type IN (0, 1)),
+    owner_id BLOB NOT NULL CHECK (length(owner_id) = 16),
+    page_id BLOB NOT NULL CHECK (length(page_id) = 16),
+    normalized_name TEXT NOT NULL CHECK (
+        length(CAST(normalized_name AS BLOB)) BETWEEN 1 AND 4194304
+    ),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    atom TEXT NOT NULL CHECK (length(CAST(atom AS BLOB)) <= 4194304),
+    atom_key TEXT NOT NULL CHECK (length(CAST(atom_key AS BLOB)) <= 4194304),
+    origin INTEGER NOT NULL CHECK (origin IN (0, 1)),
+    atom_num REAL,
+    atom_day INTEGER,
+    PRIMARY KEY (owner_type, owner_id, normalized_name, ordinal)
+) WITHOUT ROWID, STRICT";
 pub const SEARCH_FTS_DDL: &str = "CREATE VIRTUAL TABLE search_fts USING fts5(
     entity_type UNINDEXED,
     entity_id UNINDEXED,
@@ -619,6 +671,18 @@ pub const TASKS_MARKER_INDEX_DDL: &str =
 pub const TASKS_DEADLINE_INDEX_DDL: &str =
     "CREATE INDEX tasks_deadline_idx ON tasks(deadline, scheduled, page_id, block_id)";
 pub const TASKS_PAGE_INDEX_DDL: &str = "CREATE INDEX tasks_page_idx ON tasks(page_id, block_id)";
+pub const BLOCK_PATH_REFS_LOOKUP_INDEX_DDL: &str = "CREATE INDEX block_path_refs_lookup_idx
+    ON block_path_refs(normalized_name, page_id, block_id)";
+pub const BLOCK_PATH_REFS_PAGE_INDEX_DDL: &str = "CREATE INDEX block_path_refs_page_idx
+    ON block_path_refs(page_id, block_id, normalized_name)";
+pub const PROPERTY_ATOMS_KEY_INDEX_DDL: &str = "CREATE INDEX property_atoms_key_idx
+    ON property_atoms(normalized_name, atom_key, page_id, owner_type, owner_id)";
+pub const PROPERTY_ATOMS_NUM_INDEX_DDL: &str = "CREATE INDEX property_atoms_num_idx
+    ON property_atoms(normalized_name, atom_num, page_id, owner_type, owner_id)";
+pub const PROPERTY_ATOMS_DAY_INDEX_DDL: &str = "CREATE INDEX property_atoms_day_idx
+    ON property_atoms(normalized_name, atom_day, page_id, owner_type, owner_id)";
+pub const PROPERTY_ATOMS_PAGE_INDEX_DDL: &str = "CREATE INDEX property_atoms_page_idx
+    ON property_atoms(page_id, owner_type, owner_id, normalized_name, ordinal)";
 
 // A terminal bootstrap candidate is a brand-new, unpublished database. Its
 // ordinary secondary indexes can be built once after the complete row set is
@@ -626,7 +690,7 @@ pub const TASKS_PAGE_INDEX_DDL: &str = "CREATE INDEX tasks_page_idx ON tasks(pag
 // indexes and both FTS virtual tables remain live throughout construction.
 // This list must reproduce the exact normal schema before the terminal stamp
 // can advance.
-const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 22] = [
+const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 28] = [
     ("pages_name_idx", PAGES_NAME_INDEX_DDL),
     ("pages_name_key_idx", PAGES_NAME_KEY_INDEX_DDL),
     ("pages_path_idx", PAGES_PATH_INDEX_DDL),
@@ -673,12 +737,26 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 22] = [
     ("tasks_marker_idx", TASKS_MARKER_INDEX_DDL),
     ("tasks_deadline_idx", TASKS_DEADLINE_INDEX_DDL),
     ("tasks_page_idx", TASKS_PAGE_INDEX_DDL),
+    (
+        "block_path_refs_lookup_idx",
+        BLOCK_PATH_REFS_LOOKUP_INDEX_DDL,
+    ),
+    ("block_path_refs_page_idx", BLOCK_PATH_REFS_PAGE_INDEX_DDL),
+    ("property_atoms_key_idx", PROPERTY_ATOMS_KEY_INDEX_DDL),
+    ("property_atoms_num_idx", PROPERTY_ATOMS_NUM_INDEX_DDL),
+    ("property_atoms_day_idx", PROPERTY_ATOMS_DAY_INDEX_DDL),
+    ("property_atoms_page_idx", PROPERTY_ATOMS_PAGE_INDEX_DDL),
 ];
 
-const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 19] = [
+const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 21] = [
     (
         "materialization_stamp",
-        &["singleton", "acceptance_sequence", "frontier_root_digest"],
+        &[
+            "singleton",
+            "acceptance_sequence",
+            "frontier_root_digest",
+            "parse_config_hash",
+        ],
     ),
     (
         "materialization_batches",
@@ -819,6 +897,25 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 19] = [
         ],
     ),
     (
+        "block_path_refs",
+        &["block_id", "page_id", "normalized_name"],
+    ),
+    (
+        "property_atoms",
+        &[
+            "owner_type",
+            "owner_id",
+            "page_id",
+            "normalized_name",
+            "ordinal",
+            "atom",
+            "atom_key",
+            "origin",
+            "atom_num",
+            "atom_day",
+        ],
+    ),
+    (
         "search_fts_owners",
         &["rowid", "entity_type", "entity_id", "page_id"],
     ),
@@ -846,7 +943,7 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 19] = [
     ),
 ];
 
-const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 42] = [
+const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 50] = [
     ("table", "materialization_stamp", MATERIALIZATION_STAMP_DDL),
     (
         "table",
@@ -891,6 +988,8 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 42] = [
     ("table", "properties", PROPERTIES_DDL),
     ("table", "tags", TAGS_DDL),
     ("table", "tasks", TASKS_DDL),
+    ("table", "block_path_refs", BLOCK_PATH_REFS_DDL),
+    ("table", "property_atoms", PROPERTY_ATOMS_DDL),
     ("table", "search_fts_owners", SEARCH_FTS_OWNERS_DDL),
     ("table", "search_fts", SEARCH_FTS_DDL),
     ("table", "search_substring_fts", SEARCH_SUBSTRING_FTS_DDL),
@@ -969,11 +1068,49 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 42] = [
     ("index", "tags_page_idx", TAGS_PAGE_INDEX_DDL),
     ("index", "tasks_marker_idx", TASKS_MARKER_INDEX_DDL),
     ("index", "tasks_page_idx", TASKS_PAGE_INDEX_DDL),
+    (
+        "index",
+        "block_path_refs_lookup_idx",
+        BLOCK_PATH_REFS_LOOKUP_INDEX_DDL,
+    ),
+    (
+        "index",
+        "block_path_refs_page_idx",
+        BLOCK_PATH_REFS_PAGE_INDEX_DDL,
+    ),
+    (
+        "index",
+        "property_atoms_key_idx",
+        PROPERTY_ATOMS_KEY_INDEX_DDL,
+    ),
+    (
+        "index",
+        "property_atoms_num_idx",
+        PROPERTY_ATOMS_NUM_INDEX_DDL,
+    ),
+    (
+        "index",
+        "property_atoms_day_idx",
+        PROPERTY_ATOMS_DAY_INDEX_DDL,
+    ),
+    (
+        "index",
+        "property_atoms_page_idx",
+        PROPERTY_ATOMS_PAGE_INDEX_DDL,
+    ),
 ];
+
+/// A fixed non-default parse-config digest for tests that only need the stamp
+/// column filled; the config-change routes assert against real digests.
+#[cfg(test)]
+pub(crate) fn test_parse_config_hash() -> ContentDigest {
+    ContentDigest::of(b"tine-storage/test/parse-config")
+}
 
 pub fn initialize_schema(
     connection: &Connection,
     empty_frontier_digest: ContentDigest,
+    parse_config_hash: ContentDigest,
 ) -> Result<(), MaterializationError> {
     connection.execute_batch(&format!(
         "{MATERIALIZATION_STAMP_DDL};
@@ -982,11 +1119,30 @@ pub fn initialize_schema(
     initialize_graph_projection_schema(connection)?;
     connection.execute(
         "INSERT INTO materialization_stamp (
-             singleton, acceptance_sequence, frontier_root_digest
-         ) VALUES (1, 0, ?1)",
-        params![empty_frontier_digest.as_bytes().as_slice()],
+             singleton, acceptance_sequence, frontier_root_digest, parse_config_hash
+         ) VALUES (1, 0, ?1, ?2)",
+        params![
+            empty_frontier_digest.as_bytes().as_slice(),
+            parse_config_hash.as_bytes().as_slice(),
+        ],
     )?;
     Ok(())
+}
+
+/// The parse-config digest this projection's rows were derived under.
+///
+/// The caller compares it with the digest of the config it is about to read
+/// with; a difference means the rows answer a question the current graph config
+/// no longer asks, and the projection is rebuilt (never migrated, D-1).
+pub fn stamped_parse_config_hash(
+    connection: &Connection,
+) -> Result<ContentDigest, MaterializationError> {
+    let bytes: Vec<u8> = connection.query_row(
+        "SELECT parse_config_hash FROM materialization_stamp WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    decode_digest(bytes)
 }
 
 pub(crate) fn initialize_graph_projection_schema(
@@ -1007,6 +1163,8 @@ pub(crate) fn initialize_graph_projection_schema(
          {PROPERTIES_DDL};
          {TAGS_DDL};
          {TASKS_DDL};
+         {BLOCK_PATH_REFS_DDL};
+         {PROPERTY_ATOMS_DDL};
          {SEARCH_FTS_OWNERS_DDL};
          {SEARCH_FTS_DDL};
          {SEARCH_SUBSTRING_FTS_DDL};
@@ -1033,7 +1191,13 @@ pub(crate) fn initialize_graph_projection_schema(
          {TAGS_PAGE_INDEX_DDL};
          {TASKS_MARKER_INDEX_DDL};
          {TASKS_DEADLINE_INDEX_DDL};
-         {TASKS_PAGE_INDEX_DDL};"
+         {TASKS_PAGE_INDEX_DDL};
+         {BLOCK_PATH_REFS_LOOKUP_INDEX_DDL};
+         {BLOCK_PATH_REFS_PAGE_INDEX_DDL};
+         {PROPERTY_ATOMS_KEY_INDEX_DDL};
+         {PROPERTY_ATOMS_NUM_INDEX_DDL};
+         {PROPERTY_ATOMS_DAY_INDEX_DDL};
+         {PROPERTY_ATOMS_PAGE_INDEX_DDL};"
     ))?;
     connection.execute(
         "INSERT INTO search_fts_build (
@@ -1720,7 +1884,7 @@ pub(crate) fn advance_search_index_build(
 /// Terminal construction seeds an unpublished candidate whose materialized
 /// tables are still empty, so a chunk carries only insertions: there is no
 /// prior page row to clean up and no prior coverage row to replace.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PhysicalTerminalMaterializationChunk {
     pub pages: Vec<PhysicalPage>,
     pub postings: Vec<PhysicalReferencePosting>,
@@ -1818,7 +1982,7 @@ pub(crate) fn begin_terminal_construction_in_open_candidate(
 }
 
 /// Seed one bounded chunk of terminal pages and reference rows.
-pub(crate) fn seed_terminal_chunk_in_open_candidate(
+pub fn seed_terminal_chunk_in_open_candidate(
     transaction: &Connection,
     chunk: &PhysicalTerminalMaterializationChunk,
 ) -> Result<(), MaterializationError> {
@@ -2542,6 +2706,8 @@ pub(crate) fn reset_graph_projection_rows(
          DELETE FROM search_substring_fts;
          DELETE FROM search_fts;
          DELETE FROM search_fts_owners;
+         DELETE FROM property_atoms;
+         DELETE FROM block_path_refs;
          DELETE FROM tasks;
          DELETE FROM tags;
          DELETE FROM properties;
@@ -2626,6 +2792,18 @@ fn delete_page(
     instrumentation.owned_rows = instrumentation
         .owned_rows
         .saturating_add(transaction.execute(
+            "DELETE FROM property_atoms WHERE page_id = ?1",
+            params![page.as_slice()],
+        )?);
+    instrumentation.owned_rows = instrumentation
+        .owned_rows
+        .saturating_add(transaction.execute(
+            "DELETE FROM block_path_refs WHERE page_id = ?1",
+            params![page.as_slice()],
+        )?);
+    instrumentation.owned_rows = instrumentation
+        .owned_rows
+        .saturating_add(transaction.execute(
             "DELETE FROM tags WHERE page_id = ?1",
             params![page.as_slice()],
         )?);
@@ -2702,6 +2880,12 @@ fn insert_page(transaction: &Connection, page: &PhysicalPage) -> Result<(), Mate
         page.page_id,
         &page.tags,
     )?;
+    insert_property_atoms(
+        transaction,
+        PhysicalEntityId::Page(page.page_id),
+        page.page_id,
+        &page.property_atoms,
+    )?;
     for block in &page.blocks {
         insert_block(transaction, page.page_id, block)?;
     }
@@ -2749,6 +2933,8 @@ fn insert_block(
     insert_references(transaction, owner, page_id, &block.references)?;
     insert_properties(transaction, owner, page_id, &block.properties)?;
     insert_tags(transaction, owner, page_id, &block.tags)?;
+    insert_property_atoms(transaction, owner, page_id, &block.property_atoms)?;
+    insert_path_refs(transaction, block.block_id, page_id, &block.path_refs)?;
     if let Some(task) = &block.task {
         execute_cached(
             transaction,
@@ -3122,6 +3308,54 @@ fn insert_tags(
                     MaterializationError::InvalidInput("tag ordinal overflowed".into())
                 })?,
             ],
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_property_atoms(
+    transaction: &Connection,
+    owner: PhysicalEntityId,
+    page_id: [u8; 16],
+    atoms: &[PhysicalPropertyAtom],
+) -> Result<(), MaterializationError> {
+    let (owner_type, owner_id) = owner.sql_parts();
+    for atom in atoms {
+        execute_cached(
+            transaction,
+            "INSERT INTO property_atoms (
+                 owner_type, owner_id, page_id, normalized_name, ordinal,
+                 atom, atom_key, origin, atom_num, atom_day
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                owner_type,
+                owner_id.as_slice(),
+                page_id.as_slice(),
+                &atom.normalized_name,
+                i64::from(atom.ordinal),
+                &atom.atom,
+                &atom.atom_key,
+                atom.origin,
+                atom.atom_num,
+                atom.atom_day,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_path_refs(
+    transaction: &Connection,
+    block_id: [u8; 16],
+    page_id: [u8; 16],
+    names: &[String],
+) -> Result<(), MaterializationError> {
+    for name in names {
+        execute_cached(
+            transaction,
+            "INSERT INTO block_path_refs (block_id, page_id, normalized_name)
+             VALUES (?1, ?2, ?3)",
+            params![block_id.as_slice(), page_id.as_slice(), name],
         )?;
     }
     Ok(())
@@ -5682,6 +5916,15 @@ mod tests {
                 value: "test".into(),
             }],
             tags: vec!["storage".into()],
+            property_atoms: vec![PhysicalPropertyAtom {
+                normalized_name: "category".into(),
+                ordinal: 0,
+                atom: "test".into(),
+                atom_key: "test".into(),
+                origin: 1,
+                atom_num: None,
+                atom_day: None,
+            }],
             blocks: vec![PhysicalBlock {
                 block_id,
                 home_document_id: id(value + 0x2000),
@@ -5707,6 +5950,16 @@ mod tests {
                     scheduled: None,
                     deadline: None,
                 }),
+                path_refs: vec![format!("page {value}"), "block-tag".into()],
+                property_atoms: vec![PhysicalPropertyAtom {
+                    normalized_name: "block-property".into(),
+                    ordinal: 0,
+                    atom: "value".into(),
+                    atom_key: "value".into(),
+                    origin: 1,
+                    atom_num: None,
+                    atom_day: None,
+                }],
             }],
         }
     }
@@ -5806,7 +6059,7 @@ mod tests {
 
     fn lazy_terminal_database_with_pages(pages: Vec<PhysicalPage>) -> Connection {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let transaction = connection.transaction().unwrap();
         begin_terminal_construction_in_open_candidate(&transaction).unwrap();
         seed_terminal_chunk_in_open_candidate(
@@ -5905,7 +6158,7 @@ mod tests {
     #[test]
     fn ready_content_only_save_touches_one_block_and_no_page_in_both_indexes() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let original = page(1, "Page title");
         apply_and_commit(
             &mut connection,
@@ -5932,7 +6185,7 @@ mod tests {
     #[test]
     fn ready_page_search_text_change_touches_the_page_row() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let original = page(1, "Old title");
         apply_and_commit(
             &mut connection,
@@ -5999,7 +6252,7 @@ mod tests {
 
         {
             let mut connection = Connection::open(&path).unwrap();
-            initialize_schema(&connection, digest(b"empty")).unwrap();
+            initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
             let transaction = connection.transaction().unwrap();
             begin_terminal_construction_in_open_candidate(&transaction).unwrap();
             seed_terminal_chunk_in_open_candidate(
@@ -6065,7 +6318,7 @@ mod tests {
         };
 
         let mut eager = Connection::open_in_memory().unwrap();
-        initialize_schema(&eager, digest(b"empty")).unwrap();
+        initialize_schema(&eager, digest(b"empty"), test_parse_config_hash()).unwrap();
         apply_and_commit(
             &mut eager,
             &change(1, vec![edited, initial[1].clone()], Vec::new()),
@@ -6080,7 +6333,7 @@ mod tests {
     fn lazy_bulk_build_matches_the_eager_index_row_set_in_both_families() {
         let pages = vec![page(2, "計画 café"), page(1, "Alpha")];
         let mut eager = Connection::open_in_memory().unwrap();
-        initialize_schema(&eager, digest(b"empty")).unwrap();
+        initialize_schema(&eager, digest(b"empty"), test_parse_config_hash()).unwrap();
         apply_and_commit(
             &mut eager,
             &change(1, pages.clone(), Vec::new()),
@@ -6098,7 +6351,7 @@ mod tests {
     fn delta_maintained_index_matches_from_scratch_final_state_in_both_families() {
         let initial = vec![page(1, "Alpha"), page(2, "Beta"), page(3, "Gamma")];
         let mut delta = Connection::open_in_memory().unwrap();
-        initialize_schema(&delta, digest(b"empty")).unwrap();
+        initialize_schema(&delta, digest(b"empty"), test_parse_config_hash()).unwrap();
         apply_and_commit(
             &mut delta,
             &change(1, initial.clone(), Vec::new()),
@@ -6122,7 +6375,7 @@ mod tests {
         );
 
         let mut from_scratch = Connection::open_in_memory().unwrap();
-        initialize_schema(&from_scratch, digest(b"empty")).unwrap();
+        initialize_schema(&from_scratch, digest(b"empty"), test_parse_config_hash()).unwrap();
         apply_and_commit(
             &mut from_scratch,
             &change(3, final_pages, Vec::new()),
@@ -6136,7 +6389,7 @@ mod tests {
     #[test]
     fn terminal_construction_defers_and_transactionally_restores_secondary_indexes() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let deferred_index_count = TERMINAL_DEFERRED_INDEXES.len() as i64;
         assert_eq!(
             terminal_deferred_index_count(&connection),
@@ -6177,7 +6430,7 @@ mod tests {
     #[test]
     fn terminal_index_rebuild_preserves_ambiguous_external_uuid_claims() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let transaction = connection.transaction().unwrap();
         begin_terminal_construction_in_open_candidate(&transaction).unwrap();
         transaction
@@ -6229,7 +6482,7 @@ mod tests {
     #[test]
     fn streaming_row_digest_matches_legacy_across_materialized_surfaces() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
 
         let mut first = page(0x101, "\u{200b}\u{00e9} searchable\0 boundary");
         first.name = "\u{00c5}ngstr\u{00f6}m \u{1f600}".into();
@@ -6391,7 +6644,7 @@ mod tests {
         let mut connection = Connection::open_in_memory().unwrap();
         let empty = digest(b"empty");
         let frontier = digest(b"frontier-1");
-        initialize_schema(&connection, empty).unwrap();
+        initialize_schema(&connection, empty, test_parse_config_hash()).unwrap();
         let mut page = page(1, "alpha searchable");
         let logseq_uuid = id(0xfeed);
         page.blocks[0].logseq_uuid = Some(logseq_uuid);
@@ -6443,7 +6696,7 @@ mod tests {
     #[test]
     fn normalized_fts_retains_original_payload_and_pages_literal_candidates() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let mut first = page(301, "first payload");
         first.blocks[0].searchable_text = "Cafe\u{301} foo-bar common".into();
         first.blocks[0].normalized_searchable_text = "café foo-bar common".into();
@@ -6652,7 +6905,7 @@ mod tests {
     #[test]
     fn task_candidate_blocks_are_ordered_and_cursor_paged() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
 
         let mut first = page(0x10, "first page");
         first.name = "First".into();
@@ -6771,7 +7024,7 @@ mod tests {
     #[test]
     fn task_candidate_blocks_validate_joined_page_headers() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let mut input = page(0x20, "candidate");
         input.name = "Journal".into();
         input.path = "journals/2026_08_10.org".into();
@@ -6809,7 +7062,7 @@ mod tests {
     #[test]
     fn block_structure_is_bounded_and_omits_text() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let mut input = page(0x30, "structural");
         let block_id = input.blocks[0].block_id;
         let parent_id = id(0x3001);
@@ -6841,7 +7094,7 @@ mod tests {
     #[test]
     fn task_candidate_blocks_reject_malformed_inputs_and_rows() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let input = page(0x40, "corruptible");
         let block_id = input.blocks[0].block_id;
         apply_and_commit(
@@ -6897,7 +7150,7 @@ mod tests {
     #[test]
     fn task_candidate_blocks_enforce_the_existing_read_byte_budget() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let mut input = page(0x50, "large candidates");
         let content = "x".repeat(MAX_MATERIALIZATION_FIELD_BYTES);
         let mut blocks = Vec::new();
@@ -6929,7 +7182,7 @@ mod tests {
     #[test]
     fn task_candidate_block_cursor_query_seeks_existing_indexes() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         apply_and_commit(
             &mut connection,
             &change(0x600, vec![page(0x60, "indexed")], Vec::new()),
@@ -6968,7 +7221,7 @@ mod tests {
     #[test]
     fn logseq_uuid_index_preserves_duplicate_claimants_canonically() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let claimed = id(0xbeef);
         let mut first = page(101, "first");
         first.blocks[0].logseq_uuid = Some(claimed);
@@ -7008,7 +7261,7 @@ mod tests {
         let second_home = id(0x7171);
         {
             let mut connection = Connection::open(&path).unwrap();
-            initialize_schema(&connection, digest(b"empty")).unwrap();
+            initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
             let mut first = change(0x100, vec![page(1, "first")], Vec::new());
             first.block_home_claims = vec![PhysicalBlockHomeClaim {
                 block_id,
@@ -7073,7 +7326,7 @@ mod tests {
     #[test]
     fn terminal_construction_seeds_block_home_claims() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let transaction = connection.transaction().unwrap();
         begin_terminal_construction_in_open_candidate(&transaction).unwrap();
         let block_id = id(0x8181);
@@ -7128,7 +7381,7 @@ mod tests {
         let logseq_uuid = id(0xcafe);
         {
             let mut connection = Connection::open(&path).unwrap();
-            initialize_schema(&connection, digest(b"empty")).unwrap();
+            initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
             let mut first = change(0x201, vec![page(1, "first")], Vec::new());
             first.page_name_identity_records = vec![PhysicalIdentityRecord {
                 key_digest: name_key,
@@ -7217,7 +7470,7 @@ mod tests {
     #[test]
     fn terminal_construction_seeds_baseline_identity_history() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let transaction = connection.transaction().unwrap();
         begin_terminal_construction_in_open_candidate(&transaction).unwrap();
         let name_key = digest(b"baseline name");
@@ -7285,7 +7538,7 @@ mod tests {
     #[test]
     fn raw_block_reference_queries_count_distinct_sources_and_page_cursors() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let first = page(201, "first");
         let second = page(202, "second");
         let first_page = first.page_id;
@@ -7434,7 +7687,7 @@ mod tests {
     #[test]
     fn replacement_cleanup_removes_owned_rows_and_fts() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let old = page(2, "obsolete-token");
         let old_block = old.blocks[0].block_id;
         apply_and_commit(
@@ -7470,7 +7723,7 @@ mod tests {
     fn physical_apply_and_stamp_roll_back_together() {
         let mut connection = Connection::open_in_memory().unwrap();
         let empty = digest(b"empty");
-        initialize_schema(&connection, empty).unwrap();
+        initialize_schema(&connection, empty, test_parse_config_hash()).unwrap();
         {
             let transaction = connection.transaction().unwrap();
             apply_change(
@@ -7492,7 +7745,7 @@ mod tests {
     #[test]
     fn bounded_reads_reject_query_and_aggregate_overflow() {
         let mut connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let oversized_query = "q".repeat(MAX_MATERIALIZATION_QUERY_BYTES + 1);
         let read = SqliteMaterializedRead::new(&connection, 0, digest(b"empty")).unwrap();
         assert!(matches!(
@@ -7531,7 +7784,7 @@ mod tests {
     #[test]
     fn schema_validation_refuses_canonical_sql_tampering() {
         let connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         validate_schema(&connection).unwrap();
         connection
             .execute_batch(
@@ -7548,7 +7801,7 @@ mod tests {
     #[test]
     fn schema_constraints_reject_cross_kind_reference_postings() {
         let connection = Connection::open_in_memory().unwrap();
-        initialize_schema(&connection, digest(b"empty")).unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
         let result = connection.execute(
             "INSERT INTO reference_postings (
                  source_page_id, source_entity_type, source_entity_id, source_locator,

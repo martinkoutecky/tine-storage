@@ -329,6 +329,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    use crate::sqlite_materialization::test_parse_config_hash;
     use crate::sqlite_materialization::{
         PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityId, PhysicalMaterializationChange,
         PhysicalPage, PhysicalPagePortablePathClaim, PhysicalReferencePosting,
@@ -350,6 +351,7 @@ mod tests {
             references: Vec::new(),
             properties: Vec::new(),
             tags: Vec::new(),
+            property_atoms: Vec::new(),
             blocks: vec![PhysicalBlock {
                 block_id: [page_id.saturating_add(100); 16],
                 home_document_id: [page_id; 16],
@@ -371,6 +373,8 @@ mod tests {
                     scheduled: None,
                     deadline: None,
                 }),
+                path_refs: Vec::new(),
+                property_atoms: Vec::new(),
             }],
         }
     }
@@ -985,7 +989,8 @@ mod tests {
         let managed = Connection::open_in_memory().unwrap();
         let empty = ContentDigest::of(b"empty");
         let frontier = ContentDigest::of(b"frontier-1");
-        sqlite_materialization::initialize_schema(&managed, empty).unwrap();
+        sqlite_materialization::initialize_schema(&managed, empty, test_parse_config_hash())
+            .unwrap();
         let transaction = managed.unchecked_transaction().unwrap();
         sqlite_materialization::apply_change(
             &transaction,

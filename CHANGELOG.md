@@ -5,6 +5,34 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [Unreleased]
+
+### Added
+
+- `block_path_refs` and `property_atoms`, the two derived materialization
+  tables Tine's query engine needs, with their six lookup indexes. The physical
+  layer stores what it is handed and never atomizes: `PhysicalBlock` carries
+  `path_refs`, and `PhysicalBlock`/`PhysicalPage` carry `property_atoms`
+  (`PhysicalPropertyAtom`), keyed `(owner_type, owner_id, normalized_name,
+  ordinal)` `WITHOUT ROWID`.
+- `materialization_stamp.parse_config_hash`: the digest of the graph parse
+  config the derived rows were lowered under. `initialize_schema` stamps it and
+  `stamped_parse_config_hash` reads it back, so an open route can tell a stale
+  projection from a damaged one.
+- Test-support seams `materialization_row_digests_by_table_for_test` and
+  `seed_terminal_chunk_for_test`, which let a consumer compare a genesis-built
+  and a delta-built store table by table.
+
+### Changed
+
+- SQLite projection schema 22 -> 23. There is no older-schema reader and no
+  migration: an unrecognized store is preserved as a backup and rebuilt from
+  the untouched Markdown/Org tree.
+- `PhysicalBlock`, `PhysicalPage`, `PhysicalMaterializationChange`,
+  `PhysicalGraphProjectionChange` and `PhysicalTerminalMaterializationChunk` no
+  longer derive `Eq`; a property atom carries an optional `REAL`, and `f64` is
+  not `Eq`. `PartialEq` is unchanged.
+
 ## [0.12.2] - 2026-09-02
 
 ### Fixed

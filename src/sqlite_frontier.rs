@@ -22,7 +22,7 @@ use crate::sqlite_materialization::{
 use crate::ContentDigest;
 
 pub const SQLITE_APPLICATION_ID: u32 = 0x5449_4e45;
-pub const SQLITE_SCHEMA_VERSION: u32 = 22;
+pub const SQLITE_SCHEMA_VERSION: u32 = 23;
 const MAX_AUTHENTICATED_MAP_DEPTH: usize = 256;
 
 pub const META_DDL: &str = "CREATE TABLE meta (
@@ -159,10 +159,11 @@ pub const BATCH_ID_INDEX_DDL: &str =
 pub const ACCEPTANCE_SEQUENCE_INDEX_DDL: &str = "CREATE UNIQUE INDEX \
     applied_batches_acceptance_sequence_uq ON applied_batches(acceptance_sequence)";
 
-const EXPECTED_TABLES: [&str; 38] = [
+const EXPECTED_TABLES: [&str; 40] = [
     "accepted_batch_nodes",
     "applied_batches",
     "block_home_claims",
+    "block_path_refs",
     "blocks",
     "causal_clock_nodes",
     "checkpoint_generation_anchor",
@@ -177,6 +178,7 @@ const EXPECTED_TABLES: [&str; 38] = [
     "pages",
     "portable_path_identity_records",
     "properties",
+    "property_atoms",
     "reference_alias_bindings",
     "reference_alias_declarations",
     "reference_postings",
@@ -199,9 +201,11 @@ const EXPECTED_TABLES: [&str; 38] = [
     "tags",
     "tasks",
 ];
-const EXPECTED_INDEXES: [&str; 24] = [
+const EXPECTED_INDEXES: [&str; 30] = [
     "applied_batches_acceptance_sequence_uq",
     "applied_batches_batch_id_uq",
+    "block_path_refs_lookup_idx",
+    "block_path_refs_page_idx",
     "blocks_logseq_uuid_idx",
     "blocks_page_order_idx",
     "page_portable_path_claims_key_idx",
@@ -211,6 +215,10 @@ const EXPECTED_INDEXES: [&str; 24] = [
     "pages_path_idx",
     "properties_lookup_idx",
     "properties_page_idx",
+    "property_atoms_day_idx",
+    "property_atoms_key_idx",
+    "property_atoms_num_idx",
+    "property_atoms_page_idx",
     "reference_alias_bindings_normalized_alias_idx",
     "reference_alias_declarations_source_idx",
     "reference_postings_normalized_name_idx",
@@ -610,6 +618,7 @@ pub fn initialize_schema(
     connection: &Connection,
     claim: PhysicalClaim,
     empty_frontier: &[u8],
+    parse_config_hash: ContentDigest,
 ) -> Result<(), FrontierError> {
     // Schema state is disposable, but it must still be all-or-nothing. Apart
     // from avoiding one FULL/NORMAL commit per DDL statement, this means a
@@ -625,7 +634,7 @@ pub fn initialize_schema(
          {BATCH_ID_INDEX_DDL}; {ACCEPTANCE_SEQUENCE_INDEX_DDL};"
     ))?;
     let empty_digest = ContentDigest::of(empty_frontier);
-    sqlite_materialization::initialize_schema(&transaction, empty_digest)?;
+    sqlite_materialization::initialize_schema(&transaction, empty_digest, parse_config_hash)?;
     transaction.execute(
         "INSERT INTO meta (
              singleton, workspace_id, lineage_digest, oplog_protocol_version,
@@ -658,6 +667,7 @@ pub fn initialize_checkpoint_candidate_schema(
     claim: PhysicalClaim,
     root: &PhysicalCheckpointFrontierRoot,
     anchor: &PhysicalCheckpointGenerationAnchor,
+    parse_config_hash: ContentDigest,
 ) -> Result<(), FrontierError> {
     validate_checkpoint_anchor_input(root, anchor)?;
     let transaction = connection.unchecked_transaction()?;
@@ -669,7 +679,7 @@ pub fn initialize_checkpoint_candidate_schema(
          {APPLIED_BATCHES_DDL}; {CHECKPOINT_GENERATION_ANCHOR_DDL};
          {BATCH_ID_INDEX_DDL}; {ACCEPTANCE_SEQUENCE_INDEX_DDL};"
     ))?;
-    sqlite_materialization::initialize_schema(&transaction, root.digest())?;
+    sqlite_materialization::initialize_schema(&transaction, root.digest(), parse_config_hash)?;
     transaction.execute(
         "UPDATE materialization_stamp
          SET acceptance_sequence = ?1, frontier_root_digest = ?2
@@ -3339,6 +3349,7 @@ mod tests {
     use crate::sqlite::{
         PhysicalEntityId, PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalSqliteDatabase,
     };
+    use crate::sqlite_materialization::test_parse_config_hash;
 
     use super::*;
 
@@ -3582,6 +3593,7 @@ mod tests {
                 references: Vec::new(),
                 properties: Vec::new(),
                 tags: Vec::new(),
+                property_atoms: Vec::new(),
                 blocks: Vec::new(),
             }],
             deletions: Vec::new(),
@@ -3660,7 +3672,13 @@ mod tests {
     fn initialized() -> (TestDatabase, Connection, PhysicalFrontierRoot) {
         let (database, connection) = TestDatabase::create();
         let empty = root(0, &[], &[]);
-        initialize_schema(&connection, claim(), &empty.canonical_bytes).unwrap();
+        initialize_schema(
+            &connection,
+            claim(),
+            &empty.canonical_bytes,
+            test_parse_config_hash(),
+        )
+        .unwrap();
         (database, connection, empty)
     }
 
@@ -3669,7 +3687,7 @@ mod tests {
         let physical = PhysicalSqliteDatabase::open_writable(&database.path).unwrap();
         let empty = root(0, &[], &[]);
         physical
-            .initialize_schema(claim(), &empty.canonical_bytes)
+            .initialize_schema(claim(), &empty.canonical_bytes, test_parse_config_hash())
             .unwrap();
         (database, physical, empty)
     }
@@ -3683,7 +3701,12 @@ mod tests {
         let checkpoint = PhysicalSqliteDatabase::open_writable(&checkpoint_path.path).unwrap();
         let (root, anchor) = empty_checkpoint_root_and_anchor();
         checkpoint
-            .initialize_checkpoint_candidate_schema(claim(), &root, &anchor)
+            .initialize_checkpoint_candidate_schema(
+                claim(),
+                &root,
+                &anchor,
+                test_parse_config_hash(),
+            )
             .unwrap();
         checkpoint.validate_schema_and_claim(claim()).unwrap();
         assert_eq!(
@@ -3774,7 +3797,12 @@ mod tests {
         let checkpoint_path = TestDatabase::new();
         let checkpoint = PhysicalSqliteDatabase::open_writable(&checkpoint_path.path).unwrap();
         checkpoint
-            .initialize_checkpoint_candidate_schema(claim(), &checkpoint_root, &anchor)
+            .initialize_checkpoint_candidate_schema(
+                claim(),
+                &checkpoint_root,
+                &anchor,
+                test_parse_config_hash(),
+            )
             .unwrap();
         checkpoint.validate_schema_and_claim(claim()).unwrap();
         assert!(checkpoint.load_all_batches().unwrap().is_empty());
@@ -3863,7 +3891,12 @@ mod tests {
         let path = TestDatabase::new();
         let database = PhysicalSqliteDatabase::open_writable(&path.path).unwrap();
         database
-            .initialize_checkpoint_candidate_schema(claim(), &root, &anchor)
+            .initialize_checkpoint_candidate_schema(
+                claim(),
+                &root,
+                &anchor,
+                test_parse_config_hash(),
+            )
             .unwrap();
         assert!(database.load_all_batches().unwrap().is_empty());
 

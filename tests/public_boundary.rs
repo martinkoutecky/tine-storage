@@ -288,7 +288,7 @@ fn a_receipt_can_be_generated_from_the_public_manifest() {
 #[test]
 fn format_constants_are_reachable_through_formats() {
     assert!(formats::MAX_OBJECT_BYTES > 0);
-    assert_eq!(formats::SQLITE_SCHEMA_VERSION, 22);
+    assert_eq!(formats::SQLITE_SCHEMA_VERSION, 23);
     assert_eq!(formats::LOCAL_JOURNAL_SEGMENT_PROTOCOL_VERSION, 2);
     assert_eq!(formats::LOCAL_JOURNAL_SEGMENT_HEADER_BYTES, 136);
     assert_eq!(formats::LOCAL_JOURNAL_FRONTIER_BYTES, 240);

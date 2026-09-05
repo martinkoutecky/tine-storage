@@ -70,15 +70,15 @@ pub mod sqlite {
         PhysicalMaterializationChange, PhysicalNavigationAliasRow, PhysicalNavigationPageRow,
         PhysicalNavigationReferenceNameRow, PhysicalPage, PhysicalPageInventoryRow,
         PhysicalPagePortablePathClaim, PhysicalPageReferrerCandidateRow, PhysicalPageRow,
-        PhysicalPlainTextCandidatePageRow, PhysicalProperty, PhysicalPropertyFacetRow,
-        PhysicalPropertyRow, PhysicalReference, PhysicalReferencePosting, PhysicalReferenceTarget,
-        PhysicalReferrerRow, PhysicalSearchHit, PhysicalSearchIndexBuildStep,
-        PhysicalSearchIndexStatus, PhysicalTagRow, PhysicalTask, PhysicalTaskCandidateBlockRow,
-        PhysicalTaskCandidateLocatorRow, PhysicalTaskCandidatePageRow, PhysicalTaskRow,
-        PhysicalTerminalConstructionBatch, PhysicalTerminalMaterializationChunk,
-        PhysicalTerminalProjectionStamp, SqliteGraphProjectionRead, SqliteMaterializedRead,
-        MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
-        MAX_MATERIALIZATION_READ_BYTES,
+        PhysicalPlainTextCandidatePageRow, PhysicalProperty, PhysicalPropertyAtom,
+        PhysicalPropertyFacetRow, PhysicalPropertyRow, PhysicalReference, PhysicalReferencePosting,
+        PhysicalReferenceTarget, PhysicalReferrerRow, PhysicalSearchHit,
+        PhysicalSearchIndexBuildStep, PhysicalSearchIndexStatus, PhysicalTagRow, PhysicalTask,
+        PhysicalTaskCandidateBlockRow, PhysicalTaskCandidateLocatorRow,
+        PhysicalTaskCandidatePageRow, PhysicalTaskRow, PhysicalTerminalConstructionBatch,
+        PhysicalTerminalMaterializationChunk, PhysicalTerminalProjectionStamp,
+        SqliteGraphProjectionRead, SqliteMaterializedRead, MAX_MATERIALIZATION_QUERY_BYTES,
+        MAX_MATERIALIZATION_QUERY_ROWS, MAX_MATERIALIZATION_READ_BYTES,
     };
 
     #[cfg(feature = "test-support")]
@@ -88,6 +88,8 @@ pub mod sqlite {
     pub use crate::sqlite_materialization::{
         apply_change as apply_materialization_change_for_test,
         initialize_schema as initialize_materialization_schema_for_test,
+        row_digests_by_table as materialization_row_digests_by_table_for_test,
+        seed_terminal_chunk_in_open_candidate as seed_terminal_chunk_for_test,
     };
 }
 

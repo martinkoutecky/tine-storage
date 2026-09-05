@@ -101,8 +101,20 @@ impl PhysicalSqliteDatabase {
         &self,
         claim: PhysicalClaim,
         empty_frontier: &[u8],
+        parse_config_hash: ContentDigest,
     ) -> Result<(), FrontierError> {
-        sqlite_frontier::initialize_schema(&self.connection, claim, empty_frontier)
+        sqlite_frontier::initialize_schema(
+            &self.connection,
+            claim,
+            empty_frontier,
+            parse_config_hash,
+        )
+    }
+
+    /// The parse-config digest this projection's derived rows were built under
+    /// (SPEC §5.8 H6).
+    pub fn stamped_parse_config_hash(&self) -> Result<ContentDigest, FrontierError> {
+        sqlite_materialization::stamped_parse_config_hash(&self.connection).map_err(Into::into)
     }
 
     pub fn initialize_checkpoint_candidate_schema(
@@ -110,12 +122,14 @@ impl PhysicalSqliteDatabase {
         claim: PhysicalClaim,
         root: &PhysicalCheckpointFrontierRoot,
         anchor: &PhysicalCheckpointGenerationAnchor,
+        parse_config_hash: ContentDigest,
     ) -> Result<(), FrontierError> {
         sqlite_frontier::initialize_checkpoint_candidate_schema(
             &self.connection,
             claim,
             root,
             anchor,
+            parse_config_hash,
         )
     }
 
@@ -666,6 +680,7 @@ mod tests {
 
     use super::*;
     use crate::sqlite_fileset::SqliteFileSet;
+    use crate::sqlite_materialization::test_parse_config_hash;
 
     static NEXT_DATABASE: AtomicU64 = AtomicU64::new(1);
 
@@ -710,7 +725,7 @@ mod tests {
         let database = PhysicalSqliteDatabase::open_writable(path.as_path()).unwrap();
         let empty_frontier = b"canonical empty frontier";
         database
-            .initialize_schema(claim(7), empty_frontier)
+            .initialize_schema(claim(7), empty_frontier, test_parse_config_hash())
             .unwrap();
         database.validate_schema_and_claim(claim(7)).unwrap();
 
@@ -755,7 +770,9 @@ mod tests {
             )
             .unwrap();
 
-        assert!(database.initialize_schema(claim(8), b"empty").is_err());
+        assert!(database
+            .initialize_schema(claim(8), b"empty", test_parse_config_hash())
+            .is_err());
         let meta_exists: i64 = database
             .connection
             .query_row(
@@ -774,7 +791,9 @@ mod tests {
     fn reopen_accepts_only_the_expected_claim_and_schema() {
         let path = TestDatabasePath::new("reopen");
         let database = PhysicalSqliteDatabase::open_writable(path.as_path()).unwrap();
-        database.initialize_schema(claim(11), b"empty").unwrap();
+        database
+            .initialize_schema(claim(11), b"empty", test_parse_config_hash())
+            .unwrap();
         drop(database);
 
         let reopened = PhysicalSqliteDatabase::open_read_only(path.as_path()).unwrap();
@@ -810,7 +829,9 @@ mod tests {
     fn truncate_checkpoint_drains_wal_and_candidate_checkpoint_disables_it() {
         let path = TestDatabasePath::new("checkpoint");
         let database = PhysicalSqliteDatabase::open_writable(path.as_path()).unwrap();
-        database.initialize_schema(claim(17), b"empty").unwrap();
+        database
+            .initialize_schema(claim(17), b"empty", test_parse_config_hash())
+            .unwrap();
         database
             .execute_corrupting_sql_for_test(
                 "UPDATE meta SET managed_entity_set_version = managed_entity_set_version",
