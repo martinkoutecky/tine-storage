@@ -22,7 +22,7 @@ use crate::sqlite_materialization::{
 use crate::ContentDigest;
 
 pub const SQLITE_APPLICATION_ID: u32 = 0x5449_4e45;
-pub const SQLITE_SCHEMA_VERSION: u32 = 25;
+pub const SQLITE_SCHEMA_VERSION: u32 = 26;
 const MAX_AUTHENTICATED_MAP_DEPTH: usize = 256;
 
 pub const META_DDL: &str = "CREATE TABLE meta (
@@ -159,11 +159,14 @@ pub const BATCH_ID_INDEX_DDL: &str =
 pub const ACCEPTANCE_SEQUENCE_INDEX_DDL: &str = "CREATE UNIQUE INDEX \
     applied_batches_acceptance_sequence_uq ON applied_batches(acceptance_sequence)";
 
-const EXPECTED_TABLES: [&str; 43] = [
+const EXPECTED_TABLES: [&str; 46] = [
     "accepted_batch_nodes",
     "applied_batches",
     "block_home_claims",
     "block_path_refs",
+    "block_own_refs",
+    "query_block_results",
+    "query_page_order",
     "block_planning",
     "blocks",
     "block_text",
@@ -3591,6 +3594,7 @@ mod tests {
             batch_id,
             replacements: vec![sqlite_materialization::PhysicalPage {
                 page_id,
+                query_page_order: None,
                 home_document_id: id(50),
                 name: format!("page-{}", u128::from_be_bytes(batch_id)),
                 name_key: format!("page-{}", u128::from_be_bytes(batch_id)),

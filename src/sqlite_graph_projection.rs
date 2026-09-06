@@ -391,6 +391,29 @@ impl PhysicalProjectionQueryReader {
         Ok(Self { connection })
     }
 
+    /// Install the fixed query regex predicate over a caller-owned immutable
+    /// compiled-regex registry. IDs are bound values, not SQL or regex source.
+    /// The application retains its existing regex compiler and semantics.
+    pub fn set_query_regex_predicate(
+        &self,
+        predicate: impl Fn(u64, &str) -> Result<bool, MaterializationError> + Send + 'static,
+    ) -> Result<(), MaterializationError> {
+        self.connection.create_scalar_function(
+            "tine_query_regex",
+            2,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC
+                | rusqlite::functions::FunctionFlags::SQLITE_DIRECTONLY,
+            move |context| {
+                let id = context.get::<u64>(0)?;
+                let text = context.get_raw(1).as_str()?;
+                predicate(id, text)
+                    .map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+            },
+        )?;
+        Ok(())
+    }
+
     /// Run one statement with bound parameters and collect its rows.
     pub fn run_projection_query(
         &self,
@@ -561,6 +584,14 @@ impl PhysicalProjectionQuerySnapshot {
 
     pub fn cancellation(&self) -> PhysicalProjectionQueryCancellation {
         self.cancellation.clone()
+    }
+
+    /// Install compiled-regex ID lookup on this snapshot's read-only connection.
+    pub fn set_query_regex_predicate(
+        &mut self,
+        predicate: impl Fn(u64, &str) -> Result<bool, MaterializationError> + Send + 'static,
+    ) -> Result<(), MaterializationError> {
+        self.read(|reader| reader.set_query_regex_predicate(predicate))
     }
 
     fn read<T>(
@@ -851,9 +882,48 @@ mod tests {
         assert_eq!(fixture.checkpoint(), (0, 0, 0));
     }
 
+    #[test]
+    fn owned_snapshot_regex_predicate_uses_bound_ids_and_exact_text() {
+        let fixture = SnapshotFixture::new();
+        let mut snapshot = fixture.snapshot();
+        snapshot
+            .set_query_regex_predicate(|id, text| {
+                if id != 7 {
+                    return Err(MaterializationError::InvalidQuery(
+                        "unknown compiled regex ID".into(),
+                    ));
+                }
+                Ok(text == "É  exact\ntext")
+            })
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .run_projection_query(
+                    "SELECT tine_query_regex(?1, ?2)",
+                    &[
+                        PhysicalQueryValue::Integer(7),
+                        PhysicalQueryValue::Text("É  exact\ntext".into())
+                    ]
+                )
+                .unwrap(),
+            vec![vec![PhysicalQueryValue::Integer(1)]]
+        );
+        assert!(snapshot
+            .run_projection_query(
+                "SELECT tine_query_regex(?1, ?2)",
+                &[
+                    PhysicalQueryValue::Integer(8),
+                    PhysicalQueryValue::Text("text".into())
+                ]
+            )
+            .is_err());
+        assert!(snapshot.reader.is_none());
+    }
+
     fn page(page_id: u8, task: &str, content: &str) -> PhysicalPage {
         PhysicalPage {
             page_id: [page_id; 16],
+            query_page_order: Some(u64::from(page_id)),
             home_document_id: [page_id; 16],
             name: format!("Page {page_id}"),
             name_key: format!("page {page_id}"),
@@ -869,6 +939,9 @@ mod tests {
             property_atoms: Vec::new(),
             blocks: vec![PhysicalBlock {
                 block_id: [page_id.saturating_add(100); 16],
+                query_result_id: uuid::Uuid::from_bytes([page_id.saturating_add(100); 16])
+                    .to_string(),
+                own_refs: Vec::new(),
                 home_document_id: [page_id; 16],
                 parent: None,
                 order: "0001".into(),

@@ -94,6 +94,83 @@ pub struct PhysicalTag {
     pub tag_key: String,
 }
 
+/// Existing shallow query estimate, excluding the outer budget's page name and
+/// group overhead. Shared by projection production and consumers.
+pub fn query_result_estimated_bytes<'a>(
+    result_id: &str,
+    raw: &str,
+    tags: impl IntoIterator<Item = &'a str>,
+    properties: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> usize {
+    let id_bytes = if result_id.is_empty() {
+        36
+    } else {
+        result_id.len()
+    };
+    id_bytes
+        .saturating_add(raw.len())
+        .saturating_add(tags.into_iter().map(str::len).sum::<usize>())
+        .saturating_add(
+            properties
+                .into_iter()
+                .map(|(key, value)| key.len().saturating_add(value.len()))
+                .sum::<usize>(),
+        )
+        .saturating_add(128)
+}
+
+/// Expand parent-local sibling order into whole-page preorder. Returns original
+/// input indices and one-based depths, so producers can share ordering without
+/// allocating document payload. Equal orders use block ID.
+pub fn query_block_preorder<'a>(
+    blocks: impl IntoIterator<Item = ([u8; 16], Option<[u8; 16]>, &'a str)>,
+) -> Result<Vec<(usize, usize)>, MaterializationError> {
+    let blocks = blocks.into_iter().collect::<Vec<_>>();
+    let ids = blocks.iter().map(|row| row.0).collect::<BTreeSet<_>>();
+    if ids.len() != blocks.len() {
+        return Err(MaterializationError::InvalidInput(
+            "duplicate query block identity".into(),
+        ));
+    }
+    let mut children = BTreeMap::<Option<[u8; 16]>, Vec<usize>>::new();
+    for (index, (_, parent, _)) in blocks.iter().enumerate() {
+        if parent.is_some_and(|id| !ids.contains(&id)) {
+            return Err(MaterializationError::InvalidInput(
+                "query block has unknown parent".into(),
+            ));
+        }
+        children.entry(*parent).or_default().push(index);
+    }
+    for siblings in children.values_mut() {
+        siblings.sort_unstable_by_key(|index| (blocks[*index].2, blocks[*index].0));
+    }
+    let mut pending = children
+        .remove(&None)
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+        .map(|index| (index, 1))
+        .collect::<Vec<_>>();
+    let mut output = Vec::with_capacity(blocks.len());
+    while let Some((index, depth)) = pending.pop() {
+        output.push((index, depth));
+        pending.extend(
+            children
+                .remove(&Some(blocks[index].0))
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+                .map(|child| (child, depth + 1)),
+        );
+    }
+    if output.len() != blocks.len() {
+        return Err(MaterializationError::InvalidInput(
+            "cyclic query block ancestry".into(),
+        ));
+    }
+    Ok(output)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalTask {
     pub marker: String,
@@ -122,6 +199,11 @@ pub struct PhysicalPlanning {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalBlock {
     pub block_id: [u8; 16],
+    /// Public query identity, assigned by the application's current session or
+    /// Managed identity owner. The disposable physical UUID is not a substitute.
+    pub query_result_id: String,
+    /// Own normalized reference names, before ancestor/page closure expansion.
+    pub own_refs: Vec<String>,
     pub home_document_id: [u8; 16],
     pub parent: Option<[u8; 16]>,
     pub order: String,
@@ -156,6 +238,9 @@ pub struct PhysicalBlock {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalPage {
     pub page_id: [u8; 16],
+    /// Direct's current session inventory position. Managed supplies None and
+    /// orders by path. This is rebuildable metadata, never identity authority.
+    pub query_page_order: Option<u64>,
     pub home_document_id: [u8; 16],
     pub name: String,
     pub name_key: String,
@@ -664,6 +749,31 @@ pub const BLOCK_PATH_REFS_DDL: &str = "CREATE TABLE block_path_refs (
 /// The atoms of every property element (SPEC §3.3, §5.8). `properties` keeps
 /// the unsplit source value for presence, autocomplete and display; this table
 /// carries the flattened, renumbered atom list a value comparison searches.
+pub const QUERY_BLOCK_RESULTS_DDL: &str = "CREATE TABLE query_block_results (
+    block_id BLOB PRIMARY KEY CHECK (length(block_id) = 16)
+        REFERENCES blocks(block_id) ON DELETE CASCADE,
+    page_id BLOB NOT NULL CHECK (length(page_id) = 16)
+        REFERENCES pages(page_id) ON DELETE CASCADE,
+    preorder INTEGER NOT NULL CHECK (preorder >= 0),
+    result_id TEXT NOT NULL CHECK (length(CAST(result_id AS BLOB)) > 0),
+    estimated_bytes INTEGER NOT NULL CHECK (estimated_bytes >= 0),
+    tag_count INTEGER NOT NULL CHECK (tag_count >= 0),
+    property_count INTEGER NOT NULL CHECK (property_count >= 0),
+    UNIQUE (page_id, preorder)
+) STRICT";
+pub const QUERY_PAGE_ORDER_DDL: &str = "CREATE TABLE query_page_order (
+    page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16)
+        REFERENCES pages(page_id) ON DELETE CASCADE,
+    position INTEGER NOT NULL UNIQUE CHECK (position >= 0)
+) STRICT";
+pub const BLOCK_OWN_REFS_DDL: &str = "CREATE TABLE block_own_refs (
+    block_id BLOB NOT NULL CHECK (length(block_id) = 16)
+        REFERENCES blocks(block_id) ON DELETE CASCADE,
+    page_id BLOB NOT NULL CHECK (length(page_id) = 16)
+        REFERENCES pages(page_id) ON DELETE CASCADE,
+    normalized_name TEXT NOT NULL CHECK (length(CAST(normalized_name AS BLOB)) BETWEEN 1 AND 4194304),
+    PRIMARY KEY (block_id, normalized_name)
+) WITHOUT ROWID, STRICT";
 pub const PROPERTY_ATOMS_DDL: &str = "CREATE TABLE property_atoms (
     owner_type INTEGER NOT NULL CHECK (owner_type IN (0, 1)),
     owner_id BLOB NOT NULL CHECK (length(owner_id) = 16),
@@ -861,7 +971,7 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 34] = [
     ("property_atoms_page_idx", PROPERTY_ATOMS_PAGE_INDEX_DDL),
 ];
 
-const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 24] = [
+const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 27] = [
     (
         "materialization_stamp",
         &[
@@ -1048,6 +1158,23 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 24] = [
         &["block_id", "page_id", "normalized_name"],
     ),
     (
+        "block_own_refs",
+        &["block_id", "page_id", "normalized_name"],
+    ),
+    (
+        "query_block_results",
+        &[
+            "block_id",
+            "page_id",
+            "preorder",
+            "result_id",
+            "estimated_bytes",
+            "tag_count",
+            "property_count",
+        ],
+    ),
+    ("query_page_order", &["page_id", "position"]),
+    (
         "property_atoms",
         &[
             "owner_type",
@@ -1090,7 +1217,7 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 24] = [
     ),
 ];
 
-const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 59] = [
+const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 62] = [
     ("table", "materialization_stamp", MATERIALIZATION_STAMP_DDL),
     (
         "table",
@@ -1139,6 +1266,9 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 59] = [
     ("table", "tasks", TASKS_DDL),
     ("table", "block_planning", BLOCK_PLANNING_DDL),
     ("table", "block_path_refs", BLOCK_PATH_REFS_DDL),
+    ("table", "block_own_refs", BLOCK_OWN_REFS_DDL),
+    ("table", "query_block_results", QUERY_BLOCK_RESULTS_DDL),
+    ("table", "query_page_order", QUERY_PAGE_ORDER_DDL),
     ("table", "property_atoms", PROPERTY_ATOMS_DDL),
     ("table", "search_fts_owners", SEARCH_FTS_OWNERS_DDL),
     ("table", "search_fts", SEARCH_FTS_DDL),
@@ -1347,6 +1477,9 @@ pub(crate) fn initialize_graph_projection_schema(
          {TASKS_DDL};
          {BLOCK_PLANNING_DDL};
          {BLOCK_PATH_REFS_DDL};
+         {BLOCK_OWN_REFS_DDL};
+         {QUERY_BLOCK_RESULTS_DDL};
+         {QUERY_PAGE_ORDER_DDL};
          {PROPERTY_ATOMS_DDL};
          {SEARCH_FTS_OWNERS_DDL};
          {SEARCH_FTS_DDL};
@@ -2897,6 +3030,9 @@ pub(crate) fn reset_graph_projection_rows(
          DELETE FROM search_fts_owners;
          DELETE FROM property_atoms;
          DELETE FROM block_path_refs;
+         DELETE FROM block_own_refs;
+         DELETE FROM query_block_results;
+         DELETE FROM query_page_order;
          DELETE FROM block_planning;
          DELETE FROM tasks;
          DELETE FROM tags;
@@ -2941,6 +3077,21 @@ fn delete_page(
         existing_pages: usize::from(existing != 0),
         ..PageCleanupInstrumentation::default()
     };
+    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(
+        transaction.execute(
+            "DELETE FROM block_own_refs WHERE block_id IN (SELECT block_id FROM blocks WHERE page_id = ?1)",
+            params![page.as_slice()],
+        )?,
+    );
+    for table in ["query_block_results", "query_page_order"] {
+        instrumentation.owned_rows =
+            instrumentation
+                .owned_rows
+                .saturating_add(transaction.execute(
+                    &format!("DELETE FROM {table} WHERE page_id = ?1"),
+                    params![page.as_slice()],
+                )?);
+    }
     let old_blocks = {
         let mut statement =
             transaction.prepare("SELECT block_id FROM blocks WHERE page_id = ?1")?;
@@ -3101,8 +3252,43 @@ fn insert_page(transaction: &Connection, page: &PhysicalPage) -> Result<(), Mate
         page.page_id,
         &page.property_atoms,
     )?;
+    if let Some(position) = page.query_page_order {
+        execute_cached(
+            transaction,
+            "INSERT INTO query_page_order (page_id, position) VALUES (?1, ?2)",
+            params![
+                page.page_id.as_slice(),
+                i64::try_from(position).map_err(|_| MaterializationError::InvalidInput(
+                    "query page position exceeds SQLite".into()
+                ))?
+            ],
+        )?;
+    }
     for block in &page.blocks {
         insert_block(transaction, page.page_id, block)?;
+    }
+    let traversal = query_block_preorder(
+        page.blocks
+            .iter()
+            .map(|block| (block.block_id, block.parent, block.order.as_str())),
+    )?;
+    for (preorder, (index, _depth)) in traversal.into_iter().enumerate() {
+        let block = &page.blocks[index];
+        let estimated = query_result_estimated_bytes(
+            &block.query_result_id,
+            &block.content,
+            block.tags.iter().map(|tag| tag.tag.as_str()),
+            block
+                .properties
+                .iter()
+                .map(|property| (property.name.as_str(), property.value.as_str())),
+        );
+        execute_cached(transaction,
+            "INSERT INTO query_block_results (block_id, page_id, preorder, result_id, estimated_bytes, tag_count, property_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![block.block_id.as_slice(), page.page_id.as_slice(), preorder as i64,
+                &block.query_result_id, i64::try_from(estimated).map_err(|_| MaterializationError::InvalidInput("query estimate exceeds SQLite".into()))?,
+                block.tags.len() as i64, block.properties.len() as i64])?;
     }
     Ok(())
 }
@@ -3155,6 +3341,13 @@ fn insert_block(
     insert_tags(transaction, owner, page_id, &block.tags)?;
     insert_property_atoms(transaction, owner, page_id, &block.property_atoms)?;
     insert_path_refs(transaction, block.block_id, page_id, &block.path_refs)?;
+    for name in block.own_refs.iter().collect::<BTreeSet<_>>() {
+        execute_cached(
+            transaction,
+            "INSERT INTO block_own_refs (block_id, page_id, normalized_name) VALUES (?1, ?2, ?3)",
+            params![block.block_id.as_slice(), page_id.as_slice(), name],
+        )?;
+    }
     if let Some(task) = &block.task {
         execute_cached(
             transaction,
@@ -6166,6 +6359,7 @@ mod tests {
         let block_id = id(value + 0x1000);
         PhysicalPage {
             page_id,
+            query_page_order: None,
             home_document_id: id(value + 0x2000),
             name: format!("Page {value}"),
             name_key: format!("page {value}"),
@@ -6193,6 +6387,8 @@ mod tests {
             }],
             blocks: vec![PhysicalBlock {
                 block_id,
+                query_result_id: uuid::Uuid::from_bytes(block_id).to_string(),
+                own_refs: Vec::new(),
                 home_document_id: id(value + 0x2000),
                 parent: None,
                 order: "a".into(),
@@ -6536,6 +6732,111 @@ mod tests {
     }
 
     #[test]
+    fn query_metadata_preserves_public_identity_preorder_and_exact_estimate() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
+        let mut input = page(1, "α raw");
+        let mut root = input.blocks[0].clone();
+        root.block_id = id(10);
+        root.query_result_id = "sparse-v2:public-root".into();
+        root.order = "z".into();
+        root.own_refs = vec!["own".into(), "own".into()];
+        root.path_refs = vec!["own".into(), "inherited".into()];
+        let mut child = root.clone();
+        child.block_id = id(11);
+        child.query_result_id = "preserved-child".into();
+        child.parent = Some(root.block_id);
+        child.order = "a".into();
+        let mut sibling = root.clone();
+        sibling.block_id = id(12);
+        sibling.query_result_id = "public-sibling".into();
+        // Equal root orders use physical IDs. The input is deliberately NOT
+        // tree ordered, and the child's local key precedes both root keys.
+        input.blocks = vec![sibling, child, root.clone()];
+        input.query_page_order = Some(37);
+        apply_and_commit(
+            &mut connection,
+            &change(1, vec![input], Vec::new()),
+            1,
+            digest(b"f1"),
+        );
+        let rows = connection
+            .prepare("SELECT result_id FROM query_block_results ORDER BY preorder")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            ["sparse-v2:public-root", "preserved-child", "public-sibling"]
+        );
+        let (estimate, tags, properties): (i64, i64, i64) = connection.query_row(
+            "SELECT estimated_bytes, tag_count, property_count FROM query_block_results WHERE block_id=?1",
+            params![root.block_id.as_slice()], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        let expected = root.query_result_id.len()
+            + root.content.len()
+            + root.tags.iter().map(|tag| tag.tag.len()).sum::<usize>()
+            + root
+                .properties
+                .iter()
+                .map(|property| property.name.len() + property.value.len())
+                .sum::<usize>()
+            + 128;
+        assert_eq!(
+            (estimate, tags, properties),
+            (
+                expected as i64,
+                root.tags.len() as i64,
+                root.properties.len() as i64
+            )
+        );
+        let names = connection.prepare("SELECT normalized_name FROM block_own_refs WHERE block_id=?1 ORDER BY normalized_name").unwrap()
+            .query_map(params![root.block_id.as_slice()], |row| row.get::<_, String>(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(names, ["own"], "own refs are deduplicated, not the closure");
+        assert_eq!(
+            connection
+                .query_row("SELECT position FROM query_page_order", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            37
+        );
+        // Required metadata is transactional: an incomplete public identity
+        // rejects a replacement without erasing the previous successful rows.
+        let mut broken = page(1, "broken");
+        broken.blocks[0].query_result_id.clear();
+        {
+            let transaction = connection.transaction().unwrap();
+            delete_page(&transaction, broken.page_id, true, &BTreeSet::new()).unwrap();
+            assert!(insert_page(&transaction, &broken).is_err());
+        }
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM query_block_results", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn query_preorder_rejects_incomplete_or_cyclic_trees() {
+        assert!(query_block_preorder([(id(1), Some(id(2)), "a")]).is_err());
+        assert!(
+            query_block_preorder([(id(1), Some(id(2)), "a"), (id(2), Some(id(1)), "b")]).is_err()
+        );
+        assert!(query_block_preorder([(id(1), None, "a"), (id(1), None, "b")]).is_err());
+        assert_eq!(
+            query_block_preorder([(id(2), None, "z"), (id(1), None, "z")]).unwrap(),
+            [(1, 1), (0, 1)]
+        );
+        assert_eq!(
+            query_result_estimated_bytes("", "é", ["tag"], [("key", "value")]),
+            36 + 2 + 3 + 3 + 5 + 128
+        );
+    }
+
+    #[test]
     fn text_payload_follows_replacement_rollback_delete_and_reset() {
         for foreign_keys in [false, true] {
             let mut connection = Connection::open_in_memory().unwrap();
@@ -6543,8 +6844,12 @@ mod tests {
                 .pragma_update(None, "foreign_keys", foreign_keys)
                 .unwrap();
             initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
-            let first = page(1, "First");
-            let second = page(2, "Second");
+            let mut first = page(1, "First");
+            first.query_page_order = Some(0);
+            first.blocks[0].own_refs = vec!["first".into()];
+            let mut second = page(2, "Second");
+            second.query_page_order = Some(1);
+            second.blocks[0].own_refs = vec!["second".into()];
             apply_and_commit(
                 &mut connection,
                 &change(1, vec![first.clone(), second.clone()], Vec::new()),
@@ -6593,7 +6898,13 @@ mod tests {
                     .preamble,
                 None
             );
-            for table in ["page_text", "block_text"] {
+            for table in [
+                "page_text",
+                "block_text",
+                "query_block_results",
+                "query_page_order",
+                "block_own_refs",
+            ] {
                 let count: i64 = connection
                     .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                         row.get(0)
@@ -6602,7 +6913,15 @@ mod tests {
                 assert_eq!(count, 1);
             }
             reset_graph_projection_rows(&connection).unwrap();
-            for table in ["page_text", "block_text", "pages", "blocks"] {
+            for table in [
+                "page_text",
+                "block_text",
+                "pages",
+                "blocks",
+                "query_block_results",
+                "query_page_order",
+                "block_own_refs",
+            ] {
                 let count: i64 = connection
                     .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                         row.get(0)
@@ -7647,6 +7966,12 @@ mod tests {
         let mut input = page(0x30, "structural");
         let block_id = input.blocks[0].block_id;
         let parent_id = id(0x3001);
+        // Result metadata needs a complete tree. Supply the parent row while
+        // retaining the structural parent/read-boundary assertion.
+        let mut parent = input.blocks[0].clone();
+        parent.block_id = parent_id;
+        parent.query_result_id = uuid::Uuid::from_bytes(parent_id).to_string();
+        input.blocks.push(parent);
         input.blocks[0].parent = Some(parent_id);
         input.blocks[0].order = "structural-order".into();
         input.blocks[0].content = "must not cross the structure boundary".into();

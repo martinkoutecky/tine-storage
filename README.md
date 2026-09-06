@@ -142,5 +142,16 @@ signals the owner: graph replacement must also drain workers/handles, including
 idle cancelled jobs, before removing the projection. Do not infer bounded WAL
 bytes from bounded worker count; measure reader duration and retained WAL.
 
-This API is an unreleased part of the database-owned results packet. Result
-metadata and producer integration must be completed before the next certification.
+Schema 26 adds `query_block_results`, `query_page_order`, and `block_own_refs`.
+The page transaction derives preorder, construction estimates and facet counts
+from its physical inputs; producers supply their existing public identity and
+own references. Direct session positions are optional for Managed pages, which
+use path ordering. `query_block_preorder` and `query_result_estimated_bytes`
+are shared helpers for producers/consumers. Incomplete trees and empty public
+identities reject a replacement transaction. Raw text remains in block_text.
+
+`set_query_regex_predicate` installs the fixed `tine_query_regex(id, visible_text)`
+function over an application-owned compiled-regex registry. Bound IDs select
+existing compiled expressions; storage introduces no regex grammar or per-row
+compilation. This packet remains unreleased until both producer integration and
+the required certification/recovery gates pass.

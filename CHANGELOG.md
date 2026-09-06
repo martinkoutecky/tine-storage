@@ -13,7 +13,12 @@ independently in `src/formats.rs` and summarized in
   Direct acquisition guards, streaming bound-parameter reads, sticky cancellation
   and SQLite interrupts. Selection and payload reads share one snapshot while
   WAL writers continue. Errors, completion and drop release the read transaction.
-  This is the first R1 checkpoint; result metadata and app integration remain.
+  Fixed regex-ID callbacks retain the application's existing compiled semantics.
+- Schema 26 query result metadata and own-reference facts, shared preorder and
+  byte-estimate helpers, and Direct session page positions. Metadata is produced
+  in the page transaction and explicitly removed on replacement, deletion and
+  reset even with foreign keys disabled. No raw text duplication or authority
+  input format change. App integration and certification remain pending.
 
 ## [0.15.0] - 2026-09-06
 
