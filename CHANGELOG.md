@@ -5,7 +5,7 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
-## [Unreleased]
+## [0.16.0] - 2026-09-06
 
 ### Added
 
@@ -22,7 +22,7 @@ independently in `src/formats.rs` and summarized in
   transaction without rewriting unchanged pages or unchanged order metadata.
   A Direct source-table shape marker also forces older readers to reject the
   newer disposable schema. Query reads reject malformed UTF-8 rather than
-  silently substitute result text. App integration and certification remain pending.
+  silently substitute result text. Tine result-reader rollout follows separately.
 
 ## [0.15.0] - 2026-09-06
 

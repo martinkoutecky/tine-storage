@@ -125,7 +125,7 @@ an independently versioned package with an exact Tine pin:
 library, so it can only reach `pub` paths with default features. Its compiling
 is the assertion: the production API is self-sufficient for someone outside this
 crate.
-# Owned query snapshots (R1, unreleased)
+# Owned query snapshots
 
 `PhysicalProjectionQuerySnapshot` owns a read-only SQLite connection and pinned
 read transaction. `open_managed` checks acceptance sequence and frontier digest
