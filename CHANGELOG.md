@@ -18,7 +18,11 @@ independently in `src/formats.rs` and summarized in
   byte-estimate helpers, and Direct session page positions. Metadata is produced
   in the page transaction and explicitly removed on replacement, deletion and
   reset even with foreign keys disabled. No raw text duplication or authority
-  input format change. App integration and certification remain pending.
+  input format change. Ordered Direct inventories reconcile in the existing
+  transaction without rewriting unchanged pages or unchanged order metadata.
+  A Direct source-table shape marker also forces older readers to reject the
+  newer disposable schema. Query reads reject malformed UTF-8 rather than
+  silently substitute result text. App integration and certification remain pending.
 
 ## [0.15.0] - 2026-09-06
 

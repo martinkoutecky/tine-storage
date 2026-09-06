@@ -23,6 +23,7 @@ const SOURCE_REVISION_MAX_BYTES: usize = 4096;
 const SOURCE_REVISIONS_DDL: &str = "CREATE TABLE direct_source_revisions (
     page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16),
     revision TEXT NOT NULL CHECK (length(CAST(revision AS BLOB)) BETWEEN 1 AND 4096),
+    query_metadata_schema INTEGER NOT NULL DEFAULT 26 CHECK (query_metadata_schema = 26),
     FOREIGN KEY (page_id) REFERENCES pages(page_id) ON DELETE CASCADE
 ) STRICT";
 
@@ -93,10 +94,24 @@ impl PhysicalGraphProjectionDatabase {
         let columns = statement
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<Vec<_>, _>>()?;
-        if columns != ["page_id", "revision"] {
+        if columns != ["page_id", "revision", "query_metadata_schema"] {
             return Err(MaterializationError::Schema(format!(
-                "direct_source_revisions columns {columns:?} != [page_id, revision]"
+                "direct_source_revisions columns {columns:?} != [page_id, revision, query_metadata_schema]"
             )));
+        }
+        let schema_sql: String = self.connection.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type='table' AND name='direct_source_revisions'",
+            [],
+            |row| row.get(0),
+        )?;
+        if schema_sql.split_ascii_whitespace().collect::<Vec<_>>()
+            != SOURCE_REVISIONS_DDL
+                .split_ascii_whitespace()
+                .collect::<Vec<_>>()
+        {
+            return Err(MaterializationError::Schema(
+                "direct source revision metadata schema differs".into(),
+            ));
         }
         Ok(())
     }
@@ -128,7 +143,7 @@ impl PhysicalGraphProjectionDatabase {
         change: &PhysicalGraphProjectionChange,
         aliases: &[PhysicalAliasDeclaration],
     ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
-        self.apply_inner(change, None, aliases, None)
+        self.apply_inner(change, None, aliases, None, None)
     }
 
     /// Apply physical page facts and publish the exact caller-owned source
@@ -150,7 +165,21 @@ impl PhysicalGraphProjectionDatabase {
         revisions: &[PhysicalGraphProjectionSourceRevision],
         aliases: &[PhysicalAliasDeclaration],
     ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
-        self.apply_inner(change, Some(revisions), aliases, None)
+        self.apply_inner(change, Some(revisions), aliases, None, None)
+    }
+
+    /// Reconcile a complete ordered Direct inventory in the same page/source
+    /// transaction. Unchanged order is not rewritten. Unchanged page facts need
+    /// not appear in `change.replacements`. This keeps warm reopen independent
+    /// of document parsing and page reconstruction.
+    pub fn apply_with_source_revisions_aliases_and_page_order(
+        &mut self,
+        change: &PhysicalGraphProjectionChange,
+        revisions: &[PhysicalGraphProjectionSourceRevision],
+        aliases: &[PhysicalAliasDeclaration],
+        page_order: &[[u8; 16]],
+    ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
+        self.apply_inner(change, Some(revisions), aliases, None, Some(page_order))
     }
 
     /// Apply the complete current-state projection needed by both storage
@@ -166,7 +195,7 @@ impl PhysicalGraphProjectionDatabase {
         aliases: &[PhysicalAliasDeclaration],
         portable_paths: &[PhysicalPagePortablePathClaim],
     ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
-        self.apply_inner(change, Some(revisions), aliases, Some(portable_paths))
+        self.apply_inner(change, Some(revisions), aliases, Some(portable_paths), None)
     }
 
     fn apply_inner(
@@ -175,6 +204,7 @@ impl PhysicalGraphProjectionDatabase {
         revisions: Option<&[PhysicalGraphProjectionSourceRevision]>,
         aliases: &[PhysicalAliasDeclaration],
         portable_paths: Option<&[PhysicalPagePortablePathClaim]>,
+        page_order: Option<&[[u8; 16]]>,
     ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
         let replacement_ids = change
             .replacements
@@ -194,6 +224,33 @@ impl PhysicalGraphProjectionDatabase {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(order) = page_order {
+            let positions = order
+                .iter()
+                .enumerate()
+                .map(|(position, id)| (*id, position as u64))
+                .collect::<BTreeMap<_, _>>();
+            if positions.len() != order.len() {
+                return Err(MaterializationError::InvalidInput(
+                    "duplicate page in query inventory".into(),
+                ));
+            }
+            for page in &change.replacements {
+                if let Some(position) = page.query_page_order {
+                    if positions.get(&page.page_id) != Some(&position) {
+                        return Err(MaterializationError::InvalidInput(
+                            "page order differs from complete inventory".into(),
+                        ));
+                    }
+                }
+            }
+            // A changed inventory may permute occupied positions. Clear only
+            // its small order table before page writes; the final reconciliation
+            // below restores the complete order within this same transaction.
+            if !change.replacements.is_empty() || !change.deletions.is_empty() {
+                transaction.execute("DELETE FROM query_page_order", [])?;
+            }
+        }
         let instrumentation = sqlite_materialization::apply_graph_projection_rows(
             &transaction,
             &change.replacements,
@@ -238,6 +295,9 @@ impl PhysicalGraphProjectionDatabase {
                     )?;
                 }
             }
+        }
+        if let Some(order) = page_order {
+            reconcile_query_page_order(&transaction, order)?;
         }
         transaction.commit()?;
         Ok(instrumentation)
@@ -303,6 +363,47 @@ impl PhysicalGraphProjectionDatabase {
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(())
     }
+}
+
+fn reconcile_query_page_order(
+    connection: &Connection,
+    order: &[[u8; 16]],
+) -> Result<(), MaterializationError> {
+    let expected = order.iter().copied().collect::<BTreeSet<_>>();
+    let decode_id = |row: &rusqlite::Row<'_>| -> rusqlite::Result<[u8; 16]> {
+        row.get::<_, Vec<u8>>(0)?
+            .try_into()
+            .map_err(|_| rusqlite::Error::InvalidQuery)
+    };
+    let actual = connection
+        .prepare("SELECT page_id FROM pages")?
+        .query_map([], decode_id)?
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    if expected.len() != order.len() || expected != actual {
+        return Err(MaterializationError::InvalidInput(
+            "query inventory must exactly cover projected pages".into(),
+        ));
+    }
+    let existing = connection
+        .prepare("SELECT page_id, position FROM query_page_order ORDER BY position")?
+        .query_map([], |row| Ok((decode_id(row)?, row.get::<_, u64>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if existing.len() == order.len()
+        && existing.iter().zip(order).enumerate().all(
+            |(position, ((found_id, found_position), expected_id))| {
+                found_id == expected_id && *found_position == position as u64
+            },
+        )
+    {
+        return Ok(());
+    }
+    connection.execute("DELETE FROM query_page_order", [])?;
+    let mut insert = connection
+        .prepare_cached("INSERT INTO query_page_order (page_id, position) VALUES (?1, ?2)")?;
+    for (position, id) in order.iter().enumerate() {
+        insert.execute(rusqlite::params![id.as_slice(), position as i64])?;
+    }
+    Ok(())
 }
 
 fn validated_source_revisions(
@@ -452,9 +553,15 @@ impl PhysicalProjectionQueryReader {
                             PhysicalQueryValue::Integer(value)
                         }
                         rusqlite::types::ValueRef::Real(value) => PhysicalQueryValue::Real(value),
-                        rusqlite::types::ValueRef::Text(value) => {
-                            PhysicalQueryValue::Text(String::from_utf8_lossy(value).into_owned())
-                        }
+                        rusqlite::types::ValueRef::Text(value) => PhysicalQueryValue::Text(
+                            String::from_utf8(value.to_vec()).map_err(|error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    index,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            })?,
+                        ),
                         rusqlite::types::ValueRef::Blob(value) => {
                             PhysicalQueryValue::Blob(value.to_vec())
                         }
@@ -822,6 +929,17 @@ mod tests {
     }
 
     #[test]
+    fn owned_snapshot_rejects_malformed_text_without_substitution() {
+        let fixture = SnapshotFixture::new();
+        let mut snapshot = fixture.snapshot();
+        assert!(snapshot
+            .run_projection_query("SELECT CAST(x'80ff' AS TEXT)", &[])
+            .is_err());
+        assert!(snapshot.reader.is_none());
+        assert_eq!(fixture.checkpoint(), (0, 0, 0));
+    }
+
+    #[test]
     fn owned_snapshot_idle_cancellation_is_sticky_and_drop_releases_wal() {
         let fixture = SnapshotFixture::new();
         let mut snapshot = fixture.snapshot();
@@ -974,6 +1092,177 @@ mod tests {
                 property_atoms: Vec::new(),
             }],
         }
+    }
+
+    #[test]
+    fn ordered_inventory_reconciles_without_replacing_unchanged_pages() {
+        let path = std::env::temp_dir().join(format!(
+            "tine-order-reconcile-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.initialize_schema().unwrap();
+        let mut first = page(1, "TODO", "unchanged one");
+        let mut second = page(2, "DONE", "unchanged two");
+        first.query_page_order = None;
+        second.query_page_order = None;
+        database
+            .apply_with_source_revisions_aliases_and_page_order(
+                &PhysicalGraphProjectionChange {
+                    replacements: vec![first.clone(), second],
+                    deletions: vec![],
+                    reference_postings: vec![],
+                },
+                &[
+                    PhysicalGraphProjectionSourceRevision {
+                        page_id: [1; 16],
+                        revision: "one".into(),
+                    },
+                    PhysicalGraphProjectionSourceRevision {
+                        page_id: [2; 16],
+                        revision: "two".into(),
+                    },
+                ],
+                &[],
+                &[[1; 16], [2; 16]],
+            )
+            .unwrap();
+        let empty = PhysicalGraphProjectionChange {
+            replacements: vec![],
+            deletions: vec![],
+            reference_postings: vec![],
+        };
+        for table in [
+            "pages",
+            "blocks",
+            "page_text",
+            "block_text",
+            "query_block_results",
+        ] {
+            for operation in ["INSERT", "UPDATE", "DELETE"] {
+                database
+                    .connection
+                    .execute_batch(&format!(
+                        "CREATE TEMP TRIGGER no_{table}_{operation} BEFORE {operation} ON {table}
+                     BEGIN SELECT RAISE(ABORT, 'unchanged page facts were rewritten'); END;"
+                    ))
+                    .unwrap();
+            }
+        }
+        database
+            .apply_with_source_revisions_aliases_and_page_order(
+                &empty,
+                &[],
+                &[],
+                &[[2; 16], [1; 16]],
+            )
+            .unwrap();
+        let order = database
+            .connection
+            .prepare("SELECT page_id FROM query_page_order ORDER BY position")
+            .unwrap()
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(order, [vec![2; 16], vec![1; 16]]);
+        for operation in ["INSERT", "UPDATE", "DELETE"] {
+            database
+                .connection
+                .execute_batch(&format!(
+                "CREATE TEMP TRIGGER no_order_{operation} BEFORE {operation} ON query_page_order
+                 BEGIN SELECT RAISE(ABORT, 'unchanged order was rewritten'); END;"
+            ))
+                .unwrap();
+        }
+        database
+            .apply_with_source_revisions_aliases_and_page_order(
+                &empty,
+                &[],
+                &[],
+                &[[2; 16], [1; 16]],
+            )
+            .unwrap();
+        assert!(database
+            .apply_with_source_revisions_aliases_and_page_order(&empty, &[], &[], &[[1; 16]])
+            .is_err());
+        assert!(database
+            .apply_with_source_revisions_aliases_and_page_order(
+                &empty,
+                &[],
+                &[],
+                &[[1; 16], [1; 16]]
+            )
+            .is_err());
+        drop(database);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn incomplete_inventory_rolls_back_page_and_source_changes() {
+        let path = std::env::temp_dir().join(format!(
+            "tine-order-rollback-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.initialize_schema().unwrap();
+        let mut first = page(1, "TODO", "before");
+        first.query_page_order = None;
+        let revisions = [PhysicalGraphProjectionSourceRevision {
+            page_id: [1; 16],
+            revision: "before".into(),
+        }];
+        database
+            .apply_with_source_revisions_aliases_and_page_order(
+                &PhysicalGraphProjectionChange {
+                    replacements: vec![first.clone()],
+                    deletions: vec![],
+                    reference_postings: vec![],
+                },
+                &revisions,
+                &[],
+                &[[1; 16]],
+            )
+            .unwrap();
+        first.blocks[0].content = "after".into();
+        assert!(database
+            .apply_with_source_revisions_aliases_and_page_order(
+                &PhysicalGraphProjectionChange {
+                    replacements: vec![first],
+                    deletions: vec![],
+                    reference_postings: vec![]
+                },
+                &[PhysicalGraphProjectionSourceRevision {
+                    page_id: [1; 16],
+                    revision: "after".into()
+                }],
+                &[],
+                &[],
+            )
+            .is_err());
+        assert!(database
+            .source_delta(&revisions)
+            .unwrap()
+            .replacements
+            .is_empty());
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT content FROM block_text", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "before"
+        );
+        assert_eq!(
+            database
+                .connection
+                .query_row("SELECT count(*) FROM query_page_order", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(database);
+        let _ = std::fs::remove_file(path);
     }
 
     /// The statement seam's restriction is the ENGINE's, not a validator's.

@@ -26,6 +26,13 @@ on replacement/deletion/reset even with foreign keys disabled, and contain no
 serialized DTO or duplicate raw text. Producers must supply complete trees;
 preorder expands parent-local order with physical-ID ties. No authority input
 format changes. Older/newer disposable schemas are rejected and rebuilt.
+Direct `direct_source_revisions` includes `query_metadata_schema`, constrained to
+26. Its exact three-column shape and DDL are validated: old readers that only
+check known table shapes also reject this cache, rather than overlook the new
+tables. This marker carries no authority data or migration behavior.
+Full Direct inventory reconciliation updates only `query_page_order` when its
+order changes, atomically with any source/page deltas. An identical inventory
+performs no order writes; unchanged pages are not re-materialized.
 
 The schema also separates query rows from document text. `pages` stores identity,
 name and routing fields; `page_text`, keyed by `page_id`, stores `preamble`,
