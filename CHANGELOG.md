@@ -5,6 +5,16 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [Unreleased]
+
+### Added
+
+- Owned read-only query snapshots with in-transaction Managed frontier checks,
+  Direct acquisition guards, streaming bound-parameter reads, sticky cancellation
+  and SQLite interrupts. Selection and payload reads share one snapshot while
+  WAL writers continue. Errors, completion and drop release the read transaction.
+  This is the first R1 checkpoint; result metadata and app integration remain.
+
 ## [0.15.0] - 2026-09-06
 
 ### Changed

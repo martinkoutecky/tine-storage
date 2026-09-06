@@ -6,7 +6,10 @@
 //! the same page replacement/delete transaction.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::ControlFlow;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
@@ -394,36 +397,52 @@ impl PhysicalProjectionQueryReader {
         sql: &str,
         parameters: &[PhysicalQueryValue],
     ) -> Result<Vec<Vec<PhysicalQueryValue>>, MaterializationError> {
+        let mut rows = Vec::new();
+        self.visit_projection_query(sql, parameters, |row| {
+            rows.push(row.to_vec());
+            Ok(ControlFlow::Continue(()))
+        })?;
+        Ok(rows)
+    }
+
+    /// Visit one row at a time without retaining the complete result set.
+    /// A clean break finalizes the statement; a visitor error propagates.
+    pub fn visit_projection_query(
+        &self,
+        sql: &str,
+        parameters: &[PhysicalQueryValue],
+        mut visitor: impl FnMut(&[PhysicalQueryValue]) -> Result<ControlFlow<()>, MaterializationError>,
+    ) -> Result<(), MaterializationError> {
         let mut statement = self.connection.prepare_cached(sql)?;
         let columns = statement.column_count();
         let bound: Vec<&dyn rusqlite::ToSql> = parameters
             .iter()
             .map(|value| value as &dyn rusqlite::ToSql)
             .collect();
-        let rows = statement
-            .query_map(bound.as_slice(), |row| {
-                (0..columns)
-                    .map(|index| {
-                        Ok(match row.get_ref(index)? {
-                            rusqlite::types::ValueRef::Null => PhysicalQueryValue::Null,
-                            rusqlite::types::ValueRef::Integer(value) => {
-                                PhysicalQueryValue::Integer(value)
-                            }
-                            rusqlite::types::ValueRef::Real(value) => {
-                                PhysicalQueryValue::Real(value)
-                            }
-                            rusqlite::types::ValueRef::Text(value) => PhysicalQueryValue::Text(
-                                String::from_utf8_lossy(value).into_owned(),
-                            ),
-                            rusqlite::types::ValueRef::Blob(value) => {
-                                PhysicalQueryValue::Blob(value.to_vec())
-                            }
-                        })
+        let mut rows = statement.query(bound.as_slice())?;
+        while let Some(row) = rows.next()? {
+            let values = (0..columns)
+                .map(|index| {
+                    Ok(match row.get_ref(index)? {
+                        rusqlite::types::ValueRef::Null => PhysicalQueryValue::Null,
+                        rusqlite::types::ValueRef::Integer(value) => {
+                            PhysicalQueryValue::Integer(value)
+                        }
+                        rusqlite::types::ValueRef::Real(value) => PhysicalQueryValue::Real(value),
+                        rusqlite::types::ValueRef::Text(value) => {
+                            PhysicalQueryValue::Text(String::from_utf8_lossy(value).into_owned())
+                        }
+                        rusqlite::types::ValueRef::Blob(value) => {
+                            PhysicalQueryValue::Blob(value.to_vec())
+                        }
                     })
-                    .collect::<Result<Vec<_>, rusqlite::Error>>()
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+                })
+                .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+            if visitor(&values)?.is_break() {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// `EXPLAIN QUERY PLAN` for one statement, one `detail` string per step.
@@ -455,6 +474,164 @@ impl PhysicalProjectionQueryReader {
     }
 }
 
+/// Cancellation for one owned read snapshot. Cancellation is sticky, including
+/// between SQL statements. The owner must finish/drop the snapshot after its
+/// worker observes cancellation; callers drain workers before replacing files.
+#[derive(Clone)]
+pub struct PhysicalProjectionQueryCancellation {
+    cancelled: Arc<AtomicBool>,
+    interrupt: Arc<rusqlite::InterruptHandle>,
+}
+
+impl PhysicalProjectionQueryCancellation {
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.interrupt.interrupt();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+}
+
+/// An owned, pinned read transaction. It can move to a query worker without
+/// borrowing an actor's connection. No writable connection enters this API.
+/// Any query/visitor error closes the snapshot; successful consumers call
+/// `finish` or drop it when descriptor and payload reads are complete.
+pub struct PhysicalProjectionQuerySnapshot {
+    reader: Option<PhysicalProjectionQueryReader>,
+    cancellation: PhysicalProjectionQueryCancellation,
+}
+
+impl PhysicalProjectionQuerySnapshot {
+    fn begin(path: &Path) -> Result<Self, MaterializationError> {
+        let reader = PhysicalProjectionQueryReader::open(path)?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let progress_cancelled = Arc::clone(&cancelled);
+        reader.connection.progress_handler(
+            1000,
+            Some(move || progress_cancelled.load(Ordering::Acquire)),
+        );
+        let cancellation = PhysicalProjectionQueryCancellation {
+            cancelled,
+            interrupt: Arc::new(reader.connection.get_interrupt_handle()),
+        };
+        reader.connection.execute_batch("BEGIN DEFERRED")?;
+        Ok(Self {
+            reader: Some(reader),
+            cancellation,
+        })
+    }
+
+    /// Validate the accepted frontier from inside the same read transaction
+    /// that will serve every selection and payload statement.
+    pub fn open_managed(
+        path: &Path,
+        sequence: u64,
+        frontier_digest: crate::ContentDigest,
+    ) -> Result<Self, MaterializationError> {
+        let snapshot = Self::begin(path)?;
+        sqlite_materialization::ensure_stamp(
+            &snapshot.reader.as_ref().expect("new snapshot").connection,
+            sequence,
+            frontier_digest,
+        )?;
+        Ok(snapshot)
+    }
+
+    /// The owner checks its captured projection instance and ready generation
+    /// before and after SQLite establishes the read snapshot. Later ordinary
+    /// edits do not re-run this acquisition validator.
+    pub fn open_direct(
+        path: &Path,
+        mut validate: impl FnMut() -> Result<(), MaterializationError>,
+    ) -> Result<Self, MaterializationError> {
+        validate()?;
+        let snapshot = Self::begin(path)?;
+        // BEGIN DEFERRED alone does not establish a read snapshot. A real read
+        // (even an empty schema inventory) pins it before the second guard.
+        snapshot
+            .reader
+            .as_ref()
+            .expect("new snapshot")
+            .run_projection_query("SELECT rootpage FROM sqlite_schema LIMIT 1", &[])?;
+        validate()?;
+        Ok(snapshot)
+    }
+
+    pub fn cancellation(&self) -> PhysicalProjectionQueryCancellation {
+        self.cancellation.clone()
+    }
+
+    fn read<T>(
+        &mut self,
+        operation: impl FnOnce(&PhysicalProjectionQueryReader) -> Result<T, MaterializationError>,
+    ) -> Result<T, MaterializationError> {
+        let result = if self.cancellation.is_cancelled() {
+            Err(MaterializationError::Incomplete(
+                "query snapshot cancelled".into(),
+            ))
+        } else if let Some(reader) = self.reader.as_ref() {
+            operation(reader)
+        } else {
+            Err(MaterializationError::Incomplete(
+                "query snapshot closed".into(),
+            ))
+        };
+        // Also catch cancellation during a short statement or its row visitor,
+        // where SQLite may not execute enough VM steps to call the progress hook.
+        let result = if self.cancellation.is_cancelled() {
+            Err(MaterializationError::Incomplete(
+                "query snapshot cancelled".into(),
+            ))
+        } else {
+            result
+        };
+        if result.is_err() {
+            self.reader.take();
+        }
+        result
+    }
+
+    pub fn run_projection_query(
+        &mut self,
+        sql: &str,
+        parameters: &[PhysicalQueryValue],
+    ) -> Result<Vec<Vec<PhysicalQueryValue>>, MaterializationError> {
+        self.read(|reader| reader.run_projection_query(sql, parameters))
+    }
+
+    pub fn visit_projection_query(
+        &mut self,
+        sql: &str,
+        parameters: &[PhysicalQueryValue],
+        mut visitor: impl FnMut(&[PhysicalQueryValue]) -> Result<ControlFlow<()>, MaterializationError>,
+    ) -> Result<(), MaterializationError> {
+        let cancellation = self.cancellation.clone();
+        self.read(|reader| {
+            reader.visit_projection_query(sql, parameters, |row| {
+                if cancellation.is_cancelled() {
+                    return Err(MaterializationError::Incomplete(
+                        "query snapshot cancelled".into(),
+                    ));
+                }
+                visitor(row)
+            })
+        })
+    }
+
+    pub fn explain_query_plan(
+        &mut self,
+        sql: &str,
+        parameters: &[PhysicalQueryValue],
+    ) -> Result<Vec<String>, MaterializationError> {
+        self.read(|reader| reader.explain_query_plan(sql, parameters))
+    }
+
+    /// Release this transaction now. Dropping the snapshot has the same effect.
+    pub fn finish(self) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +644,212 @@ mod tests {
         PhysicalReferenceTarget, PhysicalTask,
     };
     use crate::ContentDigest;
+
+    struct SnapshotFixture {
+        writer: Connection,
+        path: std::path::PathBuf,
+    }
+
+    impl SnapshotFixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("tine-owned-read-{}.sqlite", uuid::Uuid::new_v4()));
+            let writer = Connection::open(&path).unwrap();
+            writer.busy_timeout(Duration::ZERO).unwrap();
+            writer
+                .execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                CREATE TABLE payload (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO payload VALUES (1, 'before');
+                CREATE TABLE materialization_stamp (singleton INTEGER PRIMARY KEY,
+                    acceptance_sequence INTEGER, frontier_root_digest BLOB);
+                INSERT INTO materialization_stamp VALUES (1, 7, zeroblob(32));",
+                )
+                .unwrap();
+            Self { writer, path }
+        }
+
+        fn snapshot(&self) -> PhysicalProjectionQuerySnapshot {
+            PhysicalProjectionQuerySnapshot::open_direct(&self.path, || Ok(())).unwrap()
+        }
+
+        fn checkpoint(&self) -> (i64, i64, i64) {
+            self.writer
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap()
+        }
+    }
+
+    impl Drop for SnapshotFixture {
+        fn drop(&mut self) {
+            // The owning connection is closed after this body; SQLite owns WAL
+            // sidecar cleanup. Best-effort fixture cleanup mirrors existing tests.
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    #[test]
+    fn owned_snapshot_keeps_selection_and_payload_coherent_while_writer_commits() {
+        let fixture = SnapshotFixture::new();
+        let mut snapshot = fixture.snapshot();
+        let ordinary = PhysicalProjectionQueryReader::open(&fixture.path).unwrap();
+        let sql = "SELECT value FROM payload WHERE id = ?1";
+        let params = [PhysicalQueryValue::Integer(1)];
+        let before = vec![vec![PhysicalQueryValue::Text("before".into())]];
+        assert_eq!(snapshot.run_projection_query(sql, &params).unwrap(), before);
+        fixture
+            .writer
+            .execute("UPDATE payload SET value='after'", [])
+            .unwrap();
+        // The old unpinned seam is the fail-before witness: it observes the
+        // later payload, even though selection happened at the earlier state.
+        assert_eq!(
+            ordinary.run_projection_query(sql, &params).unwrap(),
+            vec![vec![PhysicalQueryValue::Text("after".into())]]
+        );
+        assert_eq!(snapshot.run_projection_query(sql, &params).unwrap(), before);
+        assert!(!snapshot
+            .explain_query_plan(sql, &params)
+            .unwrap()
+            .is_empty());
+        assert_eq!(fixture.checkpoint().0, 1, "active reader retains WAL");
+        snapshot.finish();
+        assert_eq!(
+            fixture.checkpoint(),
+            (0, 0, 0),
+            "finished reader releases WAL"
+        );
+    }
+
+    #[test]
+    fn owned_snapshot_validates_direct_acquisition_and_managed_stamp() {
+        let fixture = SnapshotFixture::new();
+        let mut calls = 0;
+        let result = PhysicalProjectionQuerySnapshot::open_direct(&fixture.path, || {
+            calls += 1;
+            if calls == 2 {
+                Err(MaterializationError::Incomplete(
+                    "projection replaced".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 2);
+        assert_eq!(fixture.checkpoint(), (0, 0, 0));
+        let digest = ContentDigest::from_bytes([0; 32]);
+        assert!(PhysicalProjectionQuerySnapshot::open_managed(&fixture.path, 8, digest).is_err());
+        assert!(PhysicalProjectionQuerySnapshot::open_managed(
+            &fixture.path,
+            7,
+            ContentDigest::from_bytes([1; 32])
+        )
+        .is_err());
+        let mut snapshot =
+            PhysicalProjectionQuerySnapshot::open_managed(&fixture.path, 7, digest).unwrap();
+        fixture
+            .writer
+            .execute("UPDATE materialization_stamp SET acceptance_sequence=8", [])
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .run_projection_query("SELECT acceptance_sequence FROM materialization_stamp", &[])
+                .unwrap(),
+            vec![vec![PhysicalQueryValue::Integer(7)]]
+        );
+    }
+
+    #[test]
+    fn owned_snapshot_streams_stops_and_releases_on_visitor_or_sql_error() {
+        let fixture = SnapshotFixture::new();
+        let mut snapshot = fixture.snapshot();
+        let mut visits = 0;
+        snapshot
+            .visit_projection_query("SELECT 1 UNION ALL SELECT 2", &[], |_| {
+                visits += 1;
+                Ok(ControlFlow::Break(()))
+            })
+            .unwrap();
+        assert_eq!(visits, 1);
+        assert!(snapshot.run_projection_query("SELECT 1", &[]).is_ok());
+        assert!(snapshot
+            .visit_projection_query("SELECT 1", &[], |_| {
+                Err(MaterializationError::Corrupt("missing output row".into()))
+            })
+            .is_err());
+        assert!(snapshot.reader.is_none());
+        assert_eq!(fixture.checkpoint(), (0, 0, 0));
+        let mut snapshot = fixture.snapshot();
+        assert!(snapshot
+            .run_projection_query("DELETE FROM payload", &[])
+            .is_err());
+        assert!(snapshot.reader.is_none());
+        assert!(snapshot.run_projection_query("SELECT 1", &[]).is_err());
+    }
+
+    #[test]
+    fn owned_snapshot_idle_cancellation_is_sticky_and_drop_releases_wal() {
+        let fixture = SnapshotFixture::new();
+        let mut snapshot = fixture.snapshot();
+        let cancellation = snapshot.cancellation();
+        cancellation.cancel();
+        assert!(cancellation.is_cancelled());
+        assert!(snapshot.run_projection_query("SELECT 1", &[]).is_err());
+        assert!(snapshot.reader.is_none());
+        assert_eq!(fixture.checkpoint(), (0, 0, 0));
+        let snapshot = fixture.snapshot();
+        fixture
+            .writer
+            .execute("UPDATE payload SET value='later'", [])
+            .unwrap();
+        assert_eq!(fixture.checkpoint().0, 1);
+        drop(snapshot);
+        assert_eq!(fixture.checkpoint(), (0, 0, 0));
+        cancellation.cancel(); // A surviving interrupt handle is safe after close.
+    }
+
+    #[test]
+    fn owned_snapshot_cancels_active_sql_on_an_independent_worker() {
+        let fixture = SnapshotFixture::new();
+        let mut snapshot = fixture.snapshot();
+        let cancellation = snapshot.cancellation();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let signalled = AtomicBool::new(false);
+        snapshot
+            .reader
+            .as_ref()
+            .unwrap()
+            .connection
+            .create_scalar_function(
+                "signal_start",
+                0,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                move |_| {
+                    if !signalled.swap(true, Ordering::Relaxed) {
+                        started_tx.send(()).unwrap();
+                    }
+                    Ok(0_i64)
+                },
+            )
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            let result = snapshot.run_projection_query(
+                "WITH RECURSIVE numbers(x) AS (VALUES(1) UNION ALL
+                 SELECT x+1 FROM numbers WHERE x<1000000000)
+                 SELECT sum(x+signal_start()) FROM numbers",
+                &[],
+            );
+            assert!(result.is_err());
+            assert!(snapshot.reader.is_none());
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        cancellation.cancel();
+        worker.join().unwrap();
+        assert_eq!(fixture.checkpoint(), (0, 0, 0));
+    }
 
     fn page(page_id: u8, task: &str, content: &str) -> PhysicalPage {
         PhysicalPage {

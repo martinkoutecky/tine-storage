@@ -125,3 +125,22 @@ an independently versioned package with an exact Tine pin:
 library, so it can only reach `pub` paths with default features. Its compiling
 is the assertion: the production API is self-sufficient for someone outside this
 crate.
+# Owned query snapshots (R1, unreleased)
+
+`PhysicalProjectionQuerySnapshot` owns a read-only SQLite connection and pinned
+read transaction. `open_managed` checks acceptance sequence and frontier digest
+inside that transaction; `open_direct` calls the projection owner's instance/
+readiness validator before and after establishing it. Ordinary later edits do
+not invalidate a coherent snapshot. Query, explain and streaming visitor methods
+share the transaction and accept bound parameters. No connection is exposed.
+
+Acquire worker capacity before opening snapshots. A snapshot can move to a worker;
+keep selection/payload execution off the actor. Its cancellation handle combines
+a sticky flag, SQLite interrupt and progress checks. SQL/visitor errors release
+the connection; consumers finish or drop successful snapshots. Calling cancel
+signals the owner: graph replacement must also drain workers/handles, including
+idle cancelled jobs, before removing the projection. Do not infer bounded WAL
+bytes from bounded worker count; measure reader duration and retained WAL.
+
+This API is an unreleased part of the database-owned results packet. Result
+metadata and producer integration must be completed before the next certification.

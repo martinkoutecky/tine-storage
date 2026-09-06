@@ -58,7 +58,8 @@ pub mod sqlite {
     };
     pub use crate::sqlite_graph_projection::{
         PhysicalGraphProjectionDatabase, PhysicalGraphProjectionSourceDelta,
-        PhysicalGraphProjectionSourceRevision, PhysicalProjectionQueryReader, PhysicalQueryValue,
+        PhysicalGraphProjectionSourceRevision, PhysicalProjectionQueryCancellation,
+        PhysicalProjectionQueryReader, PhysicalProjectionQuerySnapshot, PhysicalQueryValue,
     };
     pub use crate::sqlite_materialization::{
         ApplyChangeInstrumentation, MaterializationError, PhysicalAliasDeclaration, PhysicalBlock,
