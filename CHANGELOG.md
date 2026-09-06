@@ -5,6 +5,16 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.15.0] - 2026-09-06
+
+### Changed
+
+- SQLite projection schema 25 keeps query/structural rows narrow and stores
+  document text in keyed `page_text` and `block_text` tables. Typed reads,
+  incremental replacements and both search indexes preserve their existing
+  semantics. Previous disposable projections rebuild through the existing app
+  lifecycle; no old-schema reader or migration is added.
+
 ## [0.14.0] - 2026-09-05
 
 ### Added

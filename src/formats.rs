@@ -714,7 +714,7 @@ mod tests {
         assert_eq!(LOCAL_JOURNAL_SEGMENT_V2_MAGIC, "TINEJNL2");
         assert_eq!(LOCAL_JOURNAL_FRONTIER_V2_MAGIC, "TINEFRT2");
         assert_eq!(SQLITE_APPLICATION_ID, 0x5449_4e45);
-        assert_eq!(SQLITE_SCHEMA_VERSION, 24);
+        assert_eq!(SQLITE_SCHEMA_VERSION, 25);
         assert_eq!(SEALED_ACCEPTED_INDEX_SCHEMA_VERSION, 2);
         assert_eq!(SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION, 2);
         assert_eq!(SEALED_ACCEPTED_STATUS_SCHEMA_VERSION, 2);

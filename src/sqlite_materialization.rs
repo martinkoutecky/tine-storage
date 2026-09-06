@@ -483,7 +483,11 @@ pub const PAGES_DDL: &str = "CREATE TABLE pages (
     name_key TEXT NOT NULL CHECK (length(CAST(name_key AS BLOB)) BETWEEN 1 AND 4194304),
     path TEXT NOT NULL CHECK (length(CAST(path AS BLOB)) BETWEEN 1 AND 4194304),
     text_kind INTEGER NOT NULL CHECK (text_kind IN (0, 1)),
-    journal_day INTEGER,
+    journal_day INTEGER
+) STRICT";
+const PAGE_TEXT_DDL: &str = "CREATE TABLE page_text (
+    page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16)
+        REFERENCES pages(page_id) ON DELETE CASCADE,
     preamble TEXT CHECK (preamble IS NULL OR length(CAST(preamble AS BLOB)) <= 16777216),
     searchable_text TEXT NOT NULL CHECK (length(CAST(searchable_text AS BLOB)) <= 4194304),
     normalized_searchable_text TEXT NOT NULL CHECK (
@@ -504,12 +508,6 @@ pub const BLOCKS_DDL: &str = "CREATE TABLE blocks (
         parent_block_id IS NULL OR length(parent_block_id) = 16
     ),
     order_key TEXT NOT NULL CHECK (length(CAST(order_key AS BLOB)) BETWEEN 1 AND 4194304),
-    content TEXT NOT NULL CHECK (length(CAST(content AS BLOB)) <= 4194304),
-    searchable_text TEXT NOT NULL CHECK (length(CAST(searchable_text AS BLOB)) <= 4194304),
-    normalized_searchable_text TEXT NOT NULL CHECK (
-        length(CAST(normalized_searchable_text AS BLOB)) <= 4194304
-    ),
-    query_visible TEXT NOT NULL CHECK (length(CAST(query_visible AS BLOB)) <= 4194304),
     query_visible_folded TEXT NOT NULL CHECK (
         length(CAST(query_visible_folded AS BLOB)) <= 4194304
     ),
@@ -526,6 +524,16 @@ pub const BLOCKS_DDL: &str = "CREATE TABLE blocks (
         (logseq_uuid IS NULL AND logseq_identity_origin IS NULL)
         OR (logseq_uuid IS NOT NULL AND logseq_identity_origin IS NOT NULL)
     )
+) STRICT";
+const BLOCK_TEXT_DDL: &str = "CREATE TABLE block_text (
+    block_id BLOB PRIMARY KEY CHECK (length(block_id) = 16)
+        REFERENCES blocks(block_id) ON DELETE CASCADE,
+    content TEXT NOT NULL CHECK (length(CAST(content AS BLOB)) <= 4194304),
+    searchable_text TEXT NOT NULL CHECK (length(CAST(searchable_text AS BLOB)) <= 4194304),
+    normalized_searchable_text TEXT NOT NULL CHECK (
+        length(CAST(normalized_searchable_text AS BLOB)) <= 4194304
+    ),
+    query_visible TEXT NOT NULL CHECK (length(CAST(query_visible AS BLOB)) <= 4194304)
 ) STRICT";
 pub const BLOCK_HOME_CLAIMS_DDL: &str = "CREATE TABLE block_home_claims (
     block_id BLOB NOT NULL CHECK (length(block_id) = 16),
@@ -853,7 +861,7 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 34] = [
     ("property_atoms_page_idx", PROPERTY_ATOMS_PAGE_INDEX_DDL),
 ];
 
-const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 22] = [
+const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 24] = [
     (
         "materialization_stamp",
         &[
@@ -910,9 +918,25 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 22] = [
             "path",
             "text_kind",
             "journal_day",
+        ],
+    ),
+    (
+        "page_text",
+        &[
+            "page_id",
             "preamble",
             "searchable_text",
             "normalized_searchable_text",
+        ],
+    ),
+    (
+        "block_text",
+        &[
+            "block_id",
+            "content",
+            "searchable_text",
+            "normalized_searchable_text",
+            "query_visible",
         ],
     ),
     (
@@ -927,10 +951,6 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 22] = [
             "home_document_id",
             "parent_block_id",
             "order_key",
-            "content",
-            "searchable_text",
-            "normalized_searchable_text",
-            "query_visible",
             "query_visible_folded",
             "heading_level",
             "collapsed",
@@ -1070,7 +1090,7 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 22] = [
     ),
 ];
 
-const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 57] = [
+const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 59] = [
     ("table", "materialization_stamp", MATERIALIZATION_STAMP_DDL),
     (
         "table",
@@ -1089,12 +1109,14 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 57] = [
         REFERENCE_ALIAS_BINDINGS_DDL,
     ),
     ("table", "pages", PAGES_DDL),
+    ("table", "page_text", PAGE_TEXT_DDL),
     (
         "table",
         "page_portable_path_claims",
         PAGE_PORTABLE_PATH_CLAIMS_DDL,
     ),
     ("table", "blocks", BLOCKS_DDL),
+    ("table", "block_text", BLOCK_TEXT_DDL),
     ("table", "block_home_claims", BLOCK_HOME_CLAIMS_DDL),
     (
         "table",
@@ -1311,8 +1333,10 @@ pub(crate) fn initialize_graph_projection_schema(
          {REFERENCE_ALIAS_DECLARATIONS_DDL};
          {REFERENCE_ALIAS_BINDINGS_DDL};
          {PAGES_DDL};
+         {PAGE_TEXT_DDL};
          {PAGE_PORTABLE_PATH_CLAIMS_DDL};
          {BLOCKS_DDL};
+         {BLOCK_TEXT_DDL};
          {BLOCK_HOME_CLAIMS_DDL};
          {PAGE_NAME_IDENTITY_RECORDS_DDL};
          {PORTABLE_PATH_IDENTITY_RECORDS_DDL};
@@ -1900,12 +1924,12 @@ pub(crate) fn advance_search_index_build(
                  SELECT 0 AS entity_type, page_id AS entity_id, page_id,
                         searchable_text AS text,
                         normalized_searchable_text AS normalized_text
-                 FROM pages
+                 FROM pages LEFT JOIN page_text USING (page_id)
                  UNION ALL
                  SELECT 1 AS entity_type, block_id AS entity_id, page_id,
                         searchable_text AS text,
                         normalized_searchable_text AS normalized_text
-                 FROM blocks
+                 FROM blocks LEFT JOIN block_text USING (block_id)
              )
              WHERE entity_type > ?1 OR (entity_type = ?1 AND entity_id > ?2)
              ORDER BY entity_type, entity_id LIMIT ?3"
@@ -1914,12 +1938,12 @@ pub(crate) fn advance_search_index_build(
                  SELECT 0 AS entity_type, page_id AS entity_id, page_id,
                         searchable_text AS text,
                         normalized_searchable_text AS normalized_text
-                 FROM pages
+                 FROM pages LEFT JOIN page_text USING (page_id)
                  UNION ALL
                  SELECT 1 AS entity_type, block_id AS entity_id, page_id,
                         searchable_text AS text,
                         normalized_searchable_text AS normalized_text
-                 FROM blocks
+                 FROM blocks LEFT JOIN block_text USING (block_id)
              ) ORDER BY entity_type, entity_id LIMIT ?1"
         };
         let mut statement = transaction.prepare(sql)?;
@@ -2885,8 +2909,10 @@ pub(crate) fn reset_graph_projection_rows(
          DELETE FROM reference_alias_bindings;
          DELETE FROM reference_alias_declarations;
          DELETE FROM reference_postings;
+         DELETE FROM block_text;
          DELETE FROM blocks;
          DELETE FROM page_portable_path_claims;
+         DELETE FROM page_text;
          DELETE FROM pages;",
     )?;
     Ok(())
@@ -2985,6 +3011,14 @@ fn delete_page(
             "DELETE FROM tasks WHERE page_id = ?1",
             params![page.as_slice()],
         )?);
+    instrumentation.owned_rows += transaction.execute(
+        "DELETE FROM block_text WHERE block_id IN (SELECT block_id FROM blocks WHERE page_id = ?1)",
+        params![page.as_slice()],
+    )?;
+    instrumentation.owned_rows += transaction.execute(
+        "DELETE FROM page_text WHERE page_id = ?1",
+        params![page.as_slice()],
+    )?;
     instrumentation.owned_rows = instrumentation
         .owned_rows
         .saturating_add(transaction.execute(
@@ -3020,8 +3054,8 @@ fn insert_page(transaction: &Connection, page: &PhysicalPage) -> Result<(), Mate
         transaction,
         "INSERT INTO pages (
              page_id, home_document_id, name, name_key, path, text_kind,
-             journal_day, preamble, searchable_text, normalized_searchable_text
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             journal_day
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             page_id.as_slice(),
             page.home_document_id.as_slice(),
@@ -3030,6 +3064,14 @@ fn insert_page(transaction: &Connection, page: &PhysicalPage) -> Result<(), Mate
             page.path.as_str(),
             page.text_kind,
             page.journal_day,
+        ],
+    )?;
+    execute_cached(
+        transaction,
+        "INSERT INTO page_text (page_id, preamble, searchable_text, normalized_searchable_text)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            page_id.as_slice(),
             &page.preamble,
             &page.searchable_text,
             &page.normalized_searchable_text,
@@ -3084,26 +3126,28 @@ fn insert_block(
         transaction,
         "INSERT INTO blocks (
              block_id, page_id, home_document_id, parent_block_id, order_key,
-             content, searchable_text, normalized_searchable_text,
-             query_visible, query_visible_folded, heading_level,
+             query_visible_folded, heading_level,
              collapsed, logseq_uuid, logseq_identity_origin
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             block.block_id.as_slice(),
             page_id.as_slice(),
             block.home_document_id.as_slice(),
             block.parent.map(|parent| parent.to_vec()),
             &block.order,
-            &block.content,
-            &block.searchable_text,
-            &block.normalized_searchable_text,
-            &block.query_visible,
             &block.query_visible_folded,
             block.heading_level.map(i64::from),
             i64::from(block.collapsed),
             logseq_uuid,
             origin,
         ],
+    )?;
+    execute_cached(
+        transaction,
+        "INSERT INTO block_text (block_id, content, searchable_text, normalized_searchable_text, query_visible)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![block.block_id.as_slice(), &block.content, &block.searchable_text,
+            &block.normalized_searchable_text, &block.query_visible],
     )?;
     let owner = PhysicalEntityId::Block(block.block_id);
     insert_references(transaction, owner, page_id, &block.references)?;
@@ -3166,7 +3210,7 @@ fn load_fts_source_rows(
         let page = transaction
             .query_row(
                 "SELECT searchable_text, normalized_searchable_text
-                 FROM pages WHERE page_id = ?1",
+                 FROM pages LEFT JOIN page_text USING (page_id) WHERE page_id = ?1",
                 params![page_id.as_slice()],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -3183,7 +3227,7 @@ fn load_fts_source_rows(
         }
         let mut statement = transaction.prepare(
             "SELECT block_id, searchable_text, normalized_searchable_text
-             FROM blocks WHERE page_id = ?1 ORDER BY block_id",
+             FROM blocks LEFT JOIN block_text USING (block_id) WHERE page_id = ?1 ORDER BY block_id",
         )?;
         let blocks = statement.query_map(params![page_id.as_slice()], |row| {
             Ok((
@@ -4007,21 +4051,23 @@ fn allow_any_page_header(_path: &str, _kind: i64) -> Result<(), MaterializationE
 
 const TASK_CANDIDATE_BLOCKS_SQL: &str =
     "SELECT t.block_id, t.page_id, b.parent_block_id, b.order_key,
-            b.content, b.logseq_uuid, p.name, p.path, p.text_kind
+            bt.content, b.logseq_uuid, p.name, p.path, p.text_kind
      FROM tasks AS t
      JOIN blocks AS b
        ON b.block_id = t.block_id AND b.page_id = t.page_id
      JOIN pages AS p ON p.page_id = t.page_id
+     LEFT JOIN block_text AS bt ON bt.block_id = b.block_id
      WHERE t.marker = ?1
      ORDER BY t.page_id, t.block_id LIMIT ?2";
 
 const TASK_CANDIDATE_BLOCKS_AFTER_SQL: &str =
     "SELECT t.block_id, t.page_id, b.parent_block_id, b.order_key,
-            b.content, b.logseq_uuid, p.name, p.path, p.text_kind
+            bt.content, b.logseq_uuid, p.name, p.path, p.text_kind
      FROM tasks AS t
      JOIN blocks AS b
        ON b.block_id = t.block_id AND b.page_id = t.page_id
      JOIN pages AS p ON p.page_id = t.page_id
+     LEFT JOIN block_text AS bt ON bt.block_id = b.block_id
      WHERE t.marker = ?1
        AND (t.page_id, t.block_id) > (?2, ?3)
      ORDER BY t.page_id, t.block_id LIMIT ?4";
@@ -4106,7 +4152,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
             .query_row(
                 "SELECT page_id, home_document_id, name, name_key, path,
                         text_kind, preamble, searchable_text
-                 FROM pages WHERE page_id = ?1",
+                 FROM pages LEFT JOIN page_text USING (page_id) WHERE page_id = ?1",
                 params![page_id.as_slice()],
                 |row| page_row_with_header_validation(row, &mut validate_header),
             )
@@ -4145,7 +4191,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         let mut statement = self.connection.prepare(
             "SELECT page_id, home_document_id, name, name_key, path,
                     text_kind, preamble, searchable_text
-             FROM pages
+             FROM pages LEFT JOIN page_text USING (page_id)
              WHERE home_document_id = ?1
              ORDER BY page_id LIMIT ?2",
         )?;
@@ -4168,7 +4214,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
                 "SELECT block_id, page_id, home_document_id, parent_block_id,
                         order_key, content, searchable_text, heading_level,
                         collapsed, logseq_uuid, logseq_identity_origin
-                 FROM blocks WHERE block_id = ?1",
+                 FROM blocks LEFT JOIN block_text USING (block_id) WHERE block_id = ?1",
                 params![block_id.as_slice()],
                 block_row,
             )
@@ -4375,7 +4421,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
             "SELECT block_id, page_id, home_document_id, parent_block_id,
                     order_key, content, searchable_text, heading_level,
                     collapsed, logseq_uuid, logseq_identity_origin
-             FROM blocks WHERE logseq_uuid = ?1
+             FROM blocks LEFT JOIN block_text USING (block_id) WHERE logseq_uuid = ?1
              ORDER BY block_id LIMIT ?2",
         )?;
         let rows = statement.query_map(params![logseq_uuid.as_slice(), limit], block_row)?;
@@ -4453,7 +4499,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         let mut statement = self.connection.prepare(
             "SELECT page_id, home_document_id, name, name_key, path,
                     text_kind, preamble, searchable_text
-             FROM pages
+             FROM pages LEFT JOIN page_text USING (page_id)
              WHERE name_key = ?1 AND text_kind = ?2
              ORDER BY page_id LIMIT ?3",
         )?;
@@ -4513,9 +4559,10 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         let limit = checked_limit(limit)?;
         let mut statement = self.connection.prepare(
             "SELECT p.page_id, p.home_document_id, p.name, p.name_key, p.path,
-                    p.text_kind, p.preamble, p.searchable_text
+                    p.text_kind, pt.preamble, pt.searchable_text
              FROM page_portable_path_claims AS c
              JOIN pages AS p ON p.page_id = c.page_id
+             LEFT JOIN page_text AS pt ON pt.page_id = p.page_id
              WHERE c.portable_path_key = ?1
              ORDER BY p.page_id LIMIT ?2",
         )?;
@@ -4551,13 +4598,13 @@ impl<'a> SqliteGraphProjectionRead<'a> {
             Some(kind) => (
                 "SELECT page_id, home_document_id, name, name_key, path,
                         text_kind, preamble, searchable_text
-                 FROM pages WHERE text_kind = ?1 ORDER BY path, page_id LIMIT ?2",
+                 FROM pages LEFT JOIN page_text USING (page_id) WHERE text_kind = ?1 ORDER BY path, page_id LIMIT ?2",
                 vec![kind.into(), limit.into()],
             ),
             None => (
                 "SELECT page_id, home_document_id, name, name_key, path,
                         text_kind, preamble, searchable_text
-                 FROM pages ORDER BY path, page_id LIMIT ?1",
+                 FROM pages LEFT JOIN page_text USING (page_id) ORDER BY path, page_id LIMIT ?1",
                 vec![limit.into()],
             ),
         };
@@ -4659,13 +4706,13 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         }
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = match (after_path, after_page_id) {
             (None, None) => (
-                "SELECT page_id, name, name_key, path, text_kind, preamble
-                     FROM pages ORDER BY path, page_id LIMIT ?1",
+                "SELECT page_id, name, name_key, path, text_kind, preamble, page_text.page_id
+                     FROM pages LEFT JOIN page_text USING (page_id) ORDER BY path, page_id LIMIT ?1",
                 vec![limit.into()],
             ),
             (Some(path), Some(page_id)) => (
-                "SELECT page_id, name, name_key, path, text_kind, preamble
-                     FROM pages
+                "SELECT page_id, name, name_key, path, text_kind, preamble, page_text.page_id
+                     FROM pages LEFT JOIN page_text USING (page_id)
                      WHERE path > ?1 OR (path = ?1 AND page_id > ?2)
                      ORDER BY path, page_id LIMIT ?3",
                 vec![
@@ -4696,8 +4743,8 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         let limit = checked_limit(limit)?;
         checked_query_text(name_key)?;
         let mut statement = self.connection.prepare(
-            "SELECT page_id, name, name_key, path, text_kind, preamble
-             FROM pages WHERE name_key = ?1
+            "SELECT page_id, name, name_key, path, text_kind, preamble, page_text.page_id
+             FROM pages LEFT JOIN page_text USING (page_id) WHERE name_key = ?1
              ORDER BY page_id LIMIT ?2",
         )?;
         let rows = statement.query_map(params![name_key, limit], |row| {
@@ -4743,15 +4790,15 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = match (after_name_key, after_page_id)
         {
             (None, None) => (
-                "SELECT page_id, name, name_key, path, text_kind, preamble
-                     FROM pages
+                "SELECT page_id, name, name_key, path, text_kind, preamble, page_text.page_id
+                     FROM pages LEFT JOIN page_text USING (page_id)
                      WHERE name_key >= ?1 AND name_key < ?2
                      ORDER BY name_key, page_id LIMIT ?3",
                 vec![lower.into(), upper.into(), limit.into()],
             ),
             (Some(after), Some(page_id)) => (
-                "SELECT page_id, name, name_key, path, text_kind, preamble
-                     FROM pages
+                "SELECT page_id, name, name_key, path, text_kind, preamble, page_text.page_id
+                     FROM pages LEFT JOIN page_text USING (page_id)
                      WHERE name_key >= ?1 AND name_key < ?2
                        AND (name_key > ?3 OR (name_key = ?3 AND page_id > ?4))
                      ORDER BY name_key, page_id LIMIT ?5",
@@ -4895,7 +4942,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         let sql = format!(
             "SELECT page_id, home_document_id, name, name_key, path,
                     text_kind, preamble, searchable_text
-             FROM pages WHERE {column} = ?1 ORDER BY page_id LIMIT ?2"
+             FROM pages LEFT JOIN page_text USING (page_id) WHERE {column} = ?1 ORDER BY page_id LIMIT ?2"
         );
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement.query_map(params![value, limit], |row| {
@@ -4917,7 +4964,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
             "SELECT block_id, page_id, home_document_id, parent_block_id,
                     order_key, content, searchable_text, heading_level,
                     collapsed, logseq_uuid, logseq_identity_origin
-             FROM blocks WHERE page_id = ?1
+             FROM blocks LEFT JOIN block_text USING (block_id) WHERE page_id = ?1
              ORDER BY order_key, block_id LIMIT ?2",
         )?;
         let rows = statement.query_map(params![page_id.as_slice(), limit], block_row)?;
@@ -5873,6 +5920,10 @@ fn navigation_page_row_with_header_validation(
     row: &rusqlite::Row<'_>,
     validate_header: &mut impl FnMut(&str, i64) -> Result<(), MaterializationError>,
 ) -> rusqlite::Result<Result<PhysicalNavigationPageRow, MaterializationError>> {
+    // Preamble may legitimately be NULL. The keyed payload row may not be
+    // missing: distinguish cache damage from an empty preamble without reading
+    // the large search text solely to check presence.
+    let _payload_id: Vec<u8> = row.get(6)?;
     let page_id: Vec<u8> = row.get(0)?;
     let path: String = row.get(3)?;
     let kind: i64 = row.get(4)?;
@@ -6423,6 +6474,185 @@ mod tests {
         connection
     }
 
+    #[test]
+    fn query_tables_keep_text_payload_out_of_structural_rows() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
+        let original = page(1, "Mixed Case");
+        apply_and_commit(
+            &mut connection,
+            &change(1, vec![original.clone()], Vec::new()),
+            1,
+            digest(b"frontier-1"),
+        );
+        for (table, excluded) in [
+            (
+                "pages",
+                vec!["preamble", "searchable_text", "normalized_searchable_text"],
+            ),
+            (
+                "blocks",
+                vec![
+                    "content",
+                    "searchable_text",
+                    "normalized_searchable_text",
+                    "query_visible",
+                ],
+            ),
+        ] {
+            let mut statement = connection
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap();
+            let columns: Vec<String> = statement
+                .query_map([], |row| row.get(1))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect();
+            for column in excluded {
+                assert!(
+                    !columns.iter().any(|name| name == column),
+                    "{table}.{column} widens structural rows"
+                );
+            }
+        }
+        let read = SqliteGraphProjectionRead::new(&connection);
+        let loaded_page = read.page(original.page_id).unwrap().unwrap();
+        assert_eq!(loaded_page.preamble, original.preamble);
+        assert_eq!(loaded_page.searchable_text, original.searchable_text);
+        let loaded_block = read.block(original.blocks[0].block_id).unwrap().unwrap();
+        assert_eq!(loaded_block.content, original.blocks[0].content);
+        assert_eq!(
+            loaded_block.searchable_text,
+            original.blocks[0].searchable_text
+        );
+        let folded: String = connection
+            .query_row(
+                "SELECT query_visible_folded FROM blocks WHERE block_id = ?1",
+                params![original.blocks[0].block_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(folded, original.blocks[0].query_visible_folded);
+    }
+
+    #[test]
+    fn text_payload_follows_replacement_rollback_delete_and_reset() {
+        for foreign_keys in [false, true] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            connection
+                .pragma_update(None, "foreign_keys", foreign_keys)
+                .unwrap();
+            initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
+            let first = page(1, "First");
+            let second = page(2, "Second");
+            apply_and_commit(
+                &mut connection,
+                &change(1, vec![first.clone(), second.clone()], Vec::new()),
+                1,
+                digest(b"f1"),
+            );
+            let mut replacement = first.clone();
+            replacement.preamble = None;
+            replacement.blocks[0].content = "Replacement".into();
+            {
+                let transaction = connection.transaction().unwrap();
+                delete_page(&transaction, first.page_id, true, &BTreeSet::new()).unwrap();
+                insert_page(&transaction, &replacement).unwrap();
+                transaction.rollback().unwrap();
+            }
+            assert_eq!(
+                SqliteGraphProjectionRead::new(&connection)
+                    .block(first.blocks[0].block_id)
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                first.blocks[0].content
+            );
+            apply_and_commit(
+                &mut connection,
+                &change(2, vec![replacement.clone()], vec![second.page_id]),
+                2,
+                digest(b"f2"),
+            );
+            let read = SqliteGraphProjectionRead::new(&connection);
+            assert_eq!(
+                read.block(first.blocks[0].block_id)
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                "Replacement"
+            );
+            assert_eq!(read.page(first.page_id).unwrap().unwrap().preamble, None);
+            assert_eq!(
+                read.navigation_pages_by_name_key_with_header_validation(
+                    &first.name_key,
+                    10,
+                    allow_any_page_header
+                )
+                .unwrap()[0]
+                    .preamble,
+                None
+            );
+            for table in ["page_text", "block_text"] {
+                let count: i64 = connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 1);
+            }
+            reset_graph_projection_rows(&connection).unwrap();
+            for table in ["page_text", "block_text", "pages", "blocks"] {
+                let count: i64 = connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn missing_text_payload_is_an_error_not_a_missing_entity() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
+        let original = page(1, "Original");
+        apply_and_commit(
+            &mut connection,
+            &change(1, vec![original.clone()], Vec::new()),
+            1,
+            digest(b"f1"),
+        );
+        connection.execute("DELETE FROM block_text", []).unwrap();
+        let read = SqliteGraphProjectionRead::new(&connection);
+        assert!(read.block(original.blocks[0].block_id).is_err());
+        assert!(read.blocks_on_page(original.page_id, 10).is_err());
+        connection.execute("DELETE FROM page_text", []).unwrap();
+        let read = SqliteGraphProjectionRead::new(&connection);
+        assert!(read.page(original.page_id).is_err());
+        assert!(read
+            .navigation_pages_by_name_key_with_header_validation(
+                &original.name_key,
+                10,
+                allow_any_page_header
+            )
+            .is_err());
+        // Lightweight inventory remains usable without touching text payload.
+        assert_eq!(
+            read.page_inventory_after_with_header_validation(
+                None,
+                None,
+                None,
+                10,
+                allow_any_page_header
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+    }
+
     fn lazy_terminal_database(page: PhysicalPage) -> Connection {
         lazy_terminal_database_with_pages(vec![page])
     }
@@ -6776,9 +7006,15 @@ mod tests {
             .execute(
                 "INSERT INTO pages (
                      page_id, home_document_id, name, name_key, path, text_kind,
-                     preamble, searchable_text, normalized_searchable_text
-                 ) VALUES (?1, ?2, 'Page', 'page', 'pages/page.md', 0, NULL, '', '')",
+                     journal_day
+                 ) VALUES (?1, ?2, 'Page', 'page', 'pages/page.md', 0, NULL)",
                 params![id(10).as_slice(), id(20).as_slice()],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO page_text VALUES (?1, NULL, '', '')",
+                params![id(10).as_slice()],
             )
             .unwrap();
         for value in [1_u128, 2] {
@@ -6786,16 +7022,21 @@ mod tests {
                 .execute(
                     "INSERT INTO blocks (
                          block_id, page_id, home_document_id, parent_block_id,
-                         order_key, content, searchable_text, normalized_searchable_text,
-                         query_visible, query_visible_folded,
+                         order_key, query_visible_folded,
                          heading_level, collapsed, logseq_uuid, logseq_identity_origin
-                     ) VALUES (?1, ?2, ?3, NULL, 'a', '', '', '', '', '', NULL, 0, ?4, 0)",
+                     ) VALUES (?1, ?2, ?3, NULL, 'a', '', NULL, 0, ?4, 0)",
                     params![
                         id(value).as_slice(),
                         id(10).as_slice(),
                         id(20).as_slice(),
                         id(30).as_slice(),
                     ],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO block_text VALUES (?1, '', '', '', '')",
+                    params![id(value).as_slice()],
                 )
                 .unwrap();
         }
