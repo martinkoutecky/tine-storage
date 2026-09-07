@@ -5,6 +5,17 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.17.0] - 2026-09-07
+
+### Added
+
+- `SealedAcceptedIndexWriter::remove_map` removes a live authenticated-map entry
+  with path copying and the existing canonical priority order. Historical roots
+  remain readable; absent-key removal publishes no nodes. Search and subtree-join
+  paths bound work independently of retained history. This supplies active-roster
+  retirement without a second map implementation in Tine. Persistent formats and
+  existing APIs are unchanged.
+
 ## [0.16.0] - 2026-09-06
 
 ### Added

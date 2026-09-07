@@ -418,3 +418,55 @@ fn the_api_surface_is_enumerable_by_a_consumer() {
         "no test-support seams recorded; a consumer cannot tell them from production API"
     );
 }
+
+#[test]
+fn persistent_map_removal_is_available_without_test_support() {
+    use std::collections::BTreeMap;
+    use tine_storage::sealed_accepted_index::{
+        AuthenticatedMapRootV1, SealedAcceptedIndexError, SealedAcceptedIndexObjectStore,
+        SealedAcceptedIndexReader, SealedAcceptedIndexWriter, SealedAcceptedObjectKind,
+    };
+    #[derive(Default)]
+    struct MapObjects(BTreeMap<ContentDigest, Vec<u8>>);
+    impl SealedAcceptedIndexObjectStore for MapObjects {
+        fn read_sealed_accepted_object(
+            &self,
+            kind: SealedAcceptedObjectKind,
+            address: ContentDigest,
+        ) -> Result<Option<Vec<u8>>, SealedAcceptedIndexError> {
+            assert_eq!(kind, SealedAcceptedObjectKind::MapNode);
+            Ok(self.0.get(&address).cloned())
+        }
+        fn publish_sealed_accepted_object(
+            &mut self,
+            kind: SealedAcceptedObjectKind,
+            address: ContentDigest,
+            bytes: &[u8],
+        ) -> Result<(), SealedAcceptedIndexError> {
+            assert_eq!(kind, SealedAcceptedObjectKind::MapNode);
+            self.0.insert(address, bytes.to_vec());
+            Ok(())
+        }
+    }
+    let mut store = MapObjects::default();
+    let value = ContentDigest::of(b"retained logical record");
+    let root = SealedAcceptedIndexWriter::new(&mut store)
+        .upsert_map(AuthenticatedMapRootV1::empty(), [1; 16], value)
+        .unwrap();
+    let removed = SealedAcceptedIndexWriter::new(&mut store)
+        .remove_map(root, [1; 16])
+        .unwrap();
+    assert_eq!(removed, AuthenticatedMapRootV1::empty());
+    assert_eq!(
+        SealedAcceptedIndexReader::new(&store)
+            .map_value(root, [1; 16])
+            .unwrap(),
+        Some(value)
+    );
+    assert_eq!(
+        SealedAcceptedIndexReader::new(&store)
+            .map_value(removed, [1; 16])
+            .unwrap(),
+        None
+    );
+}

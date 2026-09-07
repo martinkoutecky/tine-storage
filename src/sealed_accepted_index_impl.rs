@@ -1046,6 +1046,35 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexWriter<'a, St
         })
     }
 
+    /// Remove one key by path copying, preserving every previous root.
+    ///
+    /// An absent key returns the identical root without publishing nodes. A
+    /// present key joins its two subtrees using the existing deterministic
+    /// priority order, yielding exactly the canonical root of the remaining
+    /// entries. Only the search/join paths are read or rewritten; no historical
+    /// objects are deleted by this operation. The caller owns root publication
+    /// and retirement of unreachable physical objects.
+    pub fn remove_map(
+        &mut self,
+        root: AuthenticatedMapRootV1,
+        key: [u8; 16],
+    ) -> Result<AuthenticatedMapRootV1, SealedAcceptedIndexError> {
+        validate_map_root(root)?;
+        let (link, removed) = self.remove_map_child(root.root, key, 0)?;
+        if !removed {
+            return Ok(root);
+        }
+        let next = AuthenticatedMapRootV1 {
+            count: root
+                .count
+                .checked_sub(1)
+                .ok_or_else(|| corrupt("map removal underflow"))?,
+            root: link,
+        };
+        validate_map_root(next)?;
+        Ok(next)
+    }
+
     pub fn append_sequence(
         &mut self,
         root: AcceptedSequenceRootV2,
@@ -1172,6 +1201,65 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexWriter<'a, St
             }
         }
         Ok((self.publish_map_node(&node)?, inserted))
+    }
+
+    fn remove_map_child(
+        &mut self,
+        current: Option<AuthenticatedMapLinkV1>,
+        key: [u8; 16],
+        depth: usize,
+    ) -> Result<(Option<AuthenticatedMapLinkV1>, bool), SealedAcceptedIndexError> {
+        ensure_index_depth(depth)?;
+        let Some(current) = current else {
+            return Ok((None, false));
+        };
+        let mut node = self.read_map_node(current)?;
+        let removed = match key.cmp(&node.key) {
+            Ordering::Equal => {
+                return Ok((
+                    self.join_map_children(node.left, node.right, depth + 1)?,
+                    true,
+                ));
+            }
+            Ordering::Less => {
+                let (left, removed) = self.remove_map_child(node.left, key, depth + 1)?;
+                node.left = left;
+                removed
+            }
+            Ordering::Greater => {
+                let (right, removed) = self.remove_map_child(node.right, key, depth + 1)?;
+                node.right = right;
+                removed
+            }
+        };
+        if !removed {
+            return Ok((Some(current), false));
+        }
+        Ok((Some(self.publish_map_node(&node)?), true))
+    }
+
+    fn join_map_children(
+        &mut self,
+        left: Option<AuthenticatedMapLinkV1>,
+        right: Option<AuthenticatedMapLinkV1>,
+        depth: usize,
+    ) -> Result<Option<AuthenticatedMapLinkV1>, SealedAcceptedIndexError> {
+        ensure_index_depth(depth)?;
+        let (Some(left), Some(right)) = (left, right) else {
+            return Ok(left.or(right));
+        };
+        if left.key >= right.key {
+            return Err(corrupt("map join children are not ordered"));
+        }
+        let mut node;
+        if authenticated_map_priority_order(left.key, right.key).is_lt() {
+            node = self.read_map_node(left)?;
+            node.right = self.join_map_children(node.right, Some(right), depth + 1)?;
+        } else {
+            node = self.read_map_node(right)?;
+            node.left = self.join_map_children(Some(left), node.left, depth + 1)?;
+        }
+        Ok(Some(self.publish_map_node(&node)?))
     }
 
     fn rotate_map_right(
@@ -1484,6 +1572,9 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct MemoryStore {
+        reads: std::cell::Cell<usize>,
+        publications: usize,
+        fail_publication: Option<usize>,
         objects: Vec<(SealedAcceptedObjectKind, ContentDigest, Vec<u8>)>,
     }
 
@@ -1493,6 +1584,7 @@ mod tests {
             kind: SealedAcceptedObjectKind,
             address: ContentDigest,
         ) -> Result<Option<Vec<u8>>, SealedAcceptedIndexError> {
+            self.reads.set(self.reads.get() + 1);
             Ok(self
                 .objects
                 .iter()
@@ -1508,6 +1600,12 @@ mod tests {
             address: ContentDigest,
             bytes: &[u8],
         ) -> Result<(), SealedAcceptedIndexError> {
+            self.publications += 1;
+            if self.fail_publication == Some(self.publications) {
+                return Err(SealedAcceptedIndexError::Store(
+                    "injected publication failure".into(),
+                ));
+            }
             if let Some((_, _, existing)) =
                 self.objects
                     .iter()
@@ -1623,6 +1721,196 @@ mod tests {
             }
             assert_eq!(reader.map_value(root, [0xff; 16]).unwrap(), None);
         }
+    }
+
+    #[test]
+    fn persistent_map_removal_matches_canonical_rebuild_and_preserves_old_roots() {
+        let entries: Vec<_> = (0..97u128)
+            .map(|i| (i.to_be_bytes(), digest(i as u8)))
+            .collect();
+        for reverse in [false, true] {
+            let mut store = MemoryStore::default();
+            let mut root = AuthenticatedMapRootV1::empty();
+            for (key, value) in &entries {
+                root = SealedAcceptedIndexWriter::new(&mut store)
+                    .upsert_map(root, *key, *value)
+                    .unwrap();
+            }
+            let original = root;
+            let mut remaining = entries.clone();
+            for step in 0..entries.len() {
+                // Alternating ends and middle exercise leaf, one-child and
+                // two-child removal independently of priority/hash order.
+                let index = if reverse {
+                    remaining.len() / 2
+                } else {
+                    step % remaining.len()
+                };
+                let (key, _) = remaining.remove(index);
+                root = SealedAcceptedIndexWriter::new(&mut store)
+                    .remove_map(root, key)
+                    .unwrap();
+                assert_eq!(root, authenticated_map_root(&remaining).unwrap());
+                let reader = SealedAcceptedIndexReader::new(&store);
+                assert_eq!(reader.map_value(root, key).unwrap(), None);
+                assert_eq!(
+                    reader.map_value(original, key).unwrap(),
+                    entries
+                        .iter()
+                        .find(|(prior, _)| *prior == key)
+                        .map(|(_, value)| *value)
+                );
+            }
+            assert_eq!(root, AuthenticatedMapRootV1::empty());
+            let published = store.objects.len();
+            assert_eq!(
+                SealedAcceptedIndexWriter::new(&mut store)
+                    .remove_map(root, [0xff; 16])
+                    .unwrap(),
+                root
+            );
+            assert_eq!(store.objects.len(), published);
+        }
+    }
+
+    #[test]
+    fn persistent_map_mixed_churn_has_no_tombstones_or_absent_key_writes() {
+        let mut store = MemoryStore::default();
+        let mut root = AuthenticatedMapRootV1::empty();
+        let mut expected = std::collections::BTreeMap::new();
+        let mut random = 12345u64;
+        for step in 0..1024 {
+            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let key = u128::from((random >> 16) % 128).to_be_bytes();
+            if step % 3 == 0 {
+                let absent = expected.remove(&key).is_none();
+                let writes_before = store.objects.len();
+                let prior = root;
+                root = SealedAcceptedIndexWriter::new(&mut store)
+                    .remove_map(root, key)
+                    .unwrap();
+                if absent {
+                    assert_eq!(root, prior);
+                    assert_eq!(store.objects.len(), writes_before);
+                }
+            } else {
+                let value = digest(step as u8);
+                expected.insert(key, value);
+                root = SealedAcceptedIndexWriter::new(&mut store)
+                    .upsert_map(root, key, value)
+                    .unwrap();
+            }
+            let entries: Vec<_> = expected.iter().map(|(key, value)| (*key, *value)).collect();
+            assert_eq!(root, authenticated_map_root(&entries).unwrap());
+        }
+    }
+
+    #[test]
+    fn persistent_map_removal_reads_paths_not_retained_history() {
+        let mut store = MemoryStore::default();
+        let mut root = AuthenticatedMapRootV1::empty();
+        for key in 0..1024u128 {
+            root = SealedAcceptedIndexWriter::new(&mut store)
+                .upsert_map(root, key.to_be_bytes(), digest(key as u8))
+                .unwrap();
+        }
+        // Retain many old roots' nodes. The operation may touch current paths,
+        // but must never enumerate the historical object store or live roster.
+        for key in 1024..1280u128 {
+            let transient = SealedAcceptedIndexWriter::new(&mut store)
+                .upsert_map(root, key.to_be_bytes(), digest(0xaa))
+                .unwrap();
+            assert_eq!(
+                SealedAcceptedIndexWriter::new(&mut store)
+                    .remove_map(transient, key.to_be_bytes())
+                    .unwrap(),
+                root
+            );
+        }
+        store.reads.set(0);
+        store.publications = 0;
+        let removed_key = root.root.unwrap().key; // exercises the subtree join
+        let next = SealedAcceptedIndexWriter::new(&mut store)
+            .remove_map(root, removed_key)
+            .unwrap();
+        assert_eq!(next.count, 1023);
+        assert!(store.reads.get() < 64, "{} point reads", store.reads.get());
+        assert!(
+            store.publications < 64,
+            "{} node writes",
+            store.publications
+        );
+        store.reads.set(0);
+        store.publications = 0;
+        assert_eq!(
+            SealedAcceptedIndexWriter::new(&mut store)
+                .remove_map(next, [0xff; 16])
+                .unwrap(),
+            next
+        );
+        assert!(store.reads.get() < 64);
+        assert_eq!(store.publications, 0);
+    }
+
+    #[test]
+    fn persistent_map_removal_publication_failure_keeps_the_old_root_retryable() {
+        let mut store = MemoryStore::default();
+        let entries: Vec<_> = (0..128u128)
+            .map(|key| (key.to_be_bytes(), digest(key as u8)))
+            .collect();
+        let mut root = AuthenticatedMapRootV1::empty();
+        for (key, value) in &entries {
+            root = SealedAcceptedIndexWriter::new(&mut store)
+                .upsert_map(root, *key, *value)
+                .unwrap();
+        }
+        let key = root.root.unwrap().key;
+        let mut successful = store.clone();
+        successful.publications = 0;
+        let expected = SealedAcceptedIndexWriter::new(&mut successful)
+            .remove_map(root, key)
+            .unwrap();
+        assert!(successful.publications > 1);
+        for failure in 1..=successful.publications {
+            let mut interrupted = store.clone();
+            interrupted.publications = 0;
+            interrupted.fail_publication = Some(failure);
+            assert!(SealedAcceptedIndexWriter::new(&mut interrupted)
+                .remove_map(root, key)
+                .is_err());
+            for (old_key, value) in &entries {
+                assert_eq!(
+                    SealedAcceptedIndexReader::new(&interrupted)
+                        .map_value(root, *old_key)
+                        .unwrap(),
+                    Some(*value)
+                );
+            }
+            interrupted.fail_publication = None;
+            assert_eq!(
+                SealedAcceptedIndexWriter::new(&mut interrupted)
+                    .remove_map(root, key)
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_map_removal_rejects_missing_or_corrupt_search_nodes() {
+        let mut store = MemoryStore::default();
+        let root = SealedAcceptedIndexWriter::new(&mut store)
+            .upsert_map(AuthenticatedMapRootV1::empty(), [1; 16], digest(1))
+            .unwrap();
+        let mut missing = MemoryStore::default();
+        assert!(matches!(
+            SealedAcceptedIndexWriter::new(&mut missing).remove_map(root, [1; 16]),
+            Err(SealedAcceptedIndexError::Missing { .. })
+        ));
+        store.objects[0].2[0] ^= 1;
+        assert!(SealedAcceptedIndexWriter::new(&mut store)
+            .remove_map(root, [1; 16])
+            .is_err());
     }
 
     #[test]
