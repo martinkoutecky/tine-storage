@@ -22,7 +22,10 @@ use crate::sqlite_materialization::{
 };
 #[cfg(any(test, feature = "test-support"))]
 use crate::sqlite_materialization::{ApplyChangeInstrumentation, PhysicalMaterializationChange};
-use crate::{sealed_accepted_index_impl::SealedAcceptedIndexRead, ContentDigest};
+use crate::{
+    sealed_accepted_index_impl::{AuthenticatedMapKey, SealedAcceptedIndexRead},
+    ContentDigest,
+};
 
 /// Prepared-statement cache size for the writable connection.
 const PREPARED_STATEMENT_CACHE_STATEMENTS: usize = 64;
@@ -262,9 +265,9 @@ impl PhysicalSqliteDatabase {
     pub fn frontier_document(
         &self,
         root: &PhysicalFrontierRoot,
-        document_id: [u8; 16],
+        document_key: AuthenticatedMapKey,
     ) -> Result<Option<Vec<u8>>, FrontierError> {
-        sqlite_frontier::frontier_document(&self.connection, root, document_id)
+        sqlite_frontier::frontier_document(&self.connection, root, document_key)
     }
 
     pub fn read_frontier_documents(

@@ -1,7 +1,7 @@
 //! Physical authenticated accepted-prefix storage for the disposable SQLite projection.
 //!
-//! This module deliberately knows only fixed-width identifiers, digests, counters, and
-//! canonical bytes supplied by the domain owner. It owns the SQLite representation and the
+//! This module deliberately knows only bounded canonical key bytes supplied by the domain
+//! owner, digests, counters, and canonical payload bytes. It owns the SQLite representation and the
 //! single transaction that advances accepted history, authenticated indexes, materialized rows,
 //! and the terminal frontier row.
 
@@ -13,8 +13,9 @@ use rusqlite::{params, Connection, OptionalExtension as _, Transaction, Transact
 
 use crate::sealed_accepted_index_impl::{
     accepted_causal_record_digest, authenticated_map_empty_digest, authenticated_map_node_digest,
-    authenticated_map_priority_order, causal_clock_counter_digest, AuthenticatedMapLinkV1,
-    SealedAcceptedCausalRecordV2, SealedAcceptedIndexError, SealedAcceptedIndexRead,
+    authenticated_map_priority_order, causal_clock_counter_digest, AuthenticatedMapKey,
+    AuthenticatedMapLinkV1, SealedAcceptedCausalRecordV2, SealedAcceptedIndexError,
+    SealedAcceptedIndexRead, MAX_AUTHENTICATED_MAP_KEY_BYTES,
 };
 use crate::sqlite_materialization::{
     self, ApplyChangeInstrumentation, MaterializationError, PhysicalMaterializationChange,
@@ -22,7 +23,7 @@ use crate::sqlite_materialization::{
 use crate::ContentDigest;
 
 pub const SQLITE_APPLICATION_ID: u32 = 0x5449_4e45;
-pub const SQLITE_SCHEMA_VERSION: u32 = 26;
+pub const SQLITE_SCHEMA_VERSION: u32 = 27;
 const MAX_AUTHENTICATED_MAP_DEPTH: usize = 256;
 
 pub const META_DDL: &str = "CREATE TABLE meta (
@@ -41,8 +42,12 @@ pub const FRONTIER_DDL: &str = "CREATE TABLE frontier (
     frontier_root_digest BLOB NOT NULL CHECK (length(frontier_root_digest) = 32),
     applied_batch_count INTEGER NOT NULL CHECK (applied_batch_count >= 0)
 ) STRICT";
+/// The document-map key bound is written literally into the DDL below, which
+/// SQLite compares as canonical SQL text. Keep the two in step.
+const _: () = assert!(MAX_AUTHENTICATED_MAP_KEY_BYTES == 48);
+
 pub const FRONTIER_DOCUMENTS_DDL: &str = "CREATE TABLE frontier_documents (
-    document_id BLOB PRIMARY KEY CHECK (length(document_id) = 16),
+    document_id BLOB PRIMARY KEY CHECK (length(document_id) BETWEEN 1 AND 48),
     dependencies BLOB NOT NULL,
     dependencies_digest BLOB NOT NULL CHECK (length(dependencies_digest) = 32),
     left_document_id BLOB,
@@ -51,9 +56,9 @@ pub const FRONTIER_DOCUMENTS_DDL: &str = "CREATE TABLE frontier_documents (
     right_digest BLOB,
     node_digest BLOB NOT NULL CHECK (length(node_digest) = 32),
     CHECK ((left_document_id IS NULL AND left_digest IS NULL)
-        OR (length(left_document_id) = 16 AND length(left_digest) = 32)),
+        OR (length(left_document_id) BETWEEN 1 AND 48 AND length(left_digest) = 32)),
     CHECK ((right_document_id IS NULL AND right_digest IS NULL)
-        OR (length(right_document_id) = 16 AND length(right_digest) = 32))
+        OR (length(right_document_id) BETWEEN 1 AND 48 AND length(right_digest) = 32))
 ) STRICT";
 pub const CAUSAL_CLOCK_NODES_DDL: &str = "CREATE TABLE causal_clock_nodes (
     node_digest BLOB PRIMARY KEY CHECK (length(node_digest) = 32),
@@ -358,7 +363,9 @@ pub struct PhysicalFrontierRoot {
     pub canonical_bytes: Vec<u8>,
     pub acceptance_sequence: u64,
     pub document_count: u64,
-    pub document_map_root_key: Option<[u8; 16]>,
+    /// Full document-map key bytes. Document identity is domain-owned and
+    /// variable-width; batch identity below stays a fixed 16-byte UUID.
+    pub document_map_root_key: Option<AuthenticatedMapKey>,
     pub document_map_root_digest: ContentDigest,
     pub batch_map_root_key: Option<[u8; 16]>,
     pub batch_map_root_digest: ContentDigest,
@@ -411,7 +418,7 @@ pub struct PhysicalCheckpointFrontierRoot {
     pub document_count: u64,
     pub document_overlay_count: u64,
     pub retained_bytes_total: u64,
-    pub document_map_root_key: Option<[u8; 16]>,
+    pub document_map_root_key: Option<AuthenticatedMapKey>,
     pub document_map_root_digest: ContentDigest,
     pub batch_map_root_key: Option<[u8; 16]>,
     pub batch_map_root_digest: ContentDigest,
@@ -434,7 +441,8 @@ impl PhysicalCheckpointFrontierRoot {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalFrontierDocument {
-    pub document_id: [u8; 16],
+    /// The domain owner's complete, lossless document key bytes.
+    pub document_key: AuthenticatedMapKey,
     pub canonical_bytes: Vec<u8>,
 }
 
@@ -1329,9 +1337,23 @@ fn decode_id(bytes: &[u8], what: &str) -> Result<[u8; 16], FrontierError> {
         .map_err(|_| FrontierError::Corrupt(format!("invalid {what} length")))
 }
 
+fn decode_key(bytes: &[u8], what: &str) -> Result<AuthenticatedMapKey, FrontierError> {
+    AuthenticatedMapKey::new(bytes)
+        .map_err(|_| FrontierError::Corrupt(format!("invalid {what} length")))
+}
+
+/// Recover a fixed-width identity from a general authenticated-map key.
+///
+/// The batch, status and causal maps keep 16-byte UUID identities; only the
+/// document map is variable-width. A shared node that reaches one of those maps
+/// with a wider key is corrupt, not a wider identity.
+fn key_as_id(key: AuthenticatedMapKey, what: &str) -> Result<[u8; 16], FrontierError> {
+    decode_id(key.as_slice(), what)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct MapLink {
-    key: [u8; 16],
+    key: AuthenticatedMapKey,
     digest: ContentDigest,
 }
 
@@ -1352,7 +1374,11 @@ fn accepted_batch_causal_record_digest(
     )
 }
 
-fn valid_map_children(key: [u8; 16], left: Option<&MapLink>, right: Option<&MapLink>) -> bool {
+fn valid_map_children(
+    key: AuthenticatedMapKey,
+    left: Option<&MapLink>,
+    right: Option<&MapLink>,
+) -> bool {
     left.is_none_or(|child| {
         child.key < key && authenticated_map_priority_order(key, child.key).is_lt()
     }) && right.is_none_or(|child| {
@@ -1367,7 +1393,7 @@ fn decode_map_link(
     match (key, digest) {
         (None, None) => Ok(None),
         (Some(key), Some(digest)) => Ok(Some(MapLink {
-            key: decode_id(&key, "authenticated map key")?,
+            key: decode_key(&key, "authenticated map key")?,
             digest: decode_digest(&digest)?,
         })),
         _ => Err(FrontierError::Corrupt(
@@ -1441,16 +1467,17 @@ fn load_clock_node(
         left,
         right,
     };
+    let peer_key = AuthenticatedMapKey::from(peer);
     let computed = authenticated_map_node_digest(
-        peer,
+        peer_key,
         value_digest,
         node.left.as_ref().map(|child| (child.key, child.digest)),
         node.right.as_ref().map(|child| (child.key, child.digest)),
     );
-    if expected.key != peer
+    if expected.key != peer_key
         || counter == 0
         || value_digest != causal_clock_counter_digest(peer, counter)
-        || !valid_map_children(peer, node.left.as_ref(), node.right.as_ref())
+        || !valid_map_children(peer_key, node.left.as_ref(), node.right.as_ref())
         || computed != expected.digest
     {
         return Err(FrontierError::Corrupt(
@@ -1503,14 +1530,15 @@ fn load_hot_batch_map_node(
         left: decode_map_link(stored.2, stored.3)?,
         right: decode_map_link(stored.4, stored.5)?,
     };
+    let batch_key = AuthenticatedMapKey::from(batch_id);
     let computed = authenticated_map_node_digest(
-        batch_id,
+        batch_key,
         node.value_digest,
         node.left.as_ref().map(|child| (child.key, child.digest)),
         node.right.as_ref().map(|child| (child.key, child.digest)),
     );
-    if expected.key != batch_id
-        || !valid_map_children(batch_id, node.left.as_ref(), node.right.as_ref())
+    if expected.key != batch_key
+        || !valid_map_children(batch_key, node.left.as_ref(), node.right.as_ref())
         || computed != expected.digest
     {
         return Err(FrontierError::Corrupt(
@@ -1534,7 +1562,7 @@ fn batch_map_value(
         ));
     };
     let mut current = Some(MapLink {
-        key,
+        key: key.into(),
         digest: root.batch_map_root_digest,
     });
     let mut depth = 0;
@@ -1591,7 +1619,7 @@ fn load_composite_batch_map_node(
         digest: expected.digest,
     })?;
     Ok(BatchMapNode {
-        batch_id: sealed.key,
+        batch_id: key_as_id(sealed.key, "sealed accepted-batch key")?,
         value_digest: sealed.value_digest,
         left: sealed.left.map(|child| MapLink {
             key: child.key,
@@ -1615,7 +1643,7 @@ fn batch_map_value_checkpoint(
         return Ok(None);
     };
     let mut current = Some(MapLink {
-        key,
+        key: key.into(),
         digest: root.batch_map_root_digest,
     });
     let mut depth = 0;
@@ -1709,7 +1737,7 @@ fn authenticated_batch_record(
     validate_stored_batch_physical(&record)?;
     let peer = decode_id(&record.causal_peer_id, "causal peer ID")?;
     let clock_root = MapLink {
-        key: decode_id(&record.causal_clock_root_key, "causal clock root key")?,
+        key: decode_id(&record.causal_clock_root_key, "causal clock root key")?.into(),
         digest: decode_digest(&record.causal_clock_root_digest)?,
     };
     if causal_clock_lookup(connection, Some(clock_root), peer)?
@@ -1767,7 +1795,7 @@ impl CheckpointAuthenticatedBatchRecord {
         match self {
             Self::Hot(record) => {
                 let clock = MapLink {
-                    key: decode_id(&record.causal_clock_root_key, "causal clock root key")?,
+                    key: decode_id(&record.causal_clock_root_key, "causal clock root key")?.into(),
                     digest: decode_digest(&record.causal_clock_root_digest)?,
                 };
                 causal_clock_lookup(connection, Some(clock), peer)
@@ -1904,7 +1932,7 @@ pub fn batch_descends_from(
     let counter = u64::try_from(ancestor.causal_counter)
         .map_err(|_| FrontierError::Corrupt("stored causal counter is invalid".into()))?;
     let clock = MapLink {
-        key: decode_id(&descendant.causal_clock_root_key, "causal clock root key")?,
+        key: decode_id(&descendant.causal_clock_root_key, "causal clock root key")?.into(),
         digest: decode_digest(&descendant.causal_clock_root_digest)?,
     };
     Ok(causal_clock_lookup(connection, Some(clock), peer)?.is_some_and(|found| found >= counter))
@@ -1912,7 +1940,7 @@ pub fn batch_descends_from(
 
 #[derive(Clone)]
 struct FrontierMapNode {
-    document_id: [u8; 16],
+    document_key: AuthenticatedMapKey,
     encoded: Vec<u8>,
     value_digest: ContentDigest,
     left: Option<MapLink>,
@@ -1923,7 +1951,7 @@ struct FrontierMapNode {
 impl FrontierMapNode {
     fn recompute_digest(&self) -> ContentDigest {
         authenticated_map_node_digest(
-            self.document_id,
+            self.document_key,
             self.value_digest,
             self.left.as_ref().map(|child| (child.key, child.digest)),
             self.right.as_ref().map(|child| (child.key, child.digest)),
@@ -1932,7 +1960,7 @@ impl FrontierMapNode {
 
     fn as_link(&self) -> MapLink {
         MapLink {
-            key: self.document_id,
+            key: self.document_key,
             digest: self.node_digest,
         }
     }
@@ -1940,7 +1968,7 @@ impl FrontierMapNode {
 
 fn load_frontier_map_node(
     connection: &Connection,
-    document_id: [u8; 16],
+    document_key: AuthenticatedMapKey,
     expected_digest: Option<ContentDigest>,
 ) -> Result<Option<FrontierMapNode>, FrontierError> {
     type StoredRow = (
@@ -1957,7 +1985,7 @@ fn load_frontier_map_node(
             "SELECT dependencies, dependencies_digest, left_document_id, left_digest,
                 right_document_id, right_digest, node_digest
          FROM frontier_documents WHERE document_id = ?1",
-            [document_id.as_slice()],
+            [document_key.as_slice()],
             |row| {
                 Ok((
                     row.get(0)?,
@@ -1979,21 +2007,22 @@ fn load_frontier_map_node(
     let value_digest = decode_digest(&value_digest)?;
     if value_digest != ContentDigest::of(&encoded) {
         return Err(FrontierError::Corrupt(format!(
-            "frontier document {} digest mismatch",
-            HexId(&document_id)
+            "frontier document {document_key} digest mismatch"
         )));
     }
     let left = decode_map_link(left_id, left_digest)?;
     let right = decode_map_link(right_id, right_digest)?;
-    if left.as_ref().is_some_and(|child| child.key >= document_id)
-        || right.as_ref().is_some_and(|child| child.key <= document_id)
+    if left.as_ref().is_some_and(|child| child.key >= document_key)
+        || right
+            .as_ref()
+            .is_some_and(|child| child.key <= document_key)
     {
         return Err(FrontierError::Corrupt(
             "frontier map child ordering is invalid".into(),
         ));
     }
     let mut node = FrontierMapNode {
-        document_id,
+        document_key,
         encoded,
         value_digest,
         left,
@@ -2004,8 +2033,7 @@ fn load_frontier_map_node(
     if node.node_digest != computed || expected_digest.is_some_and(|expected| expected != computed)
     {
         return Err(FrontierError::Corrupt(format!(
-            "frontier document {} is not authenticated by its map root",
-            HexId(&document_id)
+            "frontier document {document_key} is not authenticated by its map root"
         )));
     }
     node.node_digest = computed;
@@ -2015,7 +2043,7 @@ fn load_frontier_map_node(
 pub fn frontier_document(
     connection: &Connection,
     root: &PhysicalFrontierRoot,
-    document_id: [u8; 16],
+    document_key: AuthenticatedMapKey,
 ) -> Result<Option<Vec<u8>>, FrontierError> {
     let mut current = match root.document_map_root_key {
         Some(key) => Some(MapLink {
@@ -2034,10 +2062,10 @@ pub fn frontier_document(
             load_frontier_map_node(connection, link.key, Some(link.digest))?.ok_or_else(|| {
                 FrontierError::Corrupt(format!(
                     "authenticated frontier node {} is missing",
-                    HexId(&link.key)
+                    link.key
                 ))
             })?;
-        match document_id.cmp(&node.document_id) {
+        match document_key.cmp(&node.document_key) {
             Ordering::Equal => return Ok(Some(node.encoded)),
             Ordering::Less => current = node.left,
             Ordering::Greater => current = node.right,
@@ -2069,21 +2097,21 @@ pub fn read_frontier_documents(
             load_frontier_map_node(connection, link.key, Some(link.digest))?.ok_or_else(|| {
                 FrontierError::Corrupt(format!(
                     "authenticated frontier node {} is missing",
-                    HexId(&link.key)
+                    link.key
                 ))
             })?;
         if let Some(right) = node.right.clone() {
             pending.push(right);
         }
         documents.push(PhysicalFrontierDocument {
-            document_id: node.document_id,
+            document_key: node.document_key,
             canonical_bytes: node.encoded,
         });
         if let Some(left) = node.left {
             pending.push(left);
         }
     }
-    documents.sort_unstable_by_key(|document| document.document_id);
+    documents.sort_unstable_by_key(|document| document.document_key);
     // This is the authenticated SQLite overlay. Its row count equals the
     // logical total only for a frontier without an external genesis baseline.
     Ok(documents)
@@ -2112,7 +2140,7 @@ fn store_frontier_map_node(
              right_digest = excluded.right_digest,
              node_digest = excluded.node_digest",
         params![
-            node.document_id.as_slice(),
+            node.document_key.as_slice(),
             &node.encoded,
             node.value_digest.as_bytes().as_slice(),
             node.left.as_ref().map(|child| child.key.as_slice()),
@@ -2139,7 +2167,7 @@ fn upsert_frontier_map(
     let Some(root) = root else {
         let value_digest = ContentDigest::of(&document.canonical_bytes);
         let mut node = FrontierMapNode {
-            document_id: document.document_id,
+            document_key: document.document_key,
             encoded: document.canonical_bytes.clone(),
             value_digest,
             left: None,
@@ -2154,11 +2182,11 @@ fn upsert_frontier_map(
         load_frontier_map_node(transaction, root.key, Some(root.digest))?.ok_or_else(|| {
             FrontierError::Corrupt(format!(
                 "authenticated frontier node {} is missing",
-                HexId(&root.key)
+                root.key
             ))
         })?;
     let inserted;
-    match document.document_id.cmp(&node.document_id) {
+    match document.document_key.cmp(&node.document_key) {
         Ordering::Equal => {
             node.encoded = document.canonical_bytes.clone();
             node.value_digest = ContentDigest::of(&node.encoded);
@@ -2170,7 +2198,7 @@ fn upsert_frontier_map(
             node.left = Some(left);
             inserted = was_inserted;
             if node.left.as_ref().is_some_and(|left| {
-                authenticated_map_priority_order(left.key, node.document_id).is_lt()
+                authenticated_map_priority_order(left.key, node.document_key).is_lt()
             }) {
                 return Ok((rotate_frontier_right(transaction, node)?, inserted));
             }
@@ -2181,7 +2209,7 @@ fn upsert_frontier_map(
             node.right = Some(right);
             inserted = was_inserted;
             if node.right.as_ref().is_some_and(|right| {
-                authenticated_map_priority_order(right.key, node.document_id).is_lt()
+                authenticated_map_priority_order(right.key, node.document_key).is_lt()
             }) {
                 return Ok((rotate_frontier_left(transaction, node)?, inserted));
             }
@@ -2298,7 +2326,7 @@ fn seed_terminal_frontier_documents_candidate_with_policy(
     }
     if documents
         .windows(2)
-        .any(|pair| pair[0].document_id >= pair[1].document_id)
+        .any(|pair| pair[0].document_key >= pair[1].document_key)
     {
         return Err(FrontierError::InvalidInput(
             "terminal frontier documents are not sorted unique".into(),
@@ -2332,8 +2360,8 @@ fn seed_terminal_frontier_documents_candidate_with_policy(
         let mut last = None;
         while stack.last().is_some_and(|prior| {
             authenticated_map_priority_order(
-                documents[index].document_id,
-                documents[*prior].document_id,
+                documents[index].document_key,
+                documents[*prior].document_key,
             )
             .is_lt()
         }) {
@@ -2364,7 +2392,7 @@ fn seed_terminal_frontier_documents_candidate_with_policy(
         }
         let link = |child: usize| -> Result<MapLink, FrontierError> {
             Ok(MapLink {
-                key: documents[child].document_id,
+                key: documents[child].document_key,
                 digest: digests[child].ok_or_else(|| {
                     FrontierError::Corrupt(
                         "terminal frontier child digest was not constructed".into(),
@@ -2375,7 +2403,7 @@ fn seed_terminal_frontier_documents_candidate_with_policy(
         let left = shape[index].left.map(link).transpose()?;
         let right = shape[index].right.map(link).transpose()?;
         let mut node = FrontierMapNode {
-            document_id: documents[index].document_id,
+            document_key: documents[index].document_key,
             encoded: documents[index].canonical_bytes.clone(),
             value_digest: ContentDigest::of(&documents[index].canonical_bytes),
             left,
@@ -2389,7 +2417,7 @@ fn seed_terminal_frontier_documents_candidate_with_policy(
     let root_digest = digests[root_index].ok_or_else(|| {
         FrontierError::Corrupt("terminal frontier root digest was not constructed".into())
     })?;
-    if expected_root.document_map_root_key != Some(documents[root_index].document_id)
+    if expected_root.document_map_root_key != Some(documents[root_index].document_key)
         || expected_root.document_map_root_digest != root_digest
     {
         return Err(FrontierError::FrontierRegression);
@@ -2465,14 +2493,15 @@ pub fn seed_genesis_frontier_candidate(
 
 fn write_clock_node(connection: &Connection, node: &ClockNode) -> Result<MapLink, FrontierError> {
     let value_digest = causal_clock_counter_digest(node.peer, node.counter);
+    let peer_key = AuthenticatedMapKey::from(node.peer);
     let digest = authenticated_map_node_digest(
-        node.peer,
+        peer_key,
         value_digest,
         node.left.as_ref().map(|child| (child.key, child.digest)),
         node.right.as_ref().map(|child| (child.key, child.digest)),
     );
     let link = MapLink {
-        key: node.peer,
+        key: peer_key,
         digest,
     };
     connection.execute(
@@ -2533,11 +2562,9 @@ fn upsert_causal_clock(
                 counter,
                 depth + 1,
             )?);
-            if node
-                .left
-                .as_ref()
-                .is_some_and(|left| authenticated_map_priority_order(left.key, node.peer).is_lt())
-            {
+            if node.left.as_ref().is_some_and(|left| {
+                authenticated_map_priority_order(left.key, node.peer.into()).is_lt()
+            }) {
                 rotate_clock_right(connection, node)
             } else {
                 write_clock_node(connection, &node)
@@ -2551,11 +2578,9 @@ fn upsert_causal_clock(
                 counter,
                 depth + 1,
             )?);
-            if node
-                .right
-                .as_ref()
-                .is_some_and(|right| authenticated_map_priority_order(right.key, node.peer).is_lt())
-            {
+            if node.right.as_ref().is_some_and(|right| {
+                authenticated_map_priority_order(right.key, node.peer.into()).is_lt()
+            }) {
                 rotate_clock_left(connection, node)
             } else {
                 write_clock_node(connection, &node)
@@ -2624,8 +2649,12 @@ fn union_clocks(
     }
     if authenticated_map_priority_order(left_link.key, right_link.key).is_lt() {
         let left_node = load_clock_node(connection, &left_link)?;
-        let (less, counter, greater) =
-            split_clock(connection, Some(right_link), left_link.key, depth + 1)?;
+        let (less, counter, greater) = split_clock(
+            connection,
+            Some(right_link),
+            key_as_id(left_link.key, "causal peer ID")?,
+            depth + 1,
+        )?;
         Ok(Some(write_clock_node(
             connection,
             &ClockNode {
@@ -2637,8 +2666,12 @@ fn union_clocks(
         )?))
     } else {
         let right_node = load_clock_node(connection, &right_link)?;
-        let (less, counter, greater) =
-            split_clock(connection, Some(left_link), right_link.key, depth + 1)?;
+        let (less, counter, greater) = split_clock(
+            connection,
+            Some(left_link),
+            key_as_id(right_link.key, "causal peer ID")?,
+            depth + 1,
+        )?;
         Ok(Some(write_clock_node(
             connection,
             &ClockNode {
@@ -2662,7 +2695,7 @@ fn split_clock(
         return Ok((None, None, None));
     };
     let node = load_clock_node(connection, &link)?;
-    match key.cmp(&link.key) {
+    match key.cmp(&node.peer) {
         Ordering::Equal => Ok((node.left, Some(node.counter), node.right)),
         Ordering::Less => {
             let (less, counter, greater_left) = split_clock(connection, node.left, key, depth + 1)?;
@@ -2703,7 +2736,7 @@ fn derive_causal_clock_root(
             transaction,
             clock,
             Some(MapLink {
-                key: decode_id(&record.causal_clock_root_key, "causal clock root key")?,
+                key: decode_id(&record.causal_clock_root_key, "causal clock root key")?.into(),
                 digest: decode_digest(&record.causal_clock_root_digest)?,
             }),
             0,
@@ -2734,14 +2767,15 @@ fn write_batch_map_node(
     connection: &Connection,
     node: &BatchMapNode,
 ) -> Result<MapLink, FrontierError> {
+    let batch_key = AuthenticatedMapKey::from(node.batch_id);
     let digest = authenticated_map_node_digest(
-        node.batch_id,
+        batch_key,
         node.value_digest,
         node.left.as_ref().map(|child| (child.key, child.digest)),
         node.right.as_ref().map(|child| (child.key, child.digest)),
     );
     let link = MapLink {
-        key: node.batch_id,
+        key: batch_key,
         digest,
     };
     connection.execute(
@@ -2801,7 +2835,7 @@ fn upsert_batch_map(
                 depth + 1,
             )?);
             if node.left.as_ref().is_some_and(|left| {
-                authenticated_map_priority_order(left.key, node.batch_id).is_lt()
+                authenticated_map_priority_order(left.key, node.batch_id.into()).is_lt()
             }) {
                 rotate_batch_right(connection, node)
             } else {
@@ -2817,7 +2851,7 @@ fn upsert_batch_map(
                 depth + 1,
             )?);
             if node.right.as_ref().is_some_and(|right| {
-                authenticated_map_priority_order(right.key, node.batch_id).is_lt()
+                authenticated_map_priority_order(right.key, node.batch_id.into()).is_lt()
             }) {
                 rotate_batch_left(connection, node)
             } else {
@@ -2949,7 +2983,7 @@ fn validate_request_shape(request: &PhysicalApplyRequest) -> Result<(), Frontier
     if batch
         .affected_documents
         .windows(2)
-        .any(|pair| pair[0].document_id >= pair[1].document_id)
+        .any(|pair| pair[0].document_key >= pair[1].document_key)
         || batch
             .causal_dependency_heads
             .windows(2)
@@ -2994,7 +3028,7 @@ pub fn preflight(
     }
     if let Some(existing) = load_batch(connection, batch.batch_id)? {
         let clock_root = MapLink {
-            key: decode_id(&existing.causal_clock_root_key, "causal clock root key")?,
+            key: decode_id(&existing.causal_clock_root_key, "causal clock root key")?.into(),
             digest: decode_digest(&existing.causal_clock_root_digest)?,
         };
         if authenticated_batch_record(connection, current_root, batch.batch_id, None)?.is_none() {
@@ -3117,7 +3151,7 @@ fn apply_with_transaction_policy(
     }
     if let Some(existing) = load_batch(connection, batch.batch_id)? {
         let existing_clock_root = MapLink {
-            key: decode_id(&existing.causal_clock_root_key, "causal clock root key")?,
+            key: decode_id(&existing.causal_clock_root_key, "causal clock root key")?.into(),
             digest: decode_digest(&existing.causal_clock_root_digest)?,
         };
         let authenticated =
@@ -3262,14 +3296,15 @@ fn apply_in_open_transaction(
     let post_batch_root = upsert_batch_map(
         connection,
         current_root.batch_map_root_key.map(|key| MapLink {
-            key,
+            key: key.into(),
             digest: current_root.batch_map_root_digest,
         }),
         batch.batch_id,
         causal_record_digest,
         0,
     )?;
-    if batch.post_frontier_root.batch_map_root_key != Some(post_batch_root.key)
+    if batch.post_frontier_root.batch_map_root_key
+        != Some(key_as_id(post_batch_root.key, "accepted batch ID")?)
         || batch.post_frontier_root.batch_map_root_digest != post_batch_root.digest
     {
         return Err(FrontierError::FrontierRegression);
@@ -3355,8 +3390,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     use crate::sealed_accepted_index::{
-        AuthenticatedMapRootV1, SealedAcceptedCausalClockEntryV2, SealedAcceptedIndexObjectStore,
-        SealedAcceptedIndexReader, SealedAcceptedIndexWriter, SealedAcceptedObjectKind,
+        authenticated_map_root, AuthenticatedMapRootV1, SealedAcceptedCausalClockEntryV2,
+        SealedAcceptedIndexObjectStore, SealedAcceptedIndexReader, SealedAcceptedIndexWriter,
+        SealedAcceptedObjectKind,
     };
     use crate::sqlite::{
         PhysicalEntityId, PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalSqliteDatabase,
@@ -3464,7 +3500,14 @@ mod tests {
         value.to_be_bytes()
     }
 
-    fn map_root(entries: &[([u8; 16], ContentDigest)]) -> (Option<[u8; 16]>, ContentDigest) {
+    fn key(value: u128) -> AuthenticatedMapKey {
+        AuthenticatedMapKey::from(id(value))
+    }
+
+    /// The reference Cartesian root, over general keys.
+    fn map_root(
+        entries: &[(AuthenticatedMapKey, ContentDigest)],
+    ) -> (Option<AuthenticatedMapKey>, ContentDigest) {
         if entries.is_empty() {
             return (None, authenticated_map_empty_digest());
         }
@@ -3485,6 +3528,19 @@ mod tests {
         (Some(key), digest)
     }
 
+    /// Same root, projected back to the 16-byte identity the batch map keeps.
+    fn batch_map_root(entries: &[([u8; 16], ContentDigest)]) -> (Option<[u8; 16]>, ContentDigest) {
+        let widened = entries
+            .iter()
+            .map(|(id, digest)| (AuthenticatedMapKey::from(*id), *digest))
+            .collect::<Vec<_>>();
+        let (root_key, digest) = map_root(&widened);
+        (
+            root_key.map(|key| key_as_id(key, "test batch ID").unwrap()),
+            digest,
+        )
+    }
+
     fn root(
         sequence: u64,
         documents: &[PhysicalFrontierDocument],
@@ -3494,13 +3550,13 @@ mod tests {
             .iter()
             .map(|document| {
                 (
-                    document.document_id,
+                    document.document_key,
                     ContentDigest::of(&document.canonical_bytes),
                 )
             })
             .collect::<Vec<_>>();
         let (document_map_root_key, document_map_root_digest) = map_root(&document_entries);
-        let (batch_map_root_key, batch_map_root_digest) = map_root(batches);
+        let (batch_map_root_key, batch_map_root_digest) = batch_map_root(batches);
         let mut canonical_bytes = b"synthetic physical frontier\0".to_vec();
         canonical_bytes.extend_from_slice(&sequence.to_be_bytes());
         canonical_bytes.extend_from_slice(document_map_root_digest.as_bytes());
@@ -3647,8 +3703,10 @@ mod tests {
                 .iter()
                 .flat_map(|document| {
                     document
-                        .document_id
-                        .into_iter()
+                        .document_key
+                        .as_slice()
+                        .iter()
+                        .copied()
                         .chain(document.canonical_bytes.iter().copied())
                 })
                 .collect(),
@@ -3661,8 +3719,8 @@ mod tests {
         };
         let clock_value = causal_clock_counter_digest(peer, sequence);
         let clock_root = MapLink {
-            key: peer,
-            digest: authenticated_map_node_digest(peer, clock_value, None, None),
+            key: peer.into(),
+            digest: authenticated_map_node_digest(peer.into(), clock_value, None, None),
         };
         let record_digest = accepted_batch_causal_record_digest(&batch, &clock_root);
         let mut batch_entries = prior_batch_entries.to_vec();
@@ -3743,6 +3801,41 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(found, 21, "validation must not rewrite an old schema");
+
+        // The schema this packet retires is refused by the same one arm: the
+        // projection is disposable, so an unrecognized cache is rebuilt by the
+        // caller, never migrated or dually read here.
+        connection
+            .execute_batch(&format!(
+                "PRAGMA user_version = {}",
+                SQLITE_SCHEMA_VERSION - 1
+            ))
+            .unwrap();
+        let error = validate_schema_and_claim(&connection, claim()).unwrap_err();
+        assert!(matches!(error, FrontierError::Schema(_)));
+        assert!(error
+            .to_string()
+            .contains(&format!("user_version {}", SQLITE_SCHEMA_VERSION - 1)));
+
+        // And a forged user_version does not get past the canonical SQL check:
+        // the widened document-key CHECK is compared structurally.
+        let (_narrow_path, narrow) = TestDatabase::create();
+        narrow
+            .execute_batch(&format!(
+                "PRAGMA user_version = {SQLITE_SCHEMA_VERSION};
+                 {}",
+                FRONTIER_DOCUMENTS_DDL.replace("BETWEEN 1 AND 48", "= 16")
+            ))
+            .unwrap();
+        assert!(matches!(
+            validate_schema_sql(
+                &narrow,
+                "table",
+                "frontier_documents",
+                FRONTIER_DOCUMENTS_DDL
+            ),
+            Err(FrontierError::Schema(_))
+        ));
     }
 
     #[test]
@@ -3755,7 +3848,8 @@ mod tests {
         drop(live);
         let live_bytes = std::fs::read(&live_path.path).unwrap();
 
-        let (covered_batch_root_key, covered_batch_root_digest) = map_root(&scenario.batch_entries);
+        let (covered_batch_root_key, covered_batch_root_digest) =
+            batch_map_root(&scenario.batch_entries);
         let covered_count = scenario.final_root.acceptance_sequence;
         let sequence_digest = ContentDigest::of(b"checkpoint-sequence");
         let generation = PhysicalCheckpointGenerationBinding {
@@ -3861,9 +3955,13 @@ mod tests {
             covered_block_count: 0,
             covered_retained_bytes_total: 10,
             covered_semantic_capsules_root_digest: ContentDigest::of(b"capsules"),
-            covered_batch_root_key: batch_root.root.map(|link| link.key),
+            covered_batch_root_key: batch_root
+                .root
+                .map(|link| key_as_id(link.key, "test batch ID").unwrap()),
             covered_batch_root_digest: batch_root.root_digest(),
-            covered_status_root_key: batch_root.root.map(|link| link.key),
+            covered_status_root_key: batch_root
+                .root
+                .map(|link| key_as_id(link.key, "test batch ID").unwrap()),
             covered_status_root_digest: batch_root.root_digest(),
             covered_sequence_root_digest: Some(ContentDigest::of(b"sequence")),
             covered_sequence_height: 0,
@@ -3883,10 +3981,14 @@ mod tests {
             retained_bytes_total: 10,
             document_map_root_key: None,
             document_map_root_digest: empty,
-            batch_map_root_key: batch_root.root.map(|link| link.key),
+            batch_map_root_key: batch_root
+                .root
+                .map(|link| key_as_id(link.key, "test batch ID").unwrap()),
             batch_map_root_digest: batch_root.root_digest(),
             batch_map_count: 1,
-            status_map_root_key: batch_root.root.map(|link| link.key),
+            status_map_root_key: batch_root
+                .root
+                .map(|link| key_as_id(link.key, "test batch ID").unwrap()),
             status_map_root_digest: batch_root.root_digest(),
             status_map_count: 1,
             sequence_root_digest: Some(ContentDigest::of(b"sequence")),
@@ -3990,7 +4092,7 @@ mod tests {
         candidate: bool,
     ) -> FreshBootstrapScenario {
         let document = PhysicalFrontierDocument {
-            document_id: id(50),
+            document_key: key(50),
             canonical_bytes: b"fresh-bootstrap-document".to_vec(),
         };
         let (mut first, first_entries) = request(empty, 1, None, vec![document.clone()], &[], true);
@@ -4035,7 +4137,7 @@ mod tests {
     fn ordered_apply_duplicate_collision_and_missing_dependency_are_physical() {
         let (_database, mut connection, empty) = initialized();
         let document = PhysicalFrontierDocument {
-            document_id: id(50),
+            document_key: key(50),
             canonical_bytes: b"document-v1".to_vec(),
         };
         let (first, entries) = request(&empty, 1, None, vec![document.clone()], &[], true);
@@ -4071,7 +4173,7 @@ mod tests {
         ));
 
         let document_v2 = PhysicalFrontierDocument {
-            document_id: id(50),
+            document_key: key(50),
             canonical_bytes: b"document-v2".to_vec(),
         };
         let (second, _) = request(
@@ -4098,7 +4200,7 @@ mod tests {
     fn materialization_and_terminal_frontier_roll_back_together() {
         let (_database, mut connection, empty) = initialized();
         let document = PhysicalFrontierDocument {
-            document_id: id(60),
+            document_key: key(60),
             canonical_bytes: b"rollback-doc".to_vec(),
         };
         let (mut change, _) = request(&empty, 1, None, vec![document], &[], true);
@@ -4132,7 +4234,7 @@ mod tests {
     fn reopen_authenticates_roots_and_rejects_tampered_nodes() {
         let (database, mut connection, empty) = initialized();
         let document = PhysicalFrontierDocument {
-            document_id: id(70),
+            document_key: key(70),
             canonical_bytes: b"reopen-doc".to_vec(),
         };
         let (change, _) = request(&empty, 1, None, vec![document], &[], true);
@@ -4158,11 +4260,341 @@ mod tests {
         ));
     }
 
+    fn entity_document(uuid: u8, body: &str) -> PhysicalFrontierDocument {
+        let mut bytes = vec![0x01];
+        bytes.extend_from_slice(&[uuid; 16]);
+        PhysicalFrontierDocument {
+            document_key: AuthenticatedMapKey::new(&bytes).unwrap(),
+            canonical_bytes: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn membership_document(block: u8, page: u8, body: &str) -> PhysicalFrontierDocument {
+        let mut bytes = vec![0x02];
+        bytes.extend_from_slice(&[block; 16]);
+        bytes.extend_from_slice(&[page; 16]);
+        PhysicalFrontierDocument {
+            document_key: AuthenticatedMapKey::new(&bytes).unwrap(),
+            canonical_bytes: body.as_bytes().to_vec(),
+        }
+    }
+
+    /// Mixed 17-byte entity and 33-byte membership keys, sorted unique. The
+    /// entity `0x11` and the membership `(0x11, *)` pair shares a UUID, and the
+    /// last pair is strictly prefix-related.
+    fn mixed_width_documents() -> Vec<PhysicalFrontierDocument> {
+        let mut documents = vec![
+            entity_document(0x11, "entity-11"),
+            entity_document(0x22, "entity-22"),
+            entity_document(0x33, "entity-33"),
+            membership_document(0x11, 0x44, "membership-11-44"),
+            membership_document(0x11, 0x55, "membership-11-55"),
+            membership_document(0x22, 0x44, "membership-22-44"),
+            PhysicalFrontierDocument {
+                document_key: AuthenticatedMapKey::new(&[0x03, 0x09]).unwrap(),
+                canonical_bytes: b"short-key".to_vec(),
+            },
+            PhysicalFrontierDocument {
+                document_key: AuthenticatedMapKey::new(&[0x03, 0x09, 0x00]).unwrap(),
+                canonical_bytes: b"short-key-extension".to_vec(),
+            },
+            PhysicalFrontierDocument {
+                document_key: AuthenticatedMapKey::new(&[0xfe; MAX_AUTHENTICATED_MAP_KEY_BYTES])
+                    .unwrap(),
+                canonical_bytes: b"maximum-width-key".to_vec(),
+            },
+        ];
+        documents.sort_by_key(|document| document.document_key);
+        documents
+    }
+
+    fn document_entries(
+        documents: &[PhysicalFrontierDocument],
+    ) -> Vec<(AuthenticatedMapKey, ContentDigest)> {
+        let mut entries = documents
+            .iter()
+            .map(|document| {
+                (
+                    document.document_key,
+                    ContentDigest::of(&document.canonical_bytes),
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(key, _)| *key);
+        entries
+    }
+
+    /// The same `(key, value_digest)` set built by the sealed writer.
+    fn sealed_document_root(
+        documents: &[PhysicalFrontierDocument],
+        order: &[usize],
+    ) -> AuthenticatedMapRootV1 {
+        let entries = document_entries(documents);
+        let mut store = TestSealedStore::default();
+        let mut root = AuthenticatedMapRootV1::empty();
+        for index in order {
+            root = SealedAcceptedIndexWriter::new(&mut store)
+                .upsert_map(root, entries[*index].0, entries[*index].1)
+                .unwrap();
+        }
+        root
+    }
+
+    /// The gate that would have caught a lossy document-map key: the live
+    /// SQLite treap, the sealed writer, and the Cartesian builder must produce
+    /// the same root key, digest and count over mixed 17/33-byte keys,
+    /// whatever order the entries arrive in.
+    #[test]
+    fn frontier_document_map_root_matches_sealed_and_cartesian_roots() {
+        let documents = mixed_width_documents();
+        let entries = document_entries(&documents);
+        let cartesian = authenticated_map_root(&entries).unwrap();
+        let cartesian_key = cartesian.root.map(|link| link.key);
+        assert_eq!(cartesian.count, documents.len() as u64);
+
+        // Three sealed insertion orders, all landing on the same root.
+        for order in [
+            (0..entries.len()).collect::<Vec<_>>(),
+            (0..entries.len()).rev().collect::<Vec<_>>(),
+            vec![4, 0, 8, 2, 6, 1, 7, 3, 5],
+        ] {
+            assert_eq!(sealed_document_root(&documents, &order), cartesian);
+        }
+
+        // (a) live SQLite upserts, one batch carrying every document.
+        let (_single_path, mut single, single_empty) = initialized_facade();
+        let (single_request, _) = request(&single_empty, 1, None, documents.clone(), &[], false);
+        single.apply(&single_empty, &single_request).unwrap();
+        let single_root = single_request.batch.post_frontier_root.clone();
+        assert_eq!(single_root.document_map_root_key, cartesian_key);
+        assert_eq!(
+            single_root.document_map_root_digest,
+            cartesian.root_digest()
+        );
+        assert_eq!(single_root.document_count, cartesian.count);
+        assert_eq!(
+            single.read_frontier_documents(&single_root).unwrap(),
+            documents
+        );
+
+        // (b) the same documents arriving as three separate batches, in an
+        //     order unrelated to key order.
+        let (_split_path, mut split, split_empty) = initialized_facade();
+        let mut current = split_empty.clone();
+        let mut batch_entries: Vec<([u8; 16], ContentDigest)> = Vec::new();
+        let mut delivered: Vec<PhysicalFrontierDocument> = Vec::new();
+        let mut previous_batch: Option<[u8; 16]> = None;
+        for (sequence, group) in [vec![4, 0, 8], vec![2, 6, 1], vec![7, 3, 5]]
+            .into_iter()
+            .enumerate()
+        {
+            let mut affected = group
+                .iter()
+                .map(|index| documents[*index].clone())
+                .collect::<Vec<_>>();
+            affected.sort_by_key(|document| document.document_key);
+            delivered.extend(affected.iter().cloned());
+            delivered.sort_by_key(|document| document.document_key);
+            let (mut change, next_entries) = request(
+                &current,
+                sequence as u64 + 1,
+                previous_batch,
+                affected,
+                &batch_entries,
+                false,
+            );
+            previous_batch = Some(change.batch.batch_id);
+            // The post root covers every document delivered so far, not just
+            // this batch's slice.
+            change.batch.post_frontier_root = root(sequence as u64 + 1, &delivered, &next_entries);
+            batch_entries = next_entries;
+            split.apply(&current, &change).unwrap();
+            current = change.batch.post_frontier_root.clone();
+        }
+        assert_eq!(current.document_map_root_key, cartesian_key);
+        assert_eq!(current.document_map_root_digest, cartesian.root_digest());
+        assert_eq!(current.document_count, cartesian.count);
+        assert_eq!(split.read_frontier_documents(&current).unwrap(), documents);
+
+        // (c) the bulk Cartesian seed path over the same terminal root.
+        let (_terminal_path, mut terminal, terminal_empty) = initialized_facade();
+        terminal.begin_candidate_build().unwrap();
+        terminal
+            .apply_terminal_prefix_candidate(&terminal_empty, &single_request)
+            .unwrap();
+        terminal
+            .seed_terminal_frontier_documents(&single_root, &documents)
+            .unwrap();
+        terminal.finish_candidate_build().unwrap();
+        assert_eq!(
+            terminal.read_frontier_documents(&single_root).unwrap(),
+            documents
+        );
+        assert_eq!(
+            terminal.read_frontier().unwrap().canonical_bytes,
+            single_root.canonical_bytes
+        );
+    }
+
+    /// Distinct keys that share a prefix must resolve to distinct rows: the
+    /// same-UUID entity/membership pair, and a strictly prefix-related pair.
+    #[test]
+    fn frontier_lookup_resolves_prefix_related_keys_distinctly() {
+        let documents = mixed_width_documents();
+        let (_database, mut physical, empty) = initialized_facade();
+        let (change, _) = request(&empty, 1, None, documents.clone(), &[], false);
+        physical.apply(&empty, &change).unwrap();
+        let post = change.batch.post_frontier_root.clone();
+
+        for document in &documents {
+            assert_eq!(
+                physical
+                    .frontier_document(&post, document.document_key)
+                    .unwrap()
+                    .as_deref(),
+                Some(document.canonical_bytes.as_slice()),
+                "key {} did not resolve to its own value",
+                document.document_key
+            );
+        }
+
+        let entity = entity_document(0x11, "entity-11");
+        let membership = membership_document(0x11, 0x44, "membership-11-44");
+        assert_ne!(entity.document_key, membership.document_key);
+        assert_ne!(
+            physical
+                .frontier_document(&post, entity.document_key)
+                .unwrap(),
+            physical
+                .frontier_document(&post, membership.document_key)
+                .unwrap()
+        );
+
+        let prefix = AuthenticatedMapKey::new(&[0x03, 0x09]).unwrap();
+        let extension = AuthenticatedMapKey::new(&[0x03, 0x09, 0x00]).unwrap();
+        assert_eq!(
+            physical.frontier_document(&post, prefix).unwrap().unwrap(),
+            b"short-key".to_vec()
+        );
+        assert_eq!(
+            physical
+                .frontier_document(&post, extension)
+                .unwrap()
+                .unwrap(),
+            b"short-key-extension".to_vec()
+        );
+
+        // An unstored key of either class is simply absent.
+        assert_eq!(
+            physical
+                .frontier_document(&post, entity_document(0x99, "").document_key)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            physical
+                .frontier_document(&post, AuthenticatedMapKey::new(&[0x03]).unwrap())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn frontier_documents_reject_empty_and_oversized_keys() {
+        assert!(AuthenticatedMapKey::new(&[]).is_err());
+        assert!(AuthenticatedMapKey::new(&[0; MAX_AUTHENTICATED_MAP_KEY_BYTES + 1]).is_err());
+
+        // The stored table carries the same bound structurally.
+        let (_database, connection, _empty) = initialized();
+        for bytes in [Vec::new(), vec![0_u8; MAX_AUTHENTICATED_MAP_KEY_BYTES + 1]] {
+            assert!(
+                connection
+                    .execute(
+                        "INSERT INTO frontier_documents (
+                             document_id, dependencies, dependencies_digest, node_digest
+                         ) VALUES (?1, ?2, ?3, ?4)",
+                        params![
+                            bytes.as_slice(),
+                            b"payload".as_slice(),
+                            ContentDigest::of(b"payload").as_bytes().as_slice(),
+                            ContentDigest::of(b"node").as_bytes().as_slice(),
+                        ],
+                    )
+                    .is_err(),
+                "a {}-byte document key must violate the table CHECK",
+                bytes.len()
+            );
+        }
+        assert!(connection
+            .execute(
+                "INSERT INTO frontier_documents (
+                     document_id, dependencies, dependencies_digest, node_digest
+                 ) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    vec![0x07_u8; MAX_AUTHENTICATED_MAP_KEY_BYTES].as_slice(),
+                    b"payload".as_slice(),
+                    ContentDigest::of(b"payload").as_bytes().as_slice(),
+                    ContentDigest::of(b"node").as_bytes().as_slice(),
+                ],
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn empty_and_genesis_document_maps_round_trip_through_the_shared_empty_root() {
+        // The empty pairing the shared map produces is exactly the pairing the
+        // frontier shape check accepts.
+        let empty_root = AuthenticatedMapRootV1::empty();
+        assert!(empty_root.root.is_none());
+        assert_eq!(empty_root.root_digest(), authenticated_map_empty_digest());
+
+        let empty = root(0, &[], &[]);
+        assert_eq!(empty.document_map_root_key, None);
+        assert_eq!(
+            empty.document_map_root_digest,
+            authenticated_map_empty_digest()
+        );
+        validate_root_shape(&empty).unwrap();
+
+        let (_database, mut physical, _empty) = initialized_facade();
+        physical.begin_candidate_build().unwrap();
+        physical.seed_genesis_frontier(&empty, &[]).unwrap();
+        physical.finish_candidate_build().unwrap();
+        assert_eq!(
+            physical.read_frontier().unwrap(),
+            StoredFrontier {
+                canonical_bytes: empty.canonical_bytes.clone(),
+                digest: empty.digest(),
+                applied_batch_count: 0,
+            }
+        );
+        assert!(physical.read_frontier_documents(&empty).unwrap().is_empty());
+        assert_eq!(
+            physical
+                .frontier_document(&empty, entity_document(0x11, "").document_key)
+                .unwrap(),
+            None
+        );
+
+        // A first full-key batch still advances from that empty root, and
+        // removing the concept of a document again is not this packet's job:
+        // the shared writer's removal path is proved in the index module.
+        let documents = mixed_width_documents();
+        let (change, _) = request(&empty, 1, None, documents.clone(), &[], false);
+        physical.apply(&empty, &change).unwrap();
+        assert_eq!(
+            physical
+                .read_frontier_documents(&change.batch.post_frontier_root)
+                .unwrap(),
+            documents
+        );
+    }
+
     #[test]
     fn terminal_frontier_and_materialization_stamp_are_exactly_equal() {
         let (_database, mut connection, empty) = initialized();
         let document = PhysicalFrontierDocument {
-            document_id: id(80),
+            document_key: key(80),
             canonical_bytes: b"terminal-doc".to_vec(),
         };
         let (change, _) = request(&empty, 1, None, vec![document], &[], true);
@@ -4252,7 +4684,7 @@ mod tests {
         let documents = [7_u128, 11, 19, 23, 29, 31, 41]
             .into_iter()
             .map(|value| PhysicalFrontierDocument {
-                document_id: id(value),
+                document_key: key(value),
                 canonical_bytes: format!("terminal-document-{value}").into_bytes(),
             })
             .collect::<Vec<_>>();
@@ -4343,7 +4775,7 @@ mod tests {
             0
         );
         let changed_baseline_document = PhysicalFrontierDocument {
-            document_id: id(11),
+            document_key: key(11),
             canonical_bytes: b"changed baseline document".to_vec(),
         };
         let (mut first, _) = request(
@@ -4412,7 +4844,7 @@ mod tests {
         let (database, mut candidate, empty) = initialized_facade();
         candidate.begin_candidate_build().unwrap();
         let document = PhysicalFrontierDocument {
-            document_id: id(50),
+            document_key: key(50),
             canonical_bytes: b"fresh-bootstrap-document".to_vec(),
         };
         let (mut first, first_entries) =
@@ -4451,7 +4883,7 @@ mod tests {
         let (_database, mut physical, empty) = initialized_facade();
         let scenario = apply_two_part_fresh_bootstrap(&mut physical, &empty);
         let document = PhysicalFrontierDocument {
-            document_id: id(50),
+            document_key: key(50),
             canonical_bytes: b"fresh-bootstrap-document".to_vec(),
         };
         let (mut staged, _) = request(

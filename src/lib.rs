@@ -101,6 +101,14 @@ pub mod sqlite {
 /// The module is intentionally independent of Tine's engine policy and of any
 /// particular filesystem layout. Both the engine and SQLite compose the same
 /// reader/writer with their own content-addressed object store.
+///
+/// The authenticated map is domain-blind: it keys entries by bounded canonical
+/// key bytes supplied by the domain owner ([`sealed_accepted_index::AuthenticatedMapKey`],
+/// 1..=`formats::MAX_AUTHENTICATED_MAP_KEY_BYTES` bytes) and never parses them.
+/// A fixed-width 16-byte identifier is one such key. Every implementation must
+/// derive node digests from the single shared
+/// [`sealed_accepted_index::authenticated_map_node_digest`], which length-frames
+/// each key so roots stay comparable across arbitrary caller key spaces.
 pub mod sealed_accepted_index {
     pub use crate::sealed_accepted_index_impl::{
         accepted_causal_record_digest, authenticated_map_empty_digest,
@@ -108,7 +116,7 @@ pub mod sealed_accepted_index {
         authenticated_map_priority_order, authenticated_map_root, causal_clock_counter_digest,
         AcceptedEvidenceBindingV2, AcceptedSequenceChildV2, AcceptedSequenceEntryV2,
         AcceptedSequenceNodeV2, AcceptedSequenceRootV2, AcceptedStatusRecordV2,
-        AuthenticatedMapLinkV1, AuthenticatedMapRootV1, CausalTipRecordV2,
+        AuthenticatedMapKey, AuthenticatedMapLinkV1, AuthenticatedMapRootV1, CausalTipRecordV2,
         SealedAcceptedCausalClockEntryV2, SealedAcceptedCausalRecordV2,
         SealedAcceptedEvidenceDecoder, SealedAcceptedIndexError, SealedAcceptedIndexObjectStore,
         SealedAcceptedIndexRead, SealedAcceptedIndexReader, SealedAcceptedIndexRootsV2,

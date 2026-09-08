@@ -83,6 +83,7 @@ pub use crate::local_journal::{
     MAX_LOCAL_JOURNAL_FRAME_BYTES, MAX_LOCAL_JOURNAL_FRAME_HEADER_BYTES,
     MAX_LOCAL_JOURNAL_SEGMENT_BYTES,
 };
+pub use crate::sealed_accepted_index_impl::MAX_AUTHENTICATED_MAP_KEY_BYTES;
 
 // --- checkpoint fingerprint geometry -----------------------------------------
 // A stored checkpoint is only comparable to a fresh one computed with the same
@@ -640,6 +641,12 @@ pub const FORMAT_MANIFEST: &[FormatConstant] = &[
     ),
     // writer bounds
     num(
+        "MAX_AUTHENTICATED_MAP_KEY_BYTES",
+        "authenticated-map key, in sealed nodes and the SQLite frontier overlay",
+        FormatKind::WriterBound,
+        MAX_AUTHENTICATED_MAP_KEY_BYTES as u64,
+    ),
+    num(
         "MAX_MANIFEST_BYTES",
         "durable batch manifest",
         FormatKind::WriterBound,
@@ -714,9 +721,9 @@ mod tests {
         assert_eq!(LOCAL_JOURNAL_SEGMENT_V2_MAGIC, "TINEJNL2");
         assert_eq!(LOCAL_JOURNAL_FRONTIER_V2_MAGIC, "TINEFRT2");
         assert_eq!(SQLITE_APPLICATION_ID, 0x5449_4e45);
-        assert_eq!(SQLITE_SCHEMA_VERSION, 26);
-        assert_eq!(SEALED_ACCEPTED_INDEX_SCHEMA_VERSION, 2);
-        assert_eq!(SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION, 2);
+        assert_eq!(SQLITE_SCHEMA_VERSION, 27);
+        assert_eq!(SEALED_ACCEPTED_INDEX_SCHEMA_VERSION, 3);
+        assert_eq!(SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION, 3);
         assert_eq!(SEALED_ACCEPTED_STATUS_SCHEMA_VERSION, 2);
         assert_eq!(SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION, 2);
         assert_eq!(SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION, 2);
@@ -727,6 +734,7 @@ mod tests {
         assert_eq!(SEALED_ACCEPTED_SEQUENCE_FANOUT, 32);
         assert_eq!(SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY, 1);
 
+        assert_eq!(MAX_AUTHENTICATED_MAP_KEY_BYTES, 48);
         assert_eq!(MAX_MANIFEST_BYTES, 1024 * 1024);
         assert_eq!(MAX_OBJECT_BYTES, 256 * 1024 * 1024);
         assert_eq!(MAX_LOCAL_JOURNAL_FRAME_BYTES, 64 * 1024 * 1024);
@@ -822,6 +830,10 @@ mod tests {
                 FormatValue::Number(SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY as u64),
             ),
             (
+                "MAX_AUTHENTICATED_MAP_KEY_BYTES",
+                FormatValue::Number(MAX_AUTHENTICATED_MAP_KEY_BYTES as u64),
+            ),
+            (
                 "MAX_MANIFEST_BYTES",
                 FormatValue::Number(MAX_MANIFEST_BYTES as u64),
             ),
@@ -900,7 +912,7 @@ mod tests {
         assert_eq!(actual, expected, "managed-storage path vocabulary drifted");
         assert_eq!(
             FORMAT_MANIFEST.len(),
-            28 + expected.len(),
+            29 + expected.len(),
             "a format row was added outside the pinned base or managed-layout inventories",
         );
     }

@@ -5,6 +5,52 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.19.0] - 2026-09-08
+
+### Changed
+
+- The one shared authenticated map now keys entries by bounded canonical key
+  bytes supplied by the domain owner instead of fixed 16-byte identifiers.
+  `sealed_accepted_index::AuthenticatedMapKey` holds 1..=48 bytes
+  (`formats::MAX_AUTHENTICATED_MAP_KEY_BYTES`), is `Copy`/`Eq`/`Hash`, orders
+  lexicographically over its meaningful bytes, and serializes canonically with a
+  validated length; its fixed-width buffer never affects equality, ordering,
+  hashing or the bytes written. `From<[u8; 16]>` keeps every existing 16-byte
+  identity expressible, so the batch, status, causal-clock and causal-tip maps
+  and every UUID-typed API (`status`, `causal`, `causal_clock_counter_digest`,
+  `AcceptedStatusRecordV2`, `CausalTipRecordV2`, the accepted-sequence tree,
+  `SealedAcceptedIndexRootsV2`, `PhysicalCheckpointGenerationBinding`'s covered
+  root keys) are unchanged. `map_value`, `upsert_map` and `remove_map` take
+  `impl Into<AuthenticatedMapKey>`.
+- The SQLite document frontier carries the same full keys.
+  `PhysicalFrontierDocument.document_id: [u8; 16]` becomes
+  `document_key: AuthenticatedMapKey`; `PhysicalFrontierRoot` and
+  `PhysicalCheckpointFrontierRoot` widen `document_map_root_key` only — their
+  batch-map root fields stay `[u8; 16]`. `frontier_document` takes an
+  `AuthenticatedMapKey`. `frontier_documents` remains one table with one node
+  kind: no second tree, no second serializer, no hash adapter, and no raw SQL
+  surface is widened.
+
+### Persistent format
+
+- `SEALED_ACCEPTED_INDEX_SCHEMA_VERSION` and
+  `SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION` 2 -> 3; `SQLITE_SCHEMA_VERSION`
+  26 -> 27; new manifest row `MAX_AUTHENTICATED_MAP_KEY_BYTES` = 48
+  (`WriterBound`).
+- The shared node digest length-frames every key (`length ‖ bytes`) under the new
+  `tine/oplog/authenticated-map/v2/node` domain, which makes its preimage
+  injective for arbitrary caller key spaces rather than imposing an undocumented
+  prefix-free obligation on callers. `authenticated_map_priority` keeps its raw
+  v1 fold, so existing 16-byte maps keep their treap shape; their node digests
+  and derived roots are rebuilt. `authenticated_map_empty_digest` is unchanged.
+  `accepted_causal_record_digest` frames its clock-root key for the same reason.
+- **Old-data behavior:** no migration and no dual reader. Sealed checkpoint
+  generation directories and SQLite projection caches are pre-0.7 private derived
+  state; an old sealed generation is backed up and rebuilt, and an unrecognized
+  SQLite `user_version` or DDL census is refused by `validate_schema_and_claim`
+  so the caller rebuilds the disposable projection from the oplog. This crate's
+  derived golden vectors changed and were regenerated in the same change.
+
 ## [0.18.0] - 2026-09-08
 
 ### Changed

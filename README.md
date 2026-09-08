@@ -142,6 +142,14 @@ signals the owner: graph replacement must also drain workers/handles, including
 idle cancelled jobs, before removing the projection. Do not infer bounded WAL
 bytes from bounded worker count; measure reader duration and retained WAL.
 
+Schema 27 widens the authenticated document frontier from a fixed 16-byte
+identifier to the domain owner's complete key bytes
+(`sealed_accepted_index::AuthenticatedMapKey`, 1..=48 bytes), keying one table
+with one node kind. The sealed writer/reader, the SQLite treap and the Cartesian
+root builder share one key codec, one length-framed node digest and one root
+representation, so their roots are comparable bit for bit. Batch, status and
+causal identities stay 16-byte UUIDs. Everything schema 26 added is unchanged.
+
 Schema 26 adds `query_block_results`, `query_page_order`, and `block_own_refs`.
 The page transaction derives preorder, construction estimates and facet counts
 from its physical inputs; producers supply their existing public identity and
@@ -153,5 +161,4 @@ identities reject a replacement transaction. Raw text remains in block_text.
 `set_query_regex_predicate` installs the fixed `tine_query_regex(id, visible_text)`
 function over an application-owned compiled-regex registry. Bound IDs select
 existing compiled expressions; storage introduces no regex grammar or per-row
-compilation. This packet remains unreleased until both producer integration and
-the required certification/recovery gates pass.
+compilation.

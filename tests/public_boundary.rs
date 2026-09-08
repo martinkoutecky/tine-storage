@@ -288,7 +288,8 @@ fn a_receipt_can_be_generated_from_the_public_manifest() {
 #[test]
 fn format_constants_are_reachable_through_formats() {
     assert!(formats::MAX_OBJECT_BYTES > 0);
-    assert_eq!(formats::SQLITE_SCHEMA_VERSION, 26);
+    assert_eq!(formats::SQLITE_SCHEMA_VERSION, 27);
+    assert_eq!(formats::MAX_AUTHENTICATED_MAP_KEY_BYTES, 48);
     assert_eq!(formats::LOCAL_JOURNAL_SEGMENT_PROTOCOL_VERSION, 2);
     assert_eq!(formats::LOCAL_JOURNAL_SEGMENT_HEADER_BYTES, 136);
     assert_eq!(formats::LOCAL_JOURNAL_FRONTIER_BYTES, 240);
@@ -468,6 +469,84 @@ fn persistent_map_removal_is_available_without_test_support() {
             .map_value(removed, [1; 16])
             .unwrap(),
         None
+    );
+}
+
+/// The authenticated map is domain-blind at the public boundary: a consumer
+/// supplies its own tagged, variable-width key bytes and gets the same root the
+/// crate's own callers get, with no key type of the crate's invention.
+#[test]
+fn a_consumer_can_key_the_shared_map_by_its_own_tagged_document_keys() {
+    use std::collections::BTreeMap;
+    use tine_storage::formats::MAX_AUTHENTICATED_MAP_KEY_BYTES;
+    use tine_storage::sealed_accepted_index::{
+        authenticated_map_root, AuthenticatedMapKey, AuthenticatedMapRootV1,
+        SealedAcceptedIndexError, SealedAcceptedIndexObjectStore, SealedAcceptedIndexReader,
+        SealedAcceptedIndexWriter, SealedAcceptedObjectKind,
+    };
+
+    #[derive(Default)]
+    struct MapObjects(BTreeMap<ContentDigest, Vec<u8>>);
+    impl SealedAcceptedIndexObjectStore for MapObjects {
+        fn read_sealed_accepted_object(
+            &self,
+            _kind: SealedAcceptedObjectKind,
+            address: ContentDigest,
+        ) -> Result<Option<Vec<u8>>, SealedAcceptedIndexError> {
+            Ok(self.0.get(&address).cloned())
+        }
+        fn publish_sealed_accepted_object(
+            &mut self,
+            _kind: SealedAcceptedObjectKind,
+            address: ContentDigest,
+            bytes: &[u8],
+        ) -> Result<(), SealedAcceptedIndexError> {
+            self.0.insert(address, bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    // The consumer's own key space: a 17-byte entity key and a 33-byte
+    // membership key that share the same leading UUID.
+    let entity = AuthenticatedMapKey::new(&[&[0x01_u8][..], &[0xab; 16][..]].concat()).unwrap();
+    let membership =
+        AuthenticatedMapKey::new(&[&[0x02_u8][..], &[0xab; 16][..], &[0xcd; 16][..]].concat())
+            .unwrap();
+    assert_eq!(entity.len(), 17);
+    assert_eq!(membership.len(), 33);
+    assert_ne!(entity, membership);
+    assert!(entity < membership);
+
+    // A 16-byte identity is one such key, unchanged.
+    assert_eq!(
+        AuthenticatedMapKey::from([0x5a; 16]),
+        AuthenticatedMapKey::new(&[0x5a; 16]).unwrap()
+    );
+
+    // Bounds are the crate's, and they are visible through `formats`.
+    assert_eq!(MAX_AUTHENTICATED_MAP_KEY_BYTES, 48);
+    assert!(AuthenticatedMapKey::new(&[]).is_err());
+    assert!(AuthenticatedMapKey::new(&[0; MAX_AUTHENTICATED_MAP_KEY_BYTES + 1]).is_err());
+
+    let entity_value = ContentDigest::of(b"entity dependencies");
+    let membership_value = ContentDigest::of(b"membership dependencies");
+    let mut store = MapObjects::default();
+    let mut root = AuthenticatedMapRootV1::empty();
+    for (key, value) in [(membership, membership_value), (entity, entity_value)] {
+        root = SealedAcceptedIndexWriter::new(&mut store)
+            .upsert_map(root, key, value)
+            .unwrap();
+    }
+    assert_eq!(
+        root,
+        authenticated_map_root(&[(entity, entity_value), (membership, membership_value)]).unwrap()
+    );
+
+    let reader = SealedAcceptedIndexReader::new(&store);
+    assert_eq!(reader.map_value(root, entity).unwrap(), Some(entity_value));
+    assert_eq!(
+        reader.map_value(root, membership).unwrap(),
+        Some(membership_value)
     );
 }
 

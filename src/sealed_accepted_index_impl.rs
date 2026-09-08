@@ -1,11 +1,14 @@
-use std::{cmp::Ordering, fmt};
+use std::{cmp::Ordering, fmt, hash};
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{
+    de::{self, DeserializeOwned},
+    Deserialize, Deserializer, Serialize, Serializer,
+};
 
 use crate::ContentDigest;
 
-pub const SEALED_ACCEPTED_INDEX_SCHEMA_VERSION: u32 = 2;
-pub const SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION: u32 = 2;
+pub const SEALED_ACCEPTED_INDEX_SCHEMA_VERSION: u32 = 3;
+pub const SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION: u32 = 3;
 pub const SEALED_ACCEPTED_STATUS_SCHEMA_VERSION: u32 = 2;
 pub const SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION: u32 = 2;
 pub const SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION: u32 = 2;
@@ -18,9 +21,191 @@ pub const SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY: usize = 1;
 /// deterministic treaps are expected to remain far below it.
 pub const MAX_ACCEPTED_INDEX_DEPTH: usize = 256;
 
+/// Inclusive upper bound on one authenticated-map key, in bytes.
+///
+/// This is a **writer bound**: keys of up to this many bytes are already on
+/// disk in sealed map nodes and in the SQLite frontier overlay, so lowering it
+/// strands stored data. It is exported from [`crate::formats`], not from the
+/// [`crate::sealed_accepted_index`] facade, because a reader must agree with a
+/// writer about it.
+pub const MAX_AUTHENTICATED_MAP_KEY_BYTES: usize = 48;
+
+/// Bounded canonical key bytes supplied by the domain owner.
+///
+/// The authenticated map is deliberately domain-blind: it stores, orders and
+/// authenticates opaque byte strings of 1..=[`MAX_AUTHENTICATED_MAP_KEY_BYTES`]
+/// bytes and never parses them. A 16-byte identifier is one such key, so
+/// [`From<[u8; 16]>`] keeps every fixed-width identity map (batch, status,
+/// causal clock, causal tip) expressible without a second key type.
+///
+/// The inline buffer is fixed-width for `Copy`, but only the first `length`
+/// bytes are ever meaningful. Equality, hashing, ordering, serialization and
+/// every digest fold read [`Self::as_slice`], so the padding can neither change
+/// a value's identity nor reach disk as a second representation of one key.
+///
+/// `Ord` is **lexicographic over the meaningful bytes**, which is the order the
+/// treap's binary-search invariant and every sorted-unique precondition depend
+/// on. It is deliberately not derived: a derived `Ord` on `(length, bytes)`
+/// would sort by length first and silently disagree with the byte order both
+/// the SQLite `BLOB` comparison and the domain owner use.
+#[derive(Clone, Copy)]
+pub struct AuthenticatedMapKey {
+    length: u8,
+    bytes: [u8; MAX_AUTHENTICATED_MAP_KEY_BYTES],
+}
+
+impl AuthenticatedMapKey {
+    /// Accept exactly the keys a writer may legally have produced.
+    pub fn new(bytes: &[u8]) -> Result<Self, SealedAcceptedIndexError> {
+        if bytes.is_empty() || bytes.len() > MAX_AUTHENTICATED_MAP_KEY_BYTES {
+            return Err(corrupt(format!(
+                "authenticated-map key length {} is outside 1..={MAX_AUTHENTICATED_MAP_KEY_BYTES}",
+                bytes.len()
+            )));
+        }
+        let mut stored = [0_u8; MAX_AUTHENTICATED_MAP_KEY_BYTES];
+        stored[..bytes.len()].copy_from_slice(bytes);
+        Ok(Self {
+            length: bytes.len() as u8,
+            bytes: stored,
+        })
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.length as usize]
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.length as usize
+    }
+
+    /// Always false: a key of zero bytes cannot be constructed.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        false
+    }
+}
+
+impl From<[u8; 16]> for AuthenticatedMapKey {
+    fn from(value: [u8; 16]) -> Self {
+        let mut bytes = [0_u8; MAX_AUTHENTICATED_MAP_KEY_BYTES];
+        bytes[..16].copy_from_slice(&value);
+        Self { length: 16, bytes }
+    }
+}
+
+impl PartialEq for AuthenticatedMapKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for AuthenticatedMapKey {}
+
+impl hash::Hash for AuthenticatedMapKey {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
+    }
+}
+
+impl Ord for AuthenticatedMapKey {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_slice().cmp(other.as_slice())
+    }
+}
+
+impl PartialOrd for AuthenticatedMapKey {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl fmt::Debug for AuthenticatedMapKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "AuthenticatedMapKey({self})")
+    }
+}
+
+impl fmt::Display for AuthenticatedMapKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.as_slice() {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl Serialize for AuthenticatedMapKey {
+    /// One canonical representation: the meaningful bytes, length-prefixed by
+    /// the byte-string encoding itself. The padding is never written.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(self.as_slice())
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthenticatedMapKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KeyVisitor;
+
+        impl KeyVisitor {
+            fn build<E: de::Error>(bytes: &[u8]) -> Result<AuthenticatedMapKey, E> {
+                AuthenticatedMapKey::new(bytes).map_err(|_| {
+                    E::invalid_length(bytes.len(), &"1..=48 authenticated-map key bytes")
+                })
+            }
+        }
+
+        impl<'de> de::Visitor<'de> for KeyVisitor {
+            type Value = AuthenticatedMapKey;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("1..=48 authenticated-map key bytes")
+            }
+
+            fn visit_bytes<E: de::Error>(self, value: &[u8]) -> Result<Self::Value, E> {
+                Self::build(value)
+            }
+
+            fn visit_byte_buf<E: de::Error>(self, value: Vec<u8>) -> Result<Self::Value, E> {
+                Self::build(&value)
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut bytes = Vec::with_capacity(MAX_AUTHENTICATED_MAP_KEY_BYTES);
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    if bytes.len() == MAX_AUTHENTICATED_MAP_KEY_BYTES {
+                        return Err(de::Error::invalid_length(
+                            bytes.len() + 1,
+                            &"1..=48 authenticated-map key bytes",
+                        ));
+                    }
+                    bytes.push(byte);
+                }
+                Self::build(&bytes)
+            }
+        }
+
+        deserializer.deserialize_bytes(KeyVisitor)
+    }
+}
+
+/// Append one key to a digest preimage as `length ‖ bytes`.
+///
+/// Every authenticated-map key is length-framed inside the shared node digest,
+/// so the preimage stays injective for arbitrary caller key spaces — including
+/// two keys where one is a prefix of the other — without imposing an
+/// undocumented prefix-free obligation on library callers. The length always
+/// fits one byte because [`MAX_AUTHENTICATED_MAP_KEY_BYTES`] is 48.
+fn push_framed_key(bytes: &mut Vec<u8>, key: AuthenticatedMapKey) {
+    bytes.push(key.length);
+    bytes.extend_from_slice(key.as_slice());
+}
+
 const AUTHENTICATED_MAP_EMPTY_DOMAIN: &[u8] = b"tine/oplog/authenticated-map/v1/empty";
 const AUTHENTICATED_MAP_PRIORITY_DOMAIN: &[u8] = b"tine/oplog/authenticated-map/v1/priority\0";
-const AUTHENTICATED_MAP_NODE_DOMAIN: &[u8] = b"tine/oplog/authenticated-map/v1/node\0";
+const AUTHENTICATED_MAP_NODE_DOMAIN: &[u8] = b"tine/oplog/authenticated-map/v2/node\0";
 const ACCEPTED_STATUS_DOMAIN: &[u8] = b"tine/oplog/accepted-status/v2\0";
 const ACCEPTED_SEQUENCE_ENTRY_DOMAIN: &[u8] = b"tine/oplog/accepted-sequence/v2/entry\0";
 const ACCEPTED_SEQUENCE_LEAF_DOMAIN: &[u8] = b"tine/oplog/accepted-sequence/v2/leaf\0";
@@ -106,13 +291,13 @@ pub trait SealedAcceptedIndexObjectStore {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct MapLinkWire {
-    key: [u8; 16],
+    key: AuthenticatedMapKey,
     digest: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuthenticatedMapLinkV1 {
-    pub key: [u8; 16],
+    pub key: AuthenticatedMapKey,
     pub digest: ContentDigest,
 }
 
@@ -162,7 +347,7 @@ impl AuthenticatedMapRootV1 {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SealedAuthenticatedMapNodeV2 {
-    pub key: [u8; 16],
+    pub key: AuthenticatedMapKey,
     pub value_digest: ContentDigest,
     pub left: Option<AuthenticatedMapLinkV1>,
     pub right: Option<AuthenticatedMapLinkV1>,
@@ -171,7 +356,7 @@ pub struct SealedAuthenticatedMapNodeV2 {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct MapNodeWireV2 {
     schema: u32,
-    key: [u8; 16],
+    key: AuthenticatedMapKey,
     value_digest: [u8; 32],
     left: Option<MapLinkWire>,
     right: Option<MapLinkWire>,
@@ -224,31 +409,50 @@ pub fn authenticated_map_empty_digest() -> ContentDigest {
     ContentDigest::of(AUTHENTICATED_MAP_EMPTY_DOMAIN)
 }
 
-pub fn authenticated_map_priority(key: [u8; 16]) -> ContentDigest {
-    digest_fold(AUTHENTICATED_MAP_PRIORITY_DOMAIN, &[&key])
+/// Heap priority for one key.
+///
+/// The fold stays raw and keeps its v1 domain: its only variable-width input is
+/// the last field, so a single key already determines the preimage uniquely and
+/// no framing is needed. Keeping it byte-identical means the treap *shape* of
+/// every existing 16-byte map is unchanged by this widening; only the node
+/// digests are rebuilt.
+pub fn authenticated_map_priority(key: AuthenticatedMapKey) -> ContentDigest {
+    digest_fold(AUTHENTICATED_MAP_PRIORITY_DOMAIN, &[key.as_slice()])
 }
 
-pub fn authenticated_map_priority_order(left: [u8; 16], right: [u8; 16]) -> Ordering {
+/// Total order used for the treap heap, ties broken by the complete key.
+pub fn authenticated_map_priority_order(
+    left: AuthenticatedMapKey,
+    right: AuthenticatedMapKey,
+) -> Ordering {
     authenticated_map_priority(left)
         .as_bytes()
         .cmp(authenticated_map_priority(right).as_bytes())
         .then_with(|| left.cmp(&right))
 }
 
+/// The single shared authenticated-map node digest.
+///
+/// Every implementation — the sealed writer/reader, the SQLite frontier treap,
+/// and the Cartesian root builder — must call exactly this function, which is
+/// what makes their roots comparable bit for bit.
+///
+/// Own and child keys are **length-framed** (`length ‖ bytes`); see
+/// [`push_framed_key`].
 pub fn authenticated_map_node_digest(
-    key: [u8; 16],
+    key: AuthenticatedMapKey,
     value_digest: ContentDigest,
-    left: Option<([u8; 16], ContentDigest)>,
-    right: Option<([u8; 16], ContentDigest)>,
+    left: Option<(AuthenticatedMapKey, ContentDigest)>,
+    right: Option<(AuthenticatedMapKey, ContentDigest)>,
 ) -> ContentDigest {
     let mut bytes = AUTHENTICATED_MAP_NODE_DOMAIN.to_vec();
-    bytes.extend_from_slice(&key);
+    push_framed_key(&mut bytes, key);
     bytes.extend_from_slice(value_digest.as_bytes());
     for child in [left, right] {
         match child {
             Some((child_key, digest)) => {
                 bytes.push(1);
-                bytes.extend_from_slice(&child_key);
+                push_framed_key(&mut bytes, child_key);
                 bytes.extend_from_slice(digest.as_bytes());
             }
             None => bytes.push(0),
@@ -257,9 +461,9 @@ pub fn authenticated_map_node_digest(
     ContentDigest::of(&bytes)
 }
 
-/// Derive the exact V1 canonical treap root from strictly key-sorted entries.
+/// Derive the canonical treap root from strictly key-sorted entries.
 pub fn authenticated_map_root(
-    entries: &[([u8; 16], ContentDigest)],
+    entries: &[(AuthenticatedMapKey, ContentDigest)],
 ) -> Result<AuthenticatedMapRootV1, SealedAcceptedIndexError> {
     if entries.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
         return Err(corrupt("authenticated-map entries are not strictly sorted"));
@@ -274,7 +478,7 @@ pub fn authenticated_map_root(
 }
 
 fn authenticated_map_subtree(
-    entries: &[([u8; 16], ContentDigest)],
+    entries: &[(AuthenticatedMapKey, ContentDigest)],
 ) -> Option<AuthenticatedMapLinkV1> {
     let (root_index, (key, value_digest)) =
         entries
@@ -624,7 +828,7 @@ impl SealedAcceptedCausalRecordV2 {
             .iter()
             .map(|entry| {
                 (
-                    entry.peer_id,
+                    AuthenticatedMapKey::from(entry.peer_id),
                     causal_clock_counter_digest(entry.peer_id, entry.counter),
                 )
             })
@@ -719,7 +923,10 @@ pub fn accepted_causal_record_digest(
     match clock_root {
         Some(root) => {
             bytes.push(1);
-            bytes.extend_from_slice(&root.key);
+            // The clock root key became variable-width with the map key, and a
+            // fixed-width digest follows it, so it is length-framed here for
+            // the same injectivity reason as the node digest.
+            push_framed_key(&mut bytes, root.key);
             bytes.extend_from_slice(root.digest.as_bytes());
         }
         None => {
@@ -830,8 +1037,9 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexReader<'a, St
     pub fn map_value(
         &self,
         root: AuthenticatedMapRootV1,
-        key: [u8; 16],
+        key: impl Into<AuthenticatedMapKey>,
     ) -> Result<Option<ContentDigest>, SealedAcceptedIndexError> {
+        let key = key.into();
         validate_map_root(root)?;
         let mut current = root.root;
         for _ in 0..MAX_ACCEPTED_INDEX_DEPTH {
@@ -1029,9 +1237,10 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexWriter<'a, St
     pub fn upsert_map(
         &mut self,
         root: AuthenticatedMapRootV1,
-        key: [u8; 16],
+        key: impl Into<AuthenticatedMapKey>,
         value_digest: ContentDigest,
     ) -> Result<AuthenticatedMapRootV1, SealedAcceptedIndexError> {
+        let key = key.into();
         validate_map_root(root)?;
         let (link, inserted) = self.upsert_map_child(root.root, key, value_digest, 0)?;
         Ok(AuthenticatedMapRootV1 {
@@ -1057,8 +1266,9 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexWriter<'a, St
     pub fn remove_map(
         &mut self,
         root: AuthenticatedMapRootV1,
-        key: [u8; 16],
+        key: impl Into<AuthenticatedMapKey>,
     ) -> Result<AuthenticatedMapRootV1, SealedAcceptedIndexError> {
+        let key = key.into();
         validate_map_root(root)?;
         let (link, removed) = self.remove_map_child(root.root, key, 0)?;
         if !removed {
@@ -1158,7 +1368,7 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexWriter<'a, St
     fn upsert_map_child(
         &mut self,
         current: Option<AuthenticatedMapLinkV1>,
-        key: [u8; 16],
+        key: AuthenticatedMapKey,
         value_digest: ContentDigest,
         depth: usize,
     ) -> Result<(AuthenticatedMapLinkV1, bool), SealedAcceptedIndexError> {
@@ -1206,7 +1416,7 @@ impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexWriter<'a, St
     fn remove_map_child(
         &mut self,
         current: Option<AuthenticatedMapLinkV1>,
-        key: [u8; 16],
+        key: AuthenticatedMapKey,
         depth: usize,
     ) -> Result<(Option<AuthenticatedMapLinkV1>, bool), SealedAcceptedIndexError> {
         ensure_index_depth(depth)?;
@@ -1435,7 +1645,7 @@ fn validate_map_root(root: AuthenticatedMapRootV1) -> Result<(), SealedAcceptedI
 }
 
 fn valid_map_children(
-    key: [u8; 16],
+    key: AuthenticatedMapKey,
     left: Option<&AuthenticatedMapLinkV1>,
     right: Option<&AuthenticatedMapLinkV1>,
 ) -> bool {
@@ -1697,9 +1907,9 @@ mod tests {
     #[test]
     fn persistent_map_upsert_is_order_independent_and_point_readable() {
         let entries = [
-            ([0x10; 16], digest(0xa0)),
-            ([0x20; 16], digest(0xb0)),
-            ([0x30; 16], digest(0xc0)),
+            (key16(0x10), digest(0xa0)),
+            (key16(0x20), digest(0xb0)),
+            (key16(0x30), digest(0xc0)),
         ];
         let expected = authenticated_map_root(&entries).unwrap();
 
@@ -1726,7 +1936,7 @@ mod tests {
     #[test]
     fn persistent_map_removal_matches_canonical_rebuild_and_preserves_old_roots() {
         let entries: Vec<_> = (0..97u128)
-            .map(|i| (i.to_be_bytes(), digest(i as u8)))
+            .map(|i| (AuthenticatedMapKey::from(i.to_be_bytes()), digest(i as u8)))
             .collect();
         for reverse in [false, true] {
             let mut store = MemoryStore::default();
@@ -1781,7 +1991,7 @@ mod tests {
         let mut random = 12345u64;
         for step in 0..1024 {
             random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let key = u128::from((random >> 16) % 128).to_be_bytes();
+            let key = AuthenticatedMapKey::from(u128::from((random >> 16) % 128).to_be_bytes());
             if step % 3 == 0 {
                 let absent = expected.remove(&key).is_none();
                 let writes_before = store.objects.len();
@@ -2228,16 +2438,345 @@ mod tests {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
+    fn key16(fill: u8) -> AuthenticatedMapKey {
+        AuthenticatedMapKey::from([fill; 16])
+    }
+
+    fn tagged_entity_key(uuid: u8) -> AuthenticatedMapKey {
+        let mut bytes = vec![0x01];
+        bytes.extend_from_slice(&[uuid; 16]);
+        AuthenticatedMapKey::new(&bytes).unwrap()
+    }
+
+    fn tagged_membership_key(block: u8, page: u8) -> AuthenticatedMapKey {
+        let mut bytes = vec![0x02];
+        bytes.extend_from_slice(&[block; 16]);
+        bytes.extend_from_slice(&[page; 16]);
+        AuthenticatedMapKey::new(&bytes).unwrap()
+    }
+
+    /// The domain owner's mixed-width key space: 17-byte entity keys and
+    /// 33-byte membership keys interleaved, plus a bare 16-byte identity.
+    fn mixed_width_entries() -> Vec<(AuthenticatedMapKey, ContentDigest)> {
+        let mut entries = vec![
+            (tagged_entity_key(0x11), digest(0x01)),
+            (tagged_entity_key(0x22), digest(0x02)),
+            (tagged_entity_key(0x33), digest(0x03)),
+            (tagged_membership_key(0x11, 0x44), digest(0x04)),
+            (tagged_membership_key(0x11, 0x55), digest(0x05)),
+            (tagged_membership_key(0x22, 0x44), digest(0x06)),
+            (key16(0x00), digest(0x07)),
+            (AuthenticatedMapKey::new(&[0x03]).unwrap(), digest(0x08)),
+            (
+                AuthenticatedMapKey::new(&[0xff; MAX_AUTHENTICATED_MAP_KEY_BYTES]).unwrap(),
+                digest(0x09),
+            ),
+        ];
+        entries.sort_unstable_by_key(|(key, _)| *key);
+        entries
+    }
+
+    #[test]
+    fn authenticated_map_key_validates_length_and_hides_its_padding() {
+        assert!(AuthenticatedMapKey::new(&[]).is_err());
+        assert!(AuthenticatedMapKey::new(&[0; MAX_AUTHENTICATED_MAP_KEY_BYTES + 1]).is_err());
+        assert_eq!(AuthenticatedMapKey::new(&[7]).unwrap().len(), 1);
+        assert_eq!(
+            AuthenticatedMapKey::new(&[7; MAX_AUTHENTICATED_MAP_KEY_BYTES])
+                .unwrap()
+                .len(),
+            MAX_AUTHENTICATED_MAP_KEY_BYTES
+        );
+
+        // A short key and a longer key whose padding would make them equal are
+        // distinct in every identity channel the map uses.
+        let short = AuthenticatedMapKey::new(&[1, 2]).unwrap();
+        let padded_looking = AuthenticatedMapKey::new(&[1, 2, 0]).unwrap();
+        assert_ne!(short, padded_looking);
+        assert!(short < padded_looking);
+        assert_ne!(
+            authenticated_map_priority(short),
+            authenticated_map_priority(padded_looking)
+        );
+
+        let hash = |key: AuthenticatedMapKey| {
+            use std::hash::{BuildHasher as _, RandomState};
+            RandomState::new().hash_one(key)
+        };
+        assert_ne!(hash(short), hash(padded_looking));
+        assert_eq!(
+            AuthenticatedMapKey::from([0x5a; 16]),
+            AuthenticatedMapKey::new(&[0x5a; 16]).unwrap(),
+            "a 16-byte identity is exactly the 16-byte key"
+        );
+    }
+
+    #[test]
+    fn authenticated_map_key_orders_lexicographically_not_by_length() {
+        // The discriminating case: a derived `Ord` over `(length, bytes)` would
+        // put the one-byte key first. Lexicographic order does not, and the
+        // treap's search invariant and every sorted-unique precondition depend
+        // on the lexicographic answer.
+        let one = AuthenticatedMapKey::new(&[0x02]).unwrap();
+        let two = AuthenticatedMapKey::new(&[0x01, 0xff]).unwrap();
+        assert!(two < one);
+        assert_eq!(two.cmp(&one), [0x01_u8, 0xff][..].cmp(&[0x02][..]));
+
+        // A strict prefix sorts before its extension, matching SQLite BLOB
+        // order and the domain owner's own byte order.
+        let prefix = AuthenticatedMapKey::new(&[0x01, 0x02]).unwrap();
+        let extension = AuthenticatedMapKey::new(&[0x01, 0x02, 0x00]).unwrap();
+        assert!(prefix < extension);
+
+        // Class tags keep entity and membership keys in disjoint contiguous
+        // ranges, and the shared order agrees with the raw bytes throughout.
+        let mut keys: Vec<AuthenticatedMapKey> =
+            mixed_width_entries().into_iter().map(|(k, _)| k).collect();
+        keys.sort_unstable();
+        let mut raw: Vec<Vec<u8>> = keys.iter().map(|key| key.as_slice().to_vec()).collect();
+        raw.sort();
+        assert_eq!(
+            keys.iter()
+                .map(|key| key.as_slice().to_vec())
+                .collect::<Vec<_>>(),
+            raw
+        );
+    }
+
+    #[test]
+    fn authenticated_map_key_serde_is_canonical_and_rejects_malformed_lengths() {
+        for key in [
+            AuthenticatedMapKey::new(&[0x09]).unwrap(),
+            key16(0x42),
+            tagged_membership_key(0x11, 0x22),
+            AuthenticatedMapKey::new(&[0xab; MAX_AUTHENTICATED_MAP_KEY_BYTES]).unwrap(),
+        ] {
+            let bytes = canonical_encode(&key).unwrap();
+            // One canonical representation: a length prefix and the meaningful
+            // bytes only, never the fixed-width padding.
+            assert_eq!(bytes.len(), 1 + key.len());
+            assert_eq!(bytes[0] as usize, key.len());
+            assert_eq!(&bytes[1..], key.as_slice());
+            assert_eq!(
+                canonical_decode::<AuthenticatedMapKey>(&bytes, "key").unwrap(),
+                key
+            );
+        }
+
+        // Zero-length and over-long encodings are refused at the codec, so no
+        // padded or empty second representation can be read back.
+        assert!(canonical_decode::<AuthenticatedMapKey>(&[0x00], "key").is_err());
+        let mut oversized = vec![(MAX_AUTHENTICATED_MAP_KEY_BYTES + 1) as u8];
+        oversized.extend_from_slice(&[0u8; MAX_AUTHENTICATED_MAP_KEY_BYTES + 1]);
+        assert!(canonical_decode::<AuthenticatedMapKey>(&oversized, "key").is_err());
+
+        // The same refusal reaches a whole stored map node.
+        let node = SealedAuthenticatedMapNodeV2 {
+            key: tagged_entity_key(0x77),
+            value_digest: digest(0x33),
+            left: None,
+            right: None,
+        };
+        let encoded = node.encode().unwrap();
+        let link = AuthenticatedMapLinkV1 {
+            key: node.key,
+            digest: node.logical_digest(),
+        };
+        assert_eq!(
+            SealedAuthenticatedMapNodeV2::decode(link, &encoded).unwrap(),
+            node
+        );
+        let mut zero_length_key = encoded.clone();
+        let key_offset = zero_length_key
+            .windows(1 + node.key.len())
+            .position(|window| {
+                window[0] as usize == node.key.len() && &window[1..] == node.key.as_slice()
+            })
+            .expect("the encoded node carries its length-prefixed key");
+        zero_length_key[key_offset] = 0;
+        assert!(SealedAuthenticatedMapNodeV2::decode(link, &zero_length_key).is_err());
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(SealedAuthenticatedMapNodeV2::decode(link, &trailing).is_err());
+    }
+
+    /// The reason the shared node digest length-frames its keys.
+    ///
+    /// With a raw fold, a one-byte-longer own key can absorb the first byte of
+    /// the value digest, shifting every later field by one and letting a
+    /// *different* (key, value, child) triple produce the identical preimage.
+    /// The pair below is exactly such a shift; framing separates them.
+    #[test]
+    fn authenticated_map_node_digest_length_frames_keys_against_shift_collisions() {
+        let mut value_a = [0x5a_u8; 32];
+        value_a[31] = 1; // becomes the child-present tag byte in the shifted twin
+        let child_digest = digest(0x6b);
+
+        let long_key = AuthenticatedMapKey::new(&[0xaa, 0xbb]).unwrap();
+        let short_key = AuthenticatedMapKey::new(&[0xaa]).unwrap();
+
+        let mut value_b = [0u8; 32];
+        value_b[0] = 0xbb;
+        value_b[1..].copy_from_slice(&value_a[..31]);
+
+        let child_a = AuthenticatedMapKey::new(&[0x77]).unwrap();
+        let child_b = AuthenticatedMapKey::new(&[0x01, 0x77]).unwrap();
+
+        // Raw preimages: identical byte strings, byte for byte.
+        let raw = |key: AuthenticatedMapKey, value: [u8; 32], child: AuthenticatedMapKey| {
+            let mut bytes = AUTHENTICATED_MAP_NODE_DOMAIN.to_vec();
+            bytes.extend_from_slice(key.as_slice());
+            bytes.extend_from_slice(&value);
+            bytes.push(1);
+            bytes.extend_from_slice(child.as_slice());
+            bytes.extend_from_slice(child_digest.as_bytes());
+            bytes.push(0);
+            bytes
+        };
+        assert_eq!(
+            raw(long_key, value_a, child_a),
+            raw(short_key, value_b, child_b),
+            "the two nodes are a genuine raw-fold collision"
+        );
+
+        // The shared, length-framed digest separates them.
+        let framed = |key: AuthenticatedMapKey, value: [u8; 32], child: AuthenticatedMapKey| {
+            authenticated_map_node_digest(
+                key,
+                ContentDigest::from_bytes(value),
+                Some((child, child_digest)),
+                None,
+            )
+        };
+        assert_ne!(
+            framed(long_key, value_a, child_a),
+            framed(short_key, value_b, child_b)
+        );
+
+        // Prefix-related keys in the same slot also stay distinct.
+        assert_ne!(
+            authenticated_map_node_digest(
+                AuthenticatedMapKey::new(&[0x01, 0x02]).unwrap(),
+                digest(0x10),
+                None,
+                None,
+            ),
+            authenticated_map_node_digest(
+                AuthenticatedMapKey::new(&[0x01, 0x02, 0x00]).unwrap(),
+                digest(0x10),
+                None,
+                None,
+            )
+        );
+    }
+
+    #[test]
+    fn full_key_sealed_upserts_match_the_cartesian_root_in_every_insertion_order() {
+        let entries = mixed_width_entries();
+        let expected = authenticated_map_root(&entries).unwrap();
+        assert_eq!(expected.count, entries.len() as u64);
+
+        let orders: [Vec<usize>; 4] = [
+            (0..entries.len()).collect(),
+            (0..entries.len()).rev().collect(),
+            (0..entries.len())
+                .filter(|index| index % 2 == 0)
+                .chain((0..entries.len()).filter(|index| index % 2 == 1))
+                .collect(),
+            vec![4, 0, 8, 2, 6, 1, 7, 3, 5],
+        ];
+        for order in orders {
+            assert_eq!(order.len(), entries.len());
+            let mut store = MemoryStore::default();
+            let mut root = AuthenticatedMapRootV1::empty();
+            for index in &order {
+                root = SealedAcceptedIndexWriter::new(&mut store)
+                    .upsert_map(root, entries[*index].0, entries[*index].1)
+                    .unwrap();
+            }
+            assert_eq!(root, expected, "insertion order {order:?} changed the root");
+
+            // Point lookups resolve every key, including the same-UUID entity
+            // and membership pair and the strict-prefix pair.
+            let reader = SealedAcceptedIndexReader::new(&store);
+            for (key, value) in &entries {
+                assert_eq!(reader.map_value(root, *key).unwrap(), Some(*value));
+            }
+            assert_eq!(
+                reader.map_value(root, tagged_entity_key(0x99)).unwrap(),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn full_key_removal_reaches_the_shared_empty_root_including_the_last_entry() {
+        let entries = mixed_width_entries();
+        let mut store = MemoryStore::default();
+        let mut root = AuthenticatedMapRootV1::empty();
+        for (key, value) in &entries {
+            root = SealedAcceptedIndexWriter::new(&mut store)
+                .upsert_map(root, *key, *value)
+                .unwrap();
+        }
+
+        let mut remaining = entries.clone();
+        while !remaining.is_empty() {
+            let (key, _) = remaining.remove(remaining.len() / 2);
+            root = SealedAcceptedIndexWriter::new(&mut store)
+                .remove_map(root, key)
+                .unwrap();
+            assert_eq!(root, authenticated_map_root(&remaining).unwrap());
+            assert_eq!(
+                SealedAcceptedIndexReader::new(&store)
+                    .map_value(root, key)
+                    .unwrap(),
+                None
+            );
+        }
+
+        // Removing the last entry lands on the canonical empty root, which is
+        // the pairing the SQLite frontier's empty-shape check accepts.
+        assert_eq!(root, AuthenticatedMapRootV1::empty());
+        assert_eq!(root.count, 0);
+        assert!(root.root.is_none());
+        assert_eq!(root.root_digest(), authenticated_map_empty_digest());
+    }
+
+    #[test]
+    fn sixteen_byte_identity_maps_stay_consistent_across_writer_reader_and_cartesian() {
+        let entries: Vec<_> = (0..64u128)
+            .map(|i| (AuthenticatedMapKey::from(i.to_be_bytes()), digest(i as u8)))
+            .collect();
+        let mut store = MemoryStore::default();
+        let mut root = AuthenticatedMapRootV1::empty();
+        for (key, value) in entries.iter().rev() {
+            root = SealedAcceptedIndexWriter::new(&mut store)
+                .upsert_map(root, *key, *value)
+                .unwrap();
+        }
+        assert_eq!(root, authenticated_map_root(&entries).unwrap());
+
+        // The UUID-typed status seam still reaches the same entries by raw
+        // `[u8; 16]`, with no key type at the call site.
+        let reader = SealedAcceptedIndexReader::new(&store);
+        for (index, (_, value)) in entries.iter().enumerate() {
+            let id = (index as u128).to_be_bytes();
+            assert_eq!(reader.map_value(root, id).unwrap(), Some(*value));
+        }
+        assert_eq!(reader.map_value(root, [0xff; 16]).unwrap(), None);
+    }
+
     #[test]
     fn v1_and_v2_golden_vectors_are_frozen() {
-        let key = [0x11; 16];
+        let key = key16(0x11);
         let priority = authenticated_map_priority(key).to_string();
         let empty = authenticated_map_empty_digest().to_string();
         let node = authenticated_map_node_digest(key, digest(0x22), None, None).to_string();
         let root = authenticated_map_root(&[
-            ([0x10; 16], digest(0xa0)),
-            ([0x20; 16], digest(0xb0)),
-            ([0x30; 16], digest(0xc0)),
+            (key16(0x10), digest(0xa0)),
+            (key16(0x20), digest(0xb0)),
+            (key16(0x30), digest(0xc0)),
         ])
         .unwrap();
 
@@ -2277,31 +2816,31 @@ mod tests {
         );
         assert_eq!(
             node,
-            "e565466183c18e6d795f150dc3294acaed8028c54880f1135ab51cf2bb1fbf23"
+            "7e95dc91b6c2842c6fb1948c49901f4331624e2e420130590e6bce6028e2d64c"
         );
         assert_eq!(
             root.root_digest().to_string(),
-            "57a8918c46769c518761d22c6d8a6087d57e0897a06f62e6ee52a2c434fbed8d"
+            "8f97b0824b8b3674284e302539c276f91ab41e26b4f0b46eac668832c51d31dd"
         );
         assert_eq!(causal_bytes, "02515151515151515151515151515151512222222222222222222222222222222222222222222222222222222222222222333333333333333333333333333333333333333333333333333333333333333344444444444444444444444444444444070211111111111111111111111111111111034444444444444444444444444444444407");
         assert_eq!(
             causal_address,
-            "7f4986b2491f46879adadfd66a4f7c3f516006c123868ad7ecff6d5791b80756"
+            "8256b076a35d84e81ff47ae5b044bca6753ae167ddc2dd0413b630bcb49af197"
         );
         assert_eq!(
             clock_root.root_digest().to_string(),
-            "effa60f99d8c9c9560c9f6d176ce457070460af5152e813d6affdd6cb48496d2"
+            "0190f2ad40bf5145da6838c56d638d6620c975cfd7271cd4de8b318833af11ea"
         );
-        assert_eq!(status_bytes, "0251515151515151515151515151515151000152015151515151515151515151515151515122222222222222222222222222222222222222222222222222222222222222223333333333333333333333333333333333333333333333333333333333333333017f4986b2491f46879adadfd66a4f7c3f516006c123868ad7ecff6d5791b80756");
+        assert_eq!(status_bytes, "0251515151515151515151515151515151000152015151515151515151515151515151515122222222222222222222222222222222222222222222222222222222222222223333333333333333333333333333333333333333333333333333333333333333018256b076a35d84e81ff47ae5b044bca6753ae167ddc2dd0413b630bcb49af197");
         assert_eq!(
             status_digest,
-            "6bdd768fa218e9f43ad0cf93530f2a8fb951f77403d989e78bfd8cb8a6b3a2c1"
+            "5b90c90985efd08eab2a6d661130d320ff6013d996dff26e7f9af03e2916fa66"
         );
-        assert_eq!(leaf_bytes, "020102030405060708515151515151515151515151515151516bdd768fa218e9f43ad0cf93530f2a8fb951f77403d989e78bfd8cb8a6b3a2c1");
+        assert_eq!(leaf_bytes, "020102030405060708515151515151515151515151515151515b90c90985efd08eab2a6d661130d320ff6013d996dff26e7f9af03e2916fa66");
         assert_eq!(
             leaf_digest,
-            "e75ae7327f31bc853a826ce6386c6786f0452da204cecb25f4f0ef7c883bac74"
+            "5a1261cf99c25091749f7ecf0095f0a9872bb6c3bf57cd69506d613a4a667701"
         );
-        assert_eq!(node_bytes, "020100000000000000010100000000000000010000000000000001e75ae7327f31bc853a826ce6386c6786f0452da204cecb25f4f0ef7c883bac74");
+        assert_eq!(node_bytes, "0201000000000000000101000000000000000100000000000000015a1261cf99c25091749f7ecf0095f0a9872bb6c3bf57cd69506d613a4a667701");
     }
 }
