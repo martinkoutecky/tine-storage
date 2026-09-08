@@ -119,6 +119,22 @@ pub fn query_result_estimated_bytes<'a>(
         .saturating_add(128)
 }
 
+/// Stable construction estimate for a shallow page result, shared by the
+/// producer and admitted-payload validator. Counts UTF-8 string bytes plus a
+/// fixed row allowance; this is not an exact allocator/RSS measurement.
+pub fn query_page_result_estimated_bytes<'a>(
+    name: &str,
+    path: &str,
+    properties: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> usize {
+    properties.into_iter().fold(
+        96usize
+            .saturating_add(name.len())
+            .saturating_add(path.len()),
+        |bytes, (key, value)| bytes.saturating_add(key.len()).saturating_add(value.len()),
+    )
+}
+
 /// Expand parent-local sibling order into whole-page preorder. Returns original
 /// input indices and one-based depths, so producers can share ordering without
 /// allocating document payload. Equal orders use block ID.
@@ -766,6 +782,12 @@ pub const QUERY_PAGE_ORDER_DDL: &str = "CREATE TABLE query_page_order (
         REFERENCES pages(page_id) ON DELETE CASCADE,
     position INTEGER NOT NULL UNIQUE CHECK (position >= 0)
 ) STRICT";
+pub const QUERY_PAGE_RESULTS_DDL: &str = "CREATE TABLE query_page_results (
+    page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16)
+        REFERENCES pages(page_id) ON DELETE CASCADE,
+    estimated_bytes INTEGER NOT NULL CHECK (estimated_bytes >= 0),
+    property_count INTEGER NOT NULL CHECK (property_count >= 0)
+) STRICT";
 pub const BLOCK_OWN_REFS_DDL: &str = "CREATE TABLE block_own_refs (
     block_id BLOB NOT NULL CHECK (length(block_id) = 16)
         REFERENCES blocks(block_id) ON DELETE CASCADE,
@@ -822,6 +844,8 @@ pub const PAGE_PORTABLE_PATH_CLAIMS_KEY_INDEX_DDL: &str =
      ON page_portable_path_claims(portable_path_key, page_id)";
 pub const BLOCKS_PAGE_ORDER_INDEX_DDL: &str =
     "CREATE INDEX blocks_page_order_idx ON blocks(page_id, order_key, block_id)";
+pub const BLOCKS_PARENT_PAGE_INDEX_DDL: &str = "CREATE INDEX blocks_parent_page_idx
+    ON blocks(parent_block_id, page_id, block_id) WHERE parent_block_id IS NOT NULL";
 pub const BLOCKS_LOGSEQ_UUID_INDEX_DDL: &str = "CREATE INDEX blocks_logseq_uuid_idx
     ON blocks(logseq_uuid, block_id) WHERE logseq_uuid IS NOT NULL";
 pub const SEARCH_FTS_OWNERS_PAGE_INDEX_DDL: &str =
@@ -892,7 +916,7 @@ pub const PROPERTY_ATOMS_PAGE_INDEX_DDL: &str = "CREATE INDEX property_atoms_pag
 // indexes and both FTS virtual tables remain live throughout construction.
 // This list must reproduce the exact normal schema before the terminal stamp
 // can advance.
-const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 34] = [
+const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 35] = [
     ("pages_name_idx", PAGES_NAME_INDEX_DDL),
     ("pages_name_key_idx", PAGES_NAME_KEY_INDEX_DDL),
     ("pages_journal_day_idx", PAGES_JOURNAL_DAY_INDEX_DDL),
@@ -906,6 +930,7 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 34] = [
         PAGE_PORTABLE_PATH_CLAIMS_KEY_INDEX_DDL,
     ),
     ("blocks_page_order_idx", BLOCKS_PAGE_ORDER_INDEX_DDL),
+    ("blocks_parent_page_idx", BLOCKS_PARENT_PAGE_INDEX_DDL),
     ("blocks_logseq_uuid_idx", BLOCKS_LOGSEQ_UUID_INDEX_DDL),
     (
         "search_fts_owners_page_idx",
@@ -971,7 +996,7 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 34] = [
     ("property_atoms_page_idx", PROPERTY_ATOMS_PAGE_INDEX_DDL),
 ];
 
-const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 27] = [
+const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 28] = [
     (
         "materialization_stamp",
         &[
@@ -1175,6 +1200,10 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 27] = [
     ),
     ("query_page_order", &["page_id", "position"]),
     (
+        "query_page_results",
+        &["page_id", "estimated_bytes", "property_count"],
+    ),
+    (
         "property_atoms",
         &[
             "owner_type",
@@ -1217,7 +1246,7 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 27] = [
     ),
 ];
 
-const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 62] = [
+const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 64] = [
     ("table", "materialization_stamp", MATERIALIZATION_STAMP_DDL),
     (
         "table",
@@ -1269,6 +1298,7 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 62] = [
     ("table", "block_own_refs", BLOCK_OWN_REFS_DDL),
     ("table", "query_block_results", QUERY_BLOCK_RESULTS_DDL),
     ("table", "query_page_order", QUERY_PAGE_ORDER_DDL),
+    ("table", "query_page_results", QUERY_PAGE_RESULTS_DDL),
     ("table", "property_atoms", PROPERTY_ATOMS_DDL),
     ("table", "search_fts_owners", SEARCH_FTS_OWNERS_DDL),
     ("table", "search_fts", SEARCH_FTS_DDL),
@@ -1297,6 +1327,11 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 62] = [
         "index",
         "blocks_page_order_idx",
         BLOCKS_PAGE_ORDER_INDEX_DDL,
+    ),
+    (
+        "index",
+        "blocks_parent_page_idx",
+        BLOCKS_PARENT_PAGE_INDEX_DDL,
     ),
     (
         "index",
@@ -1480,6 +1515,7 @@ pub(crate) fn initialize_graph_projection_schema(
          {BLOCK_OWN_REFS_DDL};
          {QUERY_BLOCK_RESULTS_DDL};
          {QUERY_PAGE_ORDER_DDL};
+         {QUERY_PAGE_RESULTS_DDL};
          {PROPERTY_ATOMS_DDL};
          {SEARCH_FTS_OWNERS_DDL};
          {SEARCH_FTS_DDL};
@@ -1493,6 +1529,7 @@ pub(crate) fn initialize_graph_projection_schema(
          {PAGES_HOME_DOCUMENT_ID_INDEX_DDL};
          {PAGE_PORTABLE_PATH_CLAIMS_KEY_INDEX_DDL};
          {BLOCKS_PAGE_ORDER_INDEX_DDL};
+         {BLOCKS_PARENT_PAGE_INDEX_DDL};
          {BLOCKS_LOGSEQ_UUID_INDEX_DDL};
          {SEARCH_FTS_OWNERS_PAGE_INDEX_DDL};
          {REFERENCES_TARGET_INDEX_DDL};
@@ -2240,8 +2277,9 @@ pub struct PhysicalTerminalProjectionStamp {
     pub frontier_root_digest: ContentDigest,
 }
 
-const TERMINAL_CONSTRUCTION_EMPTY_TABLES: [&str; 19] = [
+const TERMINAL_CONSTRUCTION_EMPTY_TABLES: [&str; 20] = [
     "pages",
+    "query_page_results",
     "page_portable_path_claims",
     "blocks",
     "block_home_claims",
@@ -3033,6 +3071,7 @@ pub(crate) fn reset_graph_projection_rows(
          DELETE FROM block_own_refs;
          DELETE FROM query_block_results;
          DELETE FROM query_page_order;
+         DELETE FROM query_page_results;
          DELETE FROM block_planning;
          DELETE FROM tasks;
          DELETE FROM tags;
@@ -3083,7 +3122,11 @@ fn delete_page(
             params![page.as_slice()],
         )?,
     );
-    for table in ["query_block_results", "query_page_order"] {
+    for table in [
+        "query_block_results",
+        "query_page_order",
+        "query_page_results",
+    ] {
         instrumentation.owned_rows =
             instrumentation
                 .owned_rows
@@ -3252,6 +3295,18 @@ fn insert_page(transaction: &Connection, page: &PhysicalPage) -> Result<(), Mate
         page.page_id,
         &page.property_atoms,
     )?;
+    let page_estimated = query_page_result_estimated_bytes(
+        &page.name,
+        &page.path,
+        page.properties
+            .iter()
+            .map(|property| (property.name.as_str(), property.value.as_str())),
+    );
+    execute_cached(transaction,
+        "INSERT INTO query_page_results (page_id, estimated_bytes, property_count) VALUES (?1, ?2, ?3)",
+        params![page.page_id.as_slice(),
+            i64::try_from(page_estimated).map_err(|_| MaterializationError::InvalidInput("query page estimate exceeds SQLite".into()))?,
+            i64::try_from(page.properties.len()).map_err(|_| MaterializationError::InvalidInput("query page property count exceeds SQLite".into()))?])?;
     if let Some(position) = page.query_page_order {
         execute_cached(
             transaction,
@@ -6820,6 +6875,76 @@ mod tests {
     }
 
     #[test]
+    fn page_result_metadata_uses_utf8_properties_and_tracks_transactional_replacement() {
+        for foreign_keys in [false, true] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            connection
+                .pragma_update(None, "foreign_keys", foreign_keys)
+                .unwrap();
+            initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
+            let mut input = page(1, "payload");
+            input.name = "é".into();
+            input.path = "pages/é.md".into();
+            input.properties = vec![
+                PhysicalProperty {
+                    name: "É".into(),
+                    normalized_name: "é".into(),
+                    value: "α".into(),
+                },
+                PhysicalProperty {
+                    name: "É".into(),
+                    normalized_name: "é".into(),
+                    value: "😀".into(),
+                },
+            ];
+            apply_and_commit(
+                &mut connection,
+                &change(1, vec![input.clone()], Vec::new()),
+                1,
+                digest(b"f1"),
+            );
+            let metadata = |connection: &Connection| {
+                connection.query_row("SELECT estimated_bytes, property_count FROM query_page_results WHERE page_id = ?1",
+                    params![input.page_id.as_slice()], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))).unwrap()
+            };
+            let original = (96 + 2 + 11 + 2 + 2 + 2 + 4, 2);
+            assert_eq!(metadata(&connection), original);
+            let mut replacement = input.clone();
+            replacement.name = "New".into();
+            replacement.path = "pages/New.md".into();
+            replacement.properties.clear();
+            {
+                let transaction = connection.transaction().unwrap();
+                delete_page(&transaction, input.page_id, true, &BTreeSet::new()).unwrap();
+                insert_page(&transaction, &replacement).unwrap();
+                assert_eq!(metadata(&transaction), (96 + 3 + 12, 0));
+                transaction.rollback().unwrap();
+            }
+            assert_eq!(metadata(&connection), original);
+            apply_and_commit(
+                &mut connection,
+                &change(2, vec![replacement], Vec::new()),
+                2,
+                digest(b"f2"),
+            );
+            assert_eq!(metadata(&connection), (96 + 3 + 12, 0));
+            apply_and_commit(
+                &mut connection,
+                &change(3, Vec::new(), vec![input.page_id]),
+                3,
+                digest(b"f3"),
+            );
+            assert_eq!(
+                connection
+                    .query_row("SELECT COUNT(*) FROM query_page_results", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
     fn query_preorder_rejects_incomplete_or_cyclic_trees() {
         assert!(query_block_preorder([(id(1), Some(id(2)), "a")]).is_err());
         assert!(
@@ -6903,6 +7028,7 @@ mod tests {
                 "block_text",
                 "query_block_results",
                 "query_page_order",
+                "query_page_results",
                 "block_own_refs",
             ] {
                 let count: i64 = connection
@@ -6920,6 +7046,7 @@ mod tests {
                 "blocks",
                 "query_block_results",
                 "query_page_order",
+                "query_page_results",
                 "block_own_refs",
             ] {
                 let count: i64 = connection
@@ -8083,6 +8210,80 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn parent_completeness_index_seeks_and_exposes_foreign_page_children() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
+        apply_and_commit(
+            &mut connection,
+            &change(
+                0x600,
+                vec![page(0x60, "parent"), page(0x61, "foreign")],
+                Vec::new(),
+            ),
+            1,
+            digest(b"frontier"),
+        );
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE blocks SET parent_block_id = ?1 WHERE block_id = ?2",
+                params![id(0x1060), id(0x1061)],
+            )
+            .unwrap();
+        let sql = "SELECT parent_block_id, page_id, COUNT(*) FROM blocks
+            WHERE parent_block_id IN (?1, ?2) GROUP BY parent_block_id, page_id";
+        let plan = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(params![id(0x1060), id(0x1061)], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|detail| detail
+                .contains("SEARCH blocks USING COVERING INDEX blocks_parent_page_idx")
+                && detail.contains("parent_block_id=?")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.contains("SCAN blocks")),
+            "{plan:?}"
+        );
+        let counts = connection
+            .prepare(sql)
+            .unwrap()
+            .query_map(params![id(0x1060), id(0x1061)], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(counts, vec![(id(0x1060).to_vec(), id(0x61).to_vec(), 1)]);
+        connection
+            .execute(
+                "DELETE FROM blocks WHERE block_id = ?1",
+                params![id(0x1061)],
+            )
+            .unwrap();
+        let remaining: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM blocks WHERE parent_block_id = ?1",
+                params![id(0x1060)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[test]

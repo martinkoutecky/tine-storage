@@ -23,7 +23,7 @@ use crate::sqlite_materialization::{
 use crate::ContentDigest;
 
 pub const SQLITE_APPLICATION_ID: u32 = 0x5449_4e45;
-pub const SQLITE_SCHEMA_VERSION: u32 = 27;
+pub const SQLITE_SCHEMA_VERSION: u32 = 28;
 const MAX_AUTHENTICATED_MAP_DEPTH: usize = 256;
 
 pub const META_DDL: &str = "CREATE TABLE meta (
@@ -164,7 +164,7 @@ pub const BATCH_ID_INDEX_DDL: &str =
 pub const ACCEPTANCE_SEQUENCE_INDEX_DDL: &str = "CREATE UNIQUE INDEX \
     applied_batches_acceptance_sequence_uq ON applied_batches(acceptance_sequence)";
 
-const EXPECTED_TABLES: [&str; 46] = [
+const EXPECTED_TABLES: [&str; 47] = [
     "accepted_batch_nodes",
     "applied_batches",
     "block_home_claims",
@@ -172,6 +172,7 @@ const EXPECTED_TABLES: [&str; 46] = [
     "block_own_refs",
     "query_block_results",
     "query_page_order",
+    "query_page_results",
     "block_planning",
     "blocks",
     "block_text",
@@ -212,7 +213,7 @@ const EXPECTED_TABLES: [&str; 46] = [
     "tags",
     "tasks",
 ];
-const EXPECTED_INDEXES: [&str; 36] = [
+const EXPECTED_INDEXES: [&str; 37] = [
     "applied_batches_acceptance_sequence_uq",
     "applied_batches_batch_id_uq",
     "block_path_refs_lookup_idx",
@@ -224,6 +225,7 @@ const EXPECTED_INDEXES: [&str; 36] = [
     "block_planning_scheduled_idx",
     "blocks_logseq_uuid_idx",
     "blocks_page_order_idx",
+    "blocks_parent_page_idx",
     "page_portable_path_claims_key_idx",
     "pages_home_document_id_idx",
     "pages_name_idx",
@@ -3790,32 +3792,24 @@ mod tests {
 
     #[test]
     fn prior_sqlite_schema_is_refused_instead_of_migrated_or_dually_read() {
-        let (_path, connection, _) = initialized();
-        connection
-            .execute_batch("PRAGMA user_version = 21")
-            .unwrap();
-        let error = validate_schema_and_claim(&connection, claim()).unwrap_err();
-        assert!(matches!(error, FrontierError::Schema(_)));
-        assert!(error.to_string().contains("user_version 21"));
-        let found: u32 = connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(found, 21, "validation must not rewrite an old schema");
-
-        // The schema this packet retires is refused by the same one arm: the
-        // projection is disposable, so an unrecognized cache is rebuilt by the
-        // caller, never migrated or dually read here.
-        connection
-            .execute_batch(&format!(
-                "PRAGMA user_version = {}",
-                SQLITE_SCHEMA_VERSION - 1
-            ))
-            .unwrap();
-        let error = validate_schema_and_claim(&connection, claim()).unwrap_err();
-        assert!(matches!(error, FrontierError::Schema(_)));
-        assert!(error
-            .to_string()
-            .contains(&format!("user_version {}", SQLITE_SCHEMA_VERSION - 1)));
+        for unsupported in [21u32, 26, 27, 29] {
+            let (_path, connection, _) = initialized();
+            connection
+                .pragma_update(None, "user_version", unsupported)
+                .unwrap();
+            let error = validate_schema_and_claim(&connection, claim()).unwrap_err();
+            assert!(matches!(error, FrontierError::Schema(_)));
+            assert!(error
+                .to_string()
+                .contains(&format!("user_version {unsupported}")));
+            let found: u32 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(
+                found, unsupported,
+                "validation must not rewrite an unsupported schema"
+            );
+        }
 
         // And a forged user_version does not get past the canonical SQL check:
         // the widened document-key CHECK is compared structurally.

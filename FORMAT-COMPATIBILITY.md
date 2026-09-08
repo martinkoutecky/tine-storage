@@ -9,7 +9,7 @@ is a review aid, not a second source of truth.
 | --- | --- | --- |
 | Oplog manifest/object protocol | protocol 2; object envelope 2; manifest encoding 4 | Existing versions must remain readable or receive an explicit migration before a writer changes these values. |
 | Local journal | frame schema 1; segment/frontier protocol 2; `TINEJNL2`/`TINEFRT2`; 136-byte header; 240-byte `.frontier-v2` | This is the only current pre-0.7 format. Recovery accepts only the exact selected header and frontier and treats bytes beyond a valid old frontier as uncommitted suffix. Tine backs up and rebuilds unrecognized private state rather than migrating or dual-reading it. |
-| SQLite projection | application ID `0x54494e45`; current schema 27 | One exact `PRAGMA user_version` plus one frozen table/index/DDL census. This is pre-0.7 private state: the crate contains no older-schema reader or migration path. Tine preserves an unrecognized private store as a backup and rebuilds the current store from Markdown/Org. Live and separately built checkpoint-candidate files use this same schema; no production marker selects a candidate in this release. |
+| SQLite projection | application ID `0x54494e45`; current schema 28 | One exact `PRAGMA user_version` plus one frozen table/index/DDL census. This is pre-0.7 private state: the crate contains no older-schema reader or migration path. Tine preserves an unrecognized private store as a backup and rebuilds the current store from Markdown/Org. Live and separately built checkpoint-candidate files use this same schema; no production marker selects a candidate in this release. |
 | Sealed accepted-history index | family schema 3; map-node schema 3; status/sequence/causal schemas 2; authenticated-map key 1..=48 bytes; sequence fanout 32; leaf capacity 1 | No production Tine marker names these objects yet. These numbers identify the one current canonical encoding; they do not imply a supported earlier encoding or migration path. After 0.7 compatibility begins, a change must preserve released readers or use a new object namespace/schema rather than replace bytes at an existing address. |
 | Checkpoint fingerprints | 64 KiB edges; 16 KiB interior ranges; 1 MiB interior sampling interval | Stored and freshly computed fingerprints are comparable only with identical geometry. |
 | Managed-storage layout | Current shared-provider, archive object/batch, projection-receipt, enrollment, source-capture, runtime/journal, and SQLite path vocabulary frozen in `managed-layout-v1.txt` | Zero-consumer Patricia, detached-bootstrap, engine-history, scratch, reconciliation, projection-work, resume-point, and migration-staging names were removed before 0.7. Tine preserves unrecognized private state as a backup and rebuilds from Markdown/Org; future post-0.7 changes must preserve old readers/writers or carry an explicit migration/rebuild rule. |
@@ -19,7 +19,21 @@ already-written data. The exact released bounds are pinned by
 `formats::tests::format_identity_is_pinned` and included in every certification
 receipt.
 
-Schema 26 adds `query_block_results` (public identity, preorder, estimate and
+Schema 28 adds `blocks_parent_page_idx`, a partial covering index on
+`(parent_block_id, page_id, block_id)` for non-NULL parents. Subtree readers can
+check immediate-child counts without scanning unrelated page blocks, including
+detecting cross-page parent pointers. Normal and terminal construction produce
+the same index. The Direct query metadata marker advances to 28 too: older
+Direct readers validate its DDL but do not reject additional tables or indexes.
+Changing that marker ensures rollback rejects and rebuilds the newer cache.
+The same release adds `query_page_results`, keyed by physical page ID, containing
+only the shallow page construction estimate and property count. Values and their
+ordered spelling remain in `properties`. Replacement/deletion/reset maintain the
+metadata explicitly even with foreign keys disabled; unchanged inventory/order
+reconciliation does not rewrite it. Page result readers admit by estimate before
+fetching properties and validate admitted payload against both fields.
+
+Schema 26 introduced `query_block_results` (public identity, preorder, estimate and
 counts), `query_page_order` (Direct session positions), and `block_own_refs`
 (names before closure). These share the page transaction, are explicitly deleted
 on replacement/deletion/reset even with foreign keys disabled, and contain no
@@ -27,7 +41,7 @@ serialized DTO or duplicate raw text. Producers must supply complete trees;
 preorder expands parent-local order with physical-ID ties. No authority input
 format changes. Older/newer disposable schemas are rejected and rebuilt.
 Direct `direct_source_revisions` includes `query_metadata_schema`, constrained to
-26. Its exact three-column shape and DDL are validated: old readers that only
+28. Its exact three-column shape and DDL are validated: old readers that only
 check known table shapes also reject this cache, rather than overlook the new
 tables. This marker carries no authority data or migration behavior.
 Full Direct inventory reconciliation updates only `query_page_order` when its

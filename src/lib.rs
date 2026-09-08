@@ -62,9 +62,9 @@ pub mod sqlite {
         PhysicalProjectionQueryReader, PhysicalProjectionQuerySnapshot, PhysicalQueryValue,
     };
     pub use crate::sqlite_materialization::{
-        query_block_preorder, query_result_estimated_bytes, ApplyChangeInstrumentation,
-        MaterializationError, PhysicalAliasDeclaration, PhysicalBlock, PhysicalBlockHomeClaim,
-        PhysicalBlockHomeClaimRow, PhysicalBlockPropertyCandidateRow,
+        query_block_preorder, query_page_result_estimated_bytes, query_result_estimated_bytes,
+        ApplyChangeInstrumentation, MaterializationError, PhysicalAliasDeclaration, PhysicalBlock,
+        PhysicalBlockHomeClaim, PhysicalBlockHomeClaimRow, PhysicalBlockPropertyCandidateRow,
         PhysicalBlockReferenceCountRow, PhysicalBlockReferrerCandidateRow, PhysicalBlockRow,
         PhysicalBlockStructureRow, PhysicalEntityId, PhysicalFuzzyCandidatePageRow,
         PhysicalGraphProjectionChange, PhysicalIdentityRecord, PhysicalIdentityRecordRow,

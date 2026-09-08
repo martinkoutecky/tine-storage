@@ -23,7 +23,7 @@ const SOURCE_REVISION_MAX_BYTES: usize = 4096;
 const SOURCE_REVISIONS_DDL: &str = "CREATE TABLE direct_source_revisions (
     page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16),
     revision TEXT NOT NULL CHECK (length(CAST(revision AS BLOB)) BETWEEN 1 AND 4096),
-    query_metadata_schema INTEGER NOT NULL DEFAULT 26 CHECK (query_metadata_schema = 26),
+    query_metadata_schema INTEGER NOT NULL DEFAULT 28 CHECK (query_metadata_schema = 28),
     FOREIGN KEY (page_id) REFERENCES pages(page_id) ON DELETE CASCADE
 ) STRICT";
 
@@ -1304,6 +1304,7 @@ mod tests {
             "page_text",
             "block_text",
             "query_block_results",
+            "query_page_results",
         ] {
             for operation in ["INSERT", "UPDATE", "DELETE"] {
                 database

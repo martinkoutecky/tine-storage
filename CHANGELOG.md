@@ -9,6 +9,13 @@ independently in `src/formats.rs` and summarized in
 
 ### Added
 
+- Disposable SQLite schema 28 adds a partial parent-first covering index for
+  bounded subtree completeness validation. Earlier projections must be rebuilt;
+  authority formats are unchanged. The Direct metadata compatibility marker also
+  advances to 28 so previous readers reject the newer disposable cache.
+- `query_page_results` stores the page construction estimate and property count
+  from existing page inputs, allowing bounded page Display payload reads.
+
 - Fixed reader/snapshot `tine_query_rank` callback registration for application
   compiled matching with lossless BLOB ranking keys and NULL nonmatches. Exact
   text, owned snapshot consistency, cancellation and error release retain the

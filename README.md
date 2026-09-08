@@ -142,6 +142,13 @@ signals the owner: graph replacement must also drain workers/handles, including
 idle cancelled jobs, before removing the projection. Do not infer bounded WAL
 bytes from bounded worker count; measure reader duration and retained WAL.
 
+Schema 28 adds `query_page_results` with rebuildable page construction estimates
+and property counts, plus `blocks_parent_page_idx` for bounded descendant lookup.
+The existing page transaction produces and deletes these facts; raw text is not
+duplicated. Both main and Direct projections reject their previous disposable
+schemas so callers rebuild once. This extends schema 27 without changing its
+authenticated-map encoding or the source authority.
+
 Schema 27 widens the authenticated document frontier from a fixed 16-byte
 identifier to the domain owner's complete key bytes
 (`sealed_accepted_index::AuthenticatedMapKey`, 1..=48 bytes), keying one table
@@ -171,4 +178,5 @@ The callback sees exact text and is isolated to its connection. Both fixed
 functions are deterministic and direct-only; errors release an owned snapshot's
 transaction through the same read guard as ordinary SQL errors. Callbacks must
 finish promptly because SQLite cannot interrupt Rust code inside a callback.
-This API addition changes neither schema 26 nor authority formats.
+The ranking callback does not change authority formats. The current disposable
+projection schema and its rebuild behavior are documented in FORMAT-COMPATIBILITY.md.
