@@ -5,6 +5,15 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [Unreleased]
+
+### Added
+
+- Fixed reader/snapshot `tine_query_rank` callback registration for application
+  compiled matching with lossless BLOB ranking keys and NULL nonmatches. Exact
+  text, owned snapshot consistency, cancellation and error release retain the
+  existing read-only boundary. No schema or authority format changes.
+
 ## [0.19.0] - 2026-09-08
 
 ### Changed

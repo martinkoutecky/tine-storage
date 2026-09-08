@@ -162,3 +162,13 @@ identities reject a replacement transaction. Raw text remains in block_text.
 function over an application-owned compiled-regex registry. Bound IDs select
 existing compiled expressions; storage introduces no regex grammar or per-row
 compilation.
+
+`set_query_rank_function` installs the fixed `tine_query_rank(id, visible_text)`
+function on that reader. The application supplies immutable compiled matching
+semantics and a lossless lexicographic BLOB ordering key; NULL means no match.
+Storage does not define a ranking grammar or convert the key to a numeric score.
+The callback sees exact text and is isolated to its connection. Both fixed
+functions are deterministic and direct-only; errors release an owned snapshot's
+transaction through the same read guard as ordinary SQL errors. Callbacks must
+finish promptly because SQLite cannot interrupt Rust code inside a callback.
+This API addition changes neither schema 26 nor authority formats.

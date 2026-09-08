@@ -33,6 +33,30 @@ use tine_storage::{
 };
 use uuid::Uuid;
 
+#[test]
+fn owned_ranked_query_is_usable_from_an_external_worker() {
+    use tine_storage::sqlite::{PhysicalProjectionQuerySnapshot, PhysicalQueryValue};
+    let path = std::env::temp_dir().join(format!("tine-public-rank-{}.sqlite", Uuid::new_v4()));
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    writer.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE texts(value TEXT); INSERT INTO texts VALUES ('exact');").unwrap();
+    let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+    snapshot
+        .set_query_rank_function(|id, text| Ok((id == 42 && text == "exact").then(|| vec![0, 255])))
+        .unwrap();
+    let rows = std::thread::spawn(move || {
+        snapshot.run_projection_query(
+            "SELECT tine_query_rank(?1, value) FROM texts",
+            &[PhysicalQueryValue::Integer(42)],
+        )
+    })
+    .join()
+    .unwrap()
+    .unwrap();
+    assert_eq!(rows, vec![vec![PhysicalQueryValue::Blob(vec![0, 255])]]);
+    drop(writer);
+    std::fs::remove_file(path).unwrap();
+}
+
 /// A durable payload survives a canonical encode/decode round trip, using only
 /// public paths. Not a redundant unit test: the unit suite proves the codec,
 /// this proves the codec is *usable* by someone who is not this crate.

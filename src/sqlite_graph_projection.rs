@@ -515,6 +515,29 @@ impl PhysicalProjectionQueryReader {
         Ok(())
     }
 
+    /// Install a fixed rank function over caller-owned immutable query programs.
+    /// `None` maps to SQL NULL (no match); bytes are a lexicographically ordered
+    /// BLOB key. The application owns matching and rank encoding, so storage
+    /// neither compiles a query grammar nor compresses tuples into lossy scores.
+    pub fn set_query_rank_function(
+        &self,
+        rank: impl Fn(u64, &str) -> Result<Option<Vec<u8>>, MaterializationError> + Send + 'static,
+    ) -> Result<(), MaterializationError> {
+        self.connection.create_scalar_function(
+            "tine_query_rank",
+            2,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC
+                | rusqlite::functions::FunctionFlags::SQLITE_DIRECTONLY,
+            move |context| {
+                let id = context.get::<u64>(0)?;
+                let text = context.get_raw(1).as_str()?;
+                rank(id, text).map_err(|error| rusqlite::Error::UserFunctionError(Box::new(error)))
+            },
+        )?;
+        Ok(())
+    }
+
     /// Run one statement with bound parameters and collect its rows.
     pub fn run_projection_query(
         &self,
@@ -699,6 +722,14 @@ impl PhysicalProjectionQuerySnapshot {
         predicate: impl Fn(u64, &str) -> Result<bool, MaterializationError> + Send + 'static,
     ) -> Result<(), MaterializationError> {
         self.read(|reader| reader.set_query_regex_predicate(predicate))
+    }
+
+    /// Install the fixed rank function on this snapshot's read-only connection.
+    pub fn set_query_rank_function(
+        &mut self,
+        rank: impl Fn(u64, &str) -> Result<Option<Vec<u8>>, MaterializationError> + Send + 'static,
+    ) -> Result<(), MaterializationError> {
+        self.read(|reader| reader.set_query_rank_function(rank))
     }
 
     fn read<T>(
@@ -1036,6 +1067,141 @@ mod tests {
             )
             .is_err());
         assert!(snapshot.reader.is_none());
+    }
+
+    #[test]
+    fn owned_snapshot_rank_preserves_exact_input_nulls_and_blob_order() {
+        let fixture = SnapshotFixture::new();
+        let mut snapshot = fixture.snapshot();
+        snapshot
+            .set_query_rank_function(|id, text| {
+                assert_eq!(id, 7);
+                Ok(match text {
+                    "É  exact\ntext" => Some(u64::MAX.to_be_bytes().to_vec()),
+                    "lower" => Some((u64::MAX - 1).to_be_bytes().to_vec()),
+                    _ => None,
+                })
+            })
+            .unwrap();
+        let rows = snapshot
+            .run_projection_query(
+                "WITH inputs(text) AS (VALUES (?2), ('lower'), ('absent'))
+             SELECT text, tine_query_rank(?1, text) AS rank FROM inputs
+             WHERE rank IS NOT NULL ORDER BY rank DESC",
+                &[
+                    PhysicalQueryValue::Integer(7),
+                    PhysicalQueryValue::Text("É  exact\ntext".into()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    PhysicalQueryValue::Text("É  exact\ntext".into()),
+                    PhysicalQueryValue::Blob(u64::MAX.to_be_bytes().to_vec())
+                ],
+                vec![
+                    PhysicalQueryValue::Text("lower".into()),
+                    PhysicalQueryValue::Blob((u64::MAX - 1).to_be_bytes().to_vec())
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn owned_snapshot_rank_is_scoped_and_reads_pinned_text() {
+        let fixture = SnapshotFixture::new();
+        let mut first = fixture.snapshot();
+        first
+            .set_query_rank_function(|_, text| Ok(Some(text.as_bytes().to_vec())))
+            .unwrap();
+        fixture
+            .writer
+            .execute("UPDATE payload SET value='after'", [])
+            .unwrap();
+        let mut second = fixture.snapshot();
+        second
+            .set_query_rank_function(|_, text| Ok(Some(format!("second:{text}").into_bytes())))
+            .unwrap();
+        let sql = "SELECT tine_query_rank(1, value) FROM payload";
+        assert_eq!(
+            first.run_projection_query(sql, &[]).unwrap(),
+            vec![vec![PhysicalQueryValue::Blob(b"before".to_vec())]]
+        );
+        assert_eq!(
+            second.run_projection_query(sql, &[]).unwrap(),
+            vec![vec![PhysicalQueryValue::Blob(b"second:after".to_vec())]]
+        );
+        first.finish();
+        second.finish();
+        assert_eq!(fixture.checkpoint(), (0, 0, 0));
+    }
+
+    #[test]
+    fn owned_snapshot_rank_error_and_cancellation_release_transactions() {
+        let fixture = SnapshotFixture::new();
+        let mut snapshot = fixture.snapshot();
+        snapshot
+            .set_query_rank_function(|_, _| {
+                Err(MaterializationError::InvalidQuery(
+                    "unknown rank program".into(),
+                ))
+            })
+            .unwrap();
+        fixture
+            .writer
+            .execute("UPDATE payload SET value='after'", [])
+            .unwrap();
+        assert!(snapshot
+            .run_projection_query("SELECT tine_query_rank(99, value) FROM payload", &[])
+            .is_err());
+        assert!(snapshot.reader.is_none());
+        assert_eq!(fixture.checkpoint(), (0, 0, 0));
+        let mut cancelled = fixture.snapshot();
+        cancelled.cancellation().cancel();
+        assert!(cancelled.set_query_rank_function(|_, _| Ok(None)).is_err());
+        assert!(cancelled.reader.is_none());
+        assert_eq!(fixture.checkpoint(), (0, 0, 0));
+    }
+
+    #[test]
+    fn owned_snapshot_rank_cancellation_interrupts_active_scoring() {
+        let fixture = SnapshotFixture::new();
+        let mut snapshot = fixture.snapshot();
+        let cancellation = snapshot.cancellation();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first = AtomicBool::new(true);
+        snapshot
+            .set_query_rank_function(move |_, text| {
+                if first.swap(false, Ordering::Relaxed) {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                Ok(Some(text.as_bytes().to_vec()))
+            })
+            .unwrap();
+        fixture
+            .writer
+            .execute("UPDATE payload SET value='after'", [])
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            let result = snapshot.run_projection_query(
+                "WITH RECURSIVE numbers(x) AS (VALUES(1) UNION ALL
+                 SELECT x+1 FROM numbers WHERE x<1000000000)
+                 SELECT sum(length(tine_query_rank(1, CAST(x AS TEXT)))) FROM numbers",
+                &[],
+            );
+            assert!(result.is_err());
+            assert!(snapshot.reader.is_none());
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(fixture.checkpoint().0, 1);
+        cancellation.cancel();
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(fixture.checkpoint(), (0, 0, 0));
     }
 
     fn page(page_id: u8, task: &str, content: &str) -> PhysicalPage {
