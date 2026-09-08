@@ -164,7 +164,7 @@ pub const BATCH_ID_INDEX_DDL: &str =
 pub const ACCEPTANCE_SEQUENCE_INDEX_DDL: &str = "CREATE UNIQUE INDEX \
     applied_batches_acceptance_sequence_uq ON applied_batches(acceptance_sequence)";
 
-const EXPECTED_TABLES: [&str; 47] = [
+const EXPECTED_TABLES: [&str; 48] = [
     "accepted_batch_nodes",
     "applied_batches",
     "block_home_claims",
@@ -173,6 +173,7 @@ const EXPECTED_TABLES: [&str; 47] = [
     "query_block_results",
     "query_page_order",
     "query_page_results",
+    "query_projection_state",
     "block_planning",
     "blocks",
     "block_text",

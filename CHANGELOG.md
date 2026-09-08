@@ -9,6 +9,9 @@ independently in `src/formats.rs` and summarized in
 
 ### Added
 
+- Snapshot `query_revision()` and schema 28 transactional local projection image
+  revision metadata, distinct from saved-edit coverage and authority frontiers.
+
 - Disposable SQLite schema 28 adds a partial parent-first covering index for
   bounded subtree completeness validation. Earlier projections must be rebuilt;
   authority formats are unchanged. The Direct metadata compatibility marker also

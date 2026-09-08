@@ -133,3 +133,10 @@ unrecognized SQLite `user_version` or DDL census is refused by
 from the oplog rather than migrating or dually reading it. Derived goldens in
 this crate's pinned vectors changed accordingly and were regenerated in the same
 change.
+
+Schema 28 also includes `query_projection_state(singleton, revision)`, a STRICT
+singleton with nonnegative local image revision. It advances transactionally on
+graph apply, reset and terminal construction; it is never a durable save target
+or part of deterministic materialized-fact digests. Fresh files start at zero,
+so consumers also require the projection owner's instance identity. No authority
+format changes are involved.

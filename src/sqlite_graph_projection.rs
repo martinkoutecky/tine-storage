@@ -716,6 +716,13 @@ impl PhysicalProjectionQuerySnapshot {
         self.cancellation.clone()
     }
 
+    /// Local projection image revision, read in this snapshot's transaction.
+    /// Pair with the owner's projection-instance identity; it is not a saved
+    /// revision target or an authority frontier, and is reset by a fresh file.
+    pub fn query_revision(&mut self) -> Result<u64, MaterializationError> {
+        self.read(|reader| sqlite_materialization::query_projection_revision(&reader.connection))
+    }
+
     /// Install compiled-regex ID lookup on this snapshot's read-only connection.
     pub fn set_query_regex_predicate(
         &mut self,
@@ -1258,6 +1265,139 @@ mod tests {
                 property_atoms: Vec::new(),
             }],
         }
+    }
+
+    #[test]
+    fn query_revision_tracks_committed_images_and_preserves_pinned_payload() {
+        let path = std::env::temp_dir().join(format!(
+            "tine-query-revision-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.initialize_schema().unwrap();
+        let open = || PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+        assert_eq!(open().query_revision().unwrap(), 0);
+        let change = |content: &str| PhysicalGraphProjectionChange {
+            replacements: vec![page(1, content, content)],
+            deletions: vec![],
+            reference_postings: vec![],
+        };
+        database.apply(&change("TODO")).unwrap();
+        let mut old = open();
+        let old_revision = old.query_revision().unwrap();
+        database.apply(&change("DONE")).unwrap();
+        let mut new = open();
+        assert!(new.query_revision().unwrap() > old_revision);
+        assert_eq!(old.query_revision().unwrap(), old_revision);
+        assert_eq!(
+            old.run_projection_query("SELECT content FROM block_text", &[])
+                .unwrap(),
+            vec![vec![PhysicalQueryValue::Text("TODO".into())]]
+        );
+        assert_eq!(
+            new.run_projection_query("SELECT content FROM block_text", &[])
+                .unwrap(),
+            vec![vec![PhysicalQueryValue::Text("DONE".into())]]
+        );
+        let revision = new.query_revision().unwrap();
+        drop(old);
+        drop(new);
+        // Inventory validation fails after page rows were written: all writes,
+        // including the image revision, must roll back together.
+        let mut invalid = page(1, "TODO", "must roll back");
+        invalid.query_page_order = None;
+        assert!(database
+            .apply_with_source_revisions_aliases_and_page_order(
+                &PhysicalGraphProjectionChange {
+                    replacements: vec![invalid],
+                    deletions: vec![],
+                    reference_postings: vec![]
+                },
+                &[PhysicalGraphProjectionSourceRevision {
+                    page_id: [1; 16],
+                    revision: "bad".into()
+                }],
+                &[],
+                &[[2; 16]],
+            )
+            .is_err());
+        assert_eq!(open().query_revision().unwrap(), revision);
+        assert_eq!(
+            open()
+                .run_projection_query("SELECT content FROM block_text", &[])
+                .unwrap(),
+            vec![vec![PhysicalQueryValue::Text("DONE".into())]]
+        );
+        // An order-only transaction must invalidate image-based query memos.
+        database
+            .apply_with_source_revisions_aliases_and_page_order(
+                &PhysicalGraphProjectionChange {
+                    replacements: vec![],
+                    deletions: vec![],
+                    reference_postings: vec![],
+                },
+                &[],
+                &[],
+                &[[1; 16]],
+            )
+            .unwrap();
+        assert!(open().query_revision().unwrap() > revision);
+        let before_reset = open().query_revision().unwrap();
+        database
+            .connection
+            .execute_batch("PRAGMA foreign_keys=OFF")
+            .unwrap();
+        database.reset().unwrap();
+        let after_reset = open().query_revision().unwrap();
+        assert!(after_reset > before_reset);
+        drop(database);
+        let database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.validate_schema().unwrap();
+        assert_eq!(open().query_revision().unwrap(), after_reset);
+        drop(database);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn query_revision_damage_and_cancellation_release_snapshot() {
+        let path = std::env::temp_dir().join(format!(
+            "tine-query-revision-damage-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.initialize_schema().unwrap();
+        database
+            .connection
+            .execute("UPDATE query_projection_state SET revision=?1", [i64::MAX])
+            .unwrap();
+        assert!(database
+            .apply(&PhysicalGraphProjectionChange {
+                replacements: vec![page(1, "TODO", "not committed")],
+                deletions: vec![],
+                reference_postings: vec![],
+            })
+            .is_err());
+        let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+        assert_eq!(snapshot.query_revision().unwrap(), i64::MAX as u64);
+        assert_eq!(
+            snapshot
+                .run_projection_query("SELECT COUNT(*) FROM pages", &[])
+                .unwrap(),
+            vec![vec![PhysicalQueryValue::Integer(0)]]
+        );
+        snapshot.cancellation().cancel();
+        assert!(snapshot.query_revision().is_err());
+        assert!(snapshot.reader.is_none());
+        database
+            .connection
+            .execute("DELETE FROM query_projection_state", [])
+            .unwrap();
+        assert!(database.validate_schema().is_err());
+        let mut snapshot = PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(())).unwrap();
+        assert!(snapshot.query_revision().is_err());
+        assert!(snapshot.reader.is_none());
+        drop(database);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

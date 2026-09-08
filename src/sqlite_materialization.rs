@@ -782,6 +782,11 @@ pub const QUERY_PAGE_ORDER_DDL: &str = "CREATE TABLE query_page_order (
         REFERENCES pages(page_id) ON DELETE CASCADE,
     position INTEGER NOT NULL UNIQUE CHECK (position >= 0)
 ) STRICT";
+const QUERY_PROJECTION_STATE_DDL: &str = "CREATE TABLE query_projection_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    revision INTEGER NOT NULL CHECK (revision >= 0)
+) STRICT";
+
 pub const QUERY_PAGE_RESULTS_DDL: &str = "CREATE TABLE query_page_results (
     page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16)
         REFERENCES pages(page_id) ON DELETE CASCADE,
@@ -996,7 +1001,7 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 35] = [
     ("property_atoms_page_idx", PROPERTY_ATOMS_PAGE_INDEX_DDL),
 ];
 
-const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 28] = [
+const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 29] = [
     (
         "materialization_stamp",
         &[
@@ -1199,6 +1204,7 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 28] = [
         ],
     ),
     ("query_page_order", &["page_id", "position"]),
+    ("query_projection_state", &["singleton", "revision"]),
     (
         "query_page_results",
         &["page_id", "estimated_bytes", "property_count"],
@@ -1246,7 +1252,7 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 28] = [
     ),
 ];
 
-const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 64] = [
+const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 65] = [
     ("table", "materialization_stamp", MATERIALIZATION_STAMP_DDL),
     (
         "table",
@@ -1299,6 +1305,11 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 64] = [
     ("table", "query_block_results", QUERY_BLOCK_RESULTS_DDL),
     ("table", "query_page_order", QUERY_PAGE_ORDER_DDL),
     ("table", "query_page_results", QUERY_PAGE_RESULTS_DDL),
+    (
+        "table",
+        "query_projection_state",
+        QUERY_PROJECTION_STATE_DDL,
+    ),
     ("table", "property_atoms", PROPERTY_ATOMS_DDL),
     ("table", "search_fts_owners", SEARCH_FTS_OWNERS_DDL),
     ("table", "search_fts", SEARCH_FTS_DDL),
@@ -1516,6 +1527,7 @@ pub(crate) fn initialize_graph_projection_schema(
          {QUERY_BLOCK_RESULTS_DDL};
          {QUERY_PAGE_ORDER_DDL};
          {QUERY_PAGE_RESULTS_DDL};
+         {QUERY_PROJECTION_STATE_DDL};
          {PROPERTY_ATOMS_DDL};
          {SEARCH_FTS_OWNERS_DDL};
          {SEARCH_FTS_DDL};
@@ -1558,6 +1570,7 @@ pub(crate) fn initialize_graph_projection_schema(
          {PROPERTY_ATOMS_DAY_INDEX_DDL};
          {PROPERTY_ATOMS_PAGE_INDEX_DDL};"
     ))?;
+    connection.execute("INSERT INTO query_projection_state VALUES (1, 0)", [])?;
     connection.execute(
         "INSERT INTO search_fts_build (
              singleton, phase, horizon_sequence, cursor_entity_type, cursor_entity_id
@@ -1608,6 +1621,7 @@ pub(crate) fn validate_graph_projection_schema(
             "search FTS build marker cardinality is invalid".into(),
         ));
     }
+    query_projection_revision(connection)?;
     Ok(())
 }
 
@@ -1639,13 +1653,19 @@ fn validate_schema_columns(
 /// consumed one row at a time.
 fn digested_materialization_tables() -> impl Iterator<Item = (&'static str, &'static [&'static str])>
 {
-    MATERIALIZATION_TABLE_COLUMNS.into_iter().chain([
-        (
-            "search_fts",
-            &["entity_type", "entity_id", "page_id", "text"] as &[&str],
-        ),
-        ("search_substring_fts", &["normalized_text"] as &[&str]),
-    ])
+    // This local write counter describes construction history, not graph facts.
+    // Independently replayed and terminal-built projections can have equal facts
+    // at different revisions. Schema/cardinality validation still covers it.
+    MATERIALIZATION_TABLE_COLUMNS
+        .into_iter()
+        .filter(|(table, _)| *table != "query_projection_state")
+        .chain([
+            (
+                "search_fts",
+                &["entity_type", "entity_id", "page_id", "text"] as &[&str],
+            ),
+            ("search_substring_fts", &["normalized_text"] as &[&str]),
+        ])
 }
 
 fn update_table_rows(
@@ -1823,13 +1843,17 @@ fn update_sqlite_value(
 #[cfg(test)]
 fn row_digest_legacy(connection: &Connection) -> Result<ContentDigest, MaterializationError> {
     let mut bytes = b"tine/sqlite-materialization/rows/v2\0".to_vec();
-    for (table, columns) in MATERIALIZATION_TABLE_COLUMNS.into_iter().chain([
-        (
-            "search_fts",
-            &["entity_type", "entity_id", "page_id", "text"] as &[&str],
-        ),
-        ("search_substring_fts", &["normalized_text"] as &[&str]),
-    ]) {
+    for (table, columns) in MATERIALIZATION_TABLE_COLUMNS
+        .into_iter()
+        .filter(|(table, _)| *table != "query_projection_state")
+        .chain([
+            (
+                "search_fts",
+                &["entity_type", "entity_id", "page_id", "text"] as &[&str],
+            ),
+            ("search_substring_fts", &["normalized_text"] as &[&str]),
+        ])
+    {
         encode_len(&mut bytes, table.len());
         bytes.extend_from_slice(table.as_bytes());
         encode_len(&mut bytes, columns.len());
@@ -2347,6 +2371,7 @@ pub fn seed_terminal_chunk_in_open_candidate(
     chunk: &PhysicalTerminalMaterializationChunk,
 ) -> Result<(), MaterializationError> {
     require_open_candidate(transaction)?;
+    advance_query_projection_revision(transaction)?;
     for page in &chunk.pages {
         insert_page(transaction, page)?;
     }
@@ -2379,6 +2404,7 @@ pub(crate) fn finish_terminal_graph_projection_in_open_candidate(
     stamp: PhysicalTerminalProjectionStamp,
 ) -> Result<(), MaterializationError> {
     require_open_candidate(transaction)?;
+    advance_query_projection_revision(transaction)?;
     transaction.execute(
         "INSERT INTO reference_alias_bindings (
              normalized_alias, candidate_ordinal, resolved_page_id
@@ -2792,6 +2818,37 @@ fn insert_logseq_uuid_introductions(
     Ok(())
 }
 
+pub(crate) fn query_projection_revision(
+    connection: &Connection,
+) -> Result<u64, MaterializationError> {
+    let revision: Option<i64> = connection
+        .query_row(
+            "SELECT revision FROM query_projection_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    revision
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| {
+            MaterializationError::Corrupt("query projection revision is missing or invalid".into())
+        })
+}
+
+fn advance_query_projection_revision(connection: &Connection) -> Result<(), MaterializationError> {
+    let changed = connection.execute(
+        "UPDATE query_projection_state SET revision = revision + 1
+         WHERE singleton = 1 AND revision < 9223372036854775807",
+        [],
+    )?;
+    if changed != 1 {
+        return Err(MaterializationError::Corrupt(
+            "query projection revision is missing or exhausted".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn apply_graph_projection_rows(
     transaction: &Connection,
     replacements: &[PhysicalPage],
@@ -2799,6 +2856,7 @@ pub(crate) fn apply_graph_projection_rows(
     acceptance_sequence: Option<u64>,
     fts_instrumentation: Option<&mut FtsChangeInstrumentation>,
 ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
+    advance_query_projection_revision(transaction)?;
     // A block can move between two replacement pages. Keep its inbound refs
     // through every cleanup pass, then remove every old owner before inserting
     // any new owner so page-ID sort order cannot collide on the block primary key.
@@ -3057,6 +3115,7 @@ pub fn reset(
 pub(crate) fn reset_graph_projection_rows(
     transaction: &Connection,
 ) -> Result<(), MaterializationError> {
+    advance_query_projection_revision(transaction)?;
     transaction.execute_batch(
         "DELETE FROM search_fts_outbox;
          UPDATE search_fts_build
@@ -6723,6 +6782,61 @@ mod tests {
         finalize_fresh_bootstrap(&transaction).unwrap();
         transaction.commit().unwrap();
         connection
+    }
+
+    #[test]
+    fn query_revision_covers_managed_apply_reset_and_terminal_construction() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        initialize_schema(&connection, digest(b"empty"), test_parse_config_hash()).unwrap();
+        assert_eq!(query_projection_revision(&connection).unwrap(), 0);
+        apply_and_commit(
+            &mut connection,
+            &change(1, vec![page(1, "TODO")], vec![]),
+            1,
+            digest(b"one"),
+        );
+        let revision = query_projection_revision(&connection).unwrap();
+        assert!(revision > 0);
+        let fact_digest = row_digest(&connection).unwrap();
+        advance_query_projection_revision(&connection).unwrap();
+        assert_eq!(row_digest(&connection).unwrap(), fact_digest);
+        assert!(!row_digests_by_table(&connection)
+            .unwrap()
+            .iter()
+            .any(|(name, _)| *name == "query_projection_state"));
+        let transaction = connection.transaction().unwrap();
+        reset_graph_projection_rows(&transaction).unwrap();
+        assert!(query_projection_revision(&transaction).unwrap() > revision + 1);
+        transaction.rollback().unwrap();
+        assert_eq!(
+            query_projection_revision(&connection).unwrap(),
+            revision + 1
+        );
+        assert_eq!(row_digest(&connection).unwrap(), fact_digest);
+
+        let mut terminal = Connection::open_in_memory().unwrap();
+        initialize_schema(&terminal, digest(b"empty"), test_parse_config_hash()).unwrap();
+        let transaction = terminal.transaction().unwrap();
+        begin_terminal_construction_in_open_candidate(&transaction).unwrap();
+        seed_terminal_chunk_in_open_candidate(
+            &transaction,
+            &PhysicalTerminalMaterializationChunk {
+                pages: vec![page(1, "TODO")],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let seeded = query_projection_revision(&transaction).unwrap();
+        assert!(seeded > 0);
+        finish_terminal_graph_projection_in_open_candidate(
+            &transaction,
+            &[],
+            empty_terminal_stamp(),
+        )
+        .unwrap();
+        assert!(query_projection_revision(&transaction).unwrap() > seeded);
+        transaction.rollback().unwrap();
+        assert_eq!(query_projection_revision(&terminal).unwrap(), 0);
     }
 
     #[test]

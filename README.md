@@ -180,3 +180,14 @@ transaction through the same read guard as ordinary SQL errors. Callbacks must
 finish promptly because SQLite cannot interrupt Rust code inside a callback.
 The ranking callback does not change authority formats. The current disposable
 projection schema and its rebuild behavior are documented in FORMAT-COMPATIBILITY.md.
+
+`PhysicalProjectionQuerySnapshot::query_revision()` reads a local image counter
+from the pinned transaction. Pair it with the owner's projection-instance
+identity for result memoization; it does not certify coverage of a saved edit.
+Schema 28's `query_projection_state` is a rebuildable singleton advanced in the
+existing transaction for graph apply (including order-only changes), reset and
+terminal construction. Failed transactions roll it back. Reset within a file
+advances it; replacement files start at zero and require lifecycle invalidation.
+It is excluded from deterministic graph-fact digests because construction history
+is not authority. Missing/exhausted state is a projection error for normal rebuild
+recovery. The revision accessor shares snapshot cancellation/error release.
