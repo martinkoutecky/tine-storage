@@ -5,6 +5,17 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.18.0] - 2026-09-08
+
+### Changed
+
+- The existing durable batch contract now supplies `CausalPeerKey` independently
+  from `DeviceId`. `CausalPeerId::from_key` and `key` replace the device-specific
+  accessors. Products can preserve enrolled device authority while minting a new
+  sequential writer incarnation after actual private-state loss, without reusing
+  an earlier causal dot. Allocation and accepted ownership remain product policy;
+  the shared codec and physical encoding are unchanged.
+
 ## [0.17.0] - 2026-09-07
 
 ### Added

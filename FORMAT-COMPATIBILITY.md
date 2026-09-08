@@ -55,3 +55,12 @@ storage release:
 2. old-version fixtures or an explicit rebuild/migration proof;
 3. an updated pinned-format test;
 4. a new certification receipt and a new Tine pin receipt.
+
+Version 0.18 separates the Rust types for an enrolled device and a causal writer
+key through `DurableBatchContract::CausalPeerKey`. The same manifest field and
+canonical codec serialize the product-selected key; the shared physical format
+numbers do not change. A product changing its interpretation of causal identity
+must update its one current operation schema and admission contract. The codec
+does not infer ownership or allocate identities. Typed round-trip tests cover two
+writer incarnations with the same enrolled author and preserve the existing byte
+golden when a contract selects the same serialized key representation.

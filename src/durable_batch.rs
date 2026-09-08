@@ -33,6 +33,18 @@ pub trait DurableBatchContract: Clone + fmt::Debug + Eq + Hash + Ord + Sized + '
         + DeserializeOwned;
     type BatchId: Copy + fmt::Debug + fmt::Display + Eq + Hash + Ord + Serialize + DeserializeOwned;
     type DeviceId: Copy + fmt::Debug + fmt::Display + Eq + Hash + Ord + Serialize + DeserializeOwned;
+    /// Identity of one sequential authoring incarnation. This is deliberately
+    /// independent of the enrolled device: recovery after private-state loss
+    /// must not alias an earlier incarnation's causal counters. The product
+    /// owns allocation, persistence and accepted owner binding.
+    type CausalPeerKey: Copy
+        + fmt::Debug
+        + fmt::Display
+        + Eq
+        + Hash
+        + Ord
+        + Serialize
+        + DeserializeOwned;
     type SessionId: Copy + fmt::Debug + fmt::Display + Eq + Serialize + DeserializeOwned;
     type Origin: Copy + fmt::Debug + Eq + Serialize + DeserializeOwned;
     type DependencyFrontier: Clone + fmt::Debug + Eq + Serialize + DeserializeOwned;
@@ -129,7 +141,9 @@ pub enum ObjectKind {
 
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent, bound = "")]
-pub struct CausalPeerId<C: DurableBatchContract>(C::DeviceId);
+/// Product-owned sequential writer identity carried by the existing batch codec.
+/// Device authorization remains on `OperationBatch::author_device_id`.
+pub struct CausalPeerId<C: DurableBatchContract>(C::CausalPeerKey);
 
 impl<C: DurableBatchContract> Clone for CausalPeerId<C> {
     fn clone(&self) -> Self {
@@ -140,11 +154,11 @@ impl<C: DurableBatchContract> Clone for CausalPeerId<C> {
 impl<C: DurableBatchContract> Copy for CausalPeerId<C> {}
 
 impl<C: DurableBatchContract> CausalPeerId<C> {
-    pub const fn from_device_id(device_id: C::DeviceId) -> Self {
-        Self(device_id)
+    pub const fn from_key(key: C::CausalPeerKey) -> Self {
+        Self(key)
     }
 
-    pub const fn as_device_id(self) -> C::DeviceId {
+    pub const fn key(self) -> C::CausalPeerKey {
         self.0
     }
 }
@@ -911,11 +925,22 @@ mod tests {
         LocalMutation,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+    #[serde(transparent)]
+    struct SyntheticWriterKey(Uuid);
+
+    impl fmt::Display for SyntheticWriterKey {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.0.fmt(formatter)
+        }
+    }
+
     impl DurableBatchContract for SyntheticContract {
         type WorkspaceId = Uuid;
         type DocumentId = Uuid;
         type BatchId = Uuid;
         type DeviceId = Uuid;
+        type CausalPeerKey = SyntheticWriterKey;
         type SessionId = Uuid;
         type Origin = SyntheticOrigin;
         type DependencyFrontier = Vec<()>;
@@ -973,13 +998,38 @@ mod tests {
             id(4),
             id(5),
             SyntheticOrigin::LocalMutation,
-            BatchCausalDot::new(CausalPeerId::from_device_id(id(4)), 1).unwrap(),
+            BatchCausalDot::new(CausalPeerId::from_key(SyntheticWriterKey(id(4))), 1).unwrap(),
             Vec::new(),
             Vec::new(),
             SemanticEffectDigest::of(b"golden payload"),
             vec![descriptor],
         )
         .unwrap()
+    }
+
+    #[test]
+    fn distinct_writer_incarnations_round_trip_without_changing_author_device() {
+        let descriptor = golden_object().descriptor().unwrap();
+        let mut original = golden_manifest(descriptor);
+        original.causal_dot =
+            BatchCausalDot::new(CausalPeerId::from_key(SyntheticWriterKey(id(71))), 1).unwrap();
+        let mut recovered = original.clone();
+        recovered.batch_id = id(72);
+        recovered.causal_dot =
+            BatchCausalDot::new(CausalPeerId::from_key(SyntheticWriterKey(id(73))), 1).unwrap();
+        for batch in [&original, &recovered] {
+            let bytes = batch.encode().unwrap();
+            let decoded = SyntheticBatch::decode(&bytes).unwrap();
+            assert_eq!(&decoded, batch);
+            assert_eq!(decoded.author_device_id(), id(4));
+            assert_eq!(decoded.causal_dot().counter(), 1);
+            assert_ne!(
+                decoded.causal_dot().peer_id().key().0,
+                decoded.author_device_id()
+            );
+        }
+        assert_ne!(original.causal_dot(), recovered.causal_dot());
+        assert_eq!(original.author_device_id(), recovered.author_device_id());
     }
 
     const PRE_EXTRACTION_OBJECT_HEX: &str = "54494e454f424a32000000b5000000000000000e7b22656e76656c6f70655f736368656d615f76657273696f6e223a322c22776f726b73706163655f6964223a2230303030303030302d303030302d303030302d303030302d303030303030303030303031222c22646f63756d656e745f6964223a2230303030303030302d303030302d303030302d303030302d303030303030303030303032222c226b696e64223a2273656d616e7469635f656666656374222c22656e6372797074696f6e223a226e6f6e65227d676f6c64656e207061796c6f6164f57b1aa52243f7955dec04cd9657510d852e0aa73dc185d898cc532004b3c91a";

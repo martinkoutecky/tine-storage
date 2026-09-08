@@ -470,3 +470,72 @@ fn persistent_map_removal_is_available_without_test_support() {
         None
     );
 }
+
+#[test]
+fn a_consumer_can_separate_enrolled_devices_from_writer_incarnations() {
+    use tine_storage::{
+        BatchCausalDot, BatchError, CausalPeerId, DurableBatchContract, LineageDigest,
+        ObjectDescriptor, ObjectKind, OperationBatch, OperationObject, SemanticEffectDigest,
+    };
+
+    #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+    struct Contract;
+    impl DurableBatchContract for Contract {
+        type WorkspaceId = Uuid;
+        type DocumentId = Uuid;
+        type BatchId = Uuid;
+        type DeviceId = u64;
+        type CausalPeerKey = Uuid;
+        type SessionId = Uuid;
+        type Origin = u8;
+        type DependencyFrontier = Vec<Uuid>;
+        type ManifestValidationState = ();
+        const OPERATION_SCHEMA_VERSION: u32 = 1;
+        const MANAGED_ENTITY_SET_VERSION: u32 = 1;
+        fn begin_manifest_validation() {}
+        fn validate_descriptor_policy(
+            _: &mut (),
+            _: &ObjectDescriptor<Self>,
+        ) -> Result<(), BatchError<Self>> {
+            Ok(())
+        }
+        fn finish_manifest_validation(_: ()) -> Result<(), BatchError<Self>> {
+            Ok(())
+        }
+    }
+    let workspace = Uuid::from_u128(1);
+    let object = OperationObject::<Contract>::new(
+        workspace,
+        Uuid::from_u128(2),
+        ObjectKind::SemanticEffect,
+        b"preserved original effect".to_vec(),
+    )
+    .unwrap();
+    let mut decoded = Vec::new();
+    for incarnation in [71, 72] {
+        let peer = CausalPeerId::<Contract>::from_key(Uuid::from_u128(incarnation));
+        let batch = OperationBatch::<Contract>::new_with_causality(
+            workspace,
+            LineageDigest::of(b"same enrollment"),
+            Uuid::from_u128(incarnation),
+            11,
+            Uuid::from_u128(3),
+            0,
+            BatchCausalDot::new(peer, 1).unwrap(),
+            vec![],
+            vec![],
+            SemanticEffectDigest::of(object.payload()),
+            vec![object.descriptor().unwrap()],
+        )
+        .unwrap();
+        let restored = OperationBatch::<Contract>::decode(&batch.encode().unwrap()).unwrap();
+        assert_eq!(restored, batch);
+        assert_eq!(restored.author_device_id(), 11);
+        assert_eq!(
+            restored.causal_dot().peer_id().key(),
+            Uuid::from_u128(incarnation)
+        );
+        decoded.push(restored);
+    }
+    assert_ne!(decoded[0].causal_dot(), decoded[1].causal_dot());
+}
