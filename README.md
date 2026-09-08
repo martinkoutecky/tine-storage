@@ -191,3 +191,21 @@ advances it; replacement files start at zero and require lifecycle invalidation.
 It is excluded from deterministic graph-fact digests because construction history
 is not authority. Missing/exhausted state is a projection error for normal rebuild
 recovery. The revision accessor shares snapshot cancellation/error release.
+
+`PhysicalProjectionQueryProgress` is the common process-local coverage primitive.
+Capture its opaque target using the existing ordered producer position at save
+acknowledgement; publish that target and the transactional query revision only
+after verified SQLite commit. `wait_for_target` waits for at least that position,
+not all later edits. It returns Ready with a minimum SQL revision, Pending on
+wait expiry, Failed on a published error, or Cancelled. It holds no database,
+actor, operation lock or query slot. Acquire existing job capacity afterwards,
+then pin and validate SQL together with immutable identity/config/registry inputs;
+use the snapshot's actual revision for memoization. This primitive does not itself
+perform that acquisition or prove producer-supplied coverage.
+
+`observe` and `wait_for_change` provide an atomic check/wait subscription, including
+failure-to-recovery transitions. A request's cancellation wakes only its waiters;
+independent requests remain live. Restart invalidates old targets and refuses late
+old publications; close is terminal. Owners must also cancel/drain admitted jobs
+through their existing job owner before replacing files. Targets/observations are
+opaque process-local handles, never serialized authority or a second ledger.

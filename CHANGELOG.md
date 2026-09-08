@@ -9,6 +9,9 @@ independently in `src/formats.rs` and summarized in
 
 ### Added
 
+- Shared process-local projection progress targets, cancellable fixed-target
+  waits and check/wait observations, with explicit pending/failure/recovery.
+
 - Snapshot `query_revision()` and schema 28 transactional local projection image
   revision metadata, distinct from saved-edit coverage and authority frontiers.
 

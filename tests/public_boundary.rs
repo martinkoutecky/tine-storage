@@ -648,3 +648,20 @@ fn a_consumer_can_separate_enrolled_devices_from_writer_incarnations() {
     }
     assert_ne!(decoded[0].causal_dot(), decoded[1].causal_dot());
 }
+
+#[test]
+fn projection_progress_is_usable_without_backend_specific_types() {
+    use tine_storage::sqlite::{
+        PhysicalProjectionQueryProgress, PhysicalProjectionQueryProgressOutcome,
+    };
+    let progress = PhysicalProjectionQueryProgress::new();
+    let target = progress.target(1);
+    let request = progress.request();
+    progress.publish(&target, 2).unwrap();
+    assert_eq!(
+        progress.wait_for_target(&target, &request, std::time::Duration::ZERO),
+        PhysicalProjectionQueryProgressOutcome::Ready {
+            minimum_revision: 2
+        }
+    );
+}

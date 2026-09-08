@@ -35,6 +35,7 @@ mod sqlite_fileset;
 mod sqlite_frontier;
 mod sqlite_graph_projection;
 mod sqlite_materialization;
+mod sqlite_query_progress;
 
 /// Curated physical SQLite API for the disposable projection.
 ///
@@ -81,6 +82,11 @@ pub mod sqlite {
         PhysicalTerminalMaterializationChunk, PhysicalTerminalProjectionStamp,
         SqliteGraphProjectionRead, SqliteMaterializedRead, MAX_MATERIALIZATION_QUERY_BYTES,
         MAX_MATERIALIZATION_QUERY_ROWS, MAX_MATERIALIZATION_READ_BYTES,
+    };
+    pub use crate::sqlite_query_progress::{
+        PhysicalProjectionQueryObservation, PhysicalProjectionQueryProgress,
+        PhysicalProjectionQueryProgressOutcome, PhysicalProjectionQueryRequest,
+        PhysicalProjectionQueryTarget,
     };
 
     #[cfg(feature = "test-support")]
