@@ -1133,15 +1133,36 @@ fn validate_checkpoint_generation_anchor(connection: &Connection) -> Result<(), 
     // damage: `read_frontier` rejects a frontier whose digest does not match its
     // own bytes, the anchor's own digest/bytes binding is checked above, and the
     // materialization stamp must still agree with the active frontier below.
+    // The frontier row must at minimum hash to its own digest. `read_frontier`
+    // checks this, but `validate_schema_and_claim` calls THIS function directly
+    // and never goes through `read_frontier` -- so relying on that was a gap, and
+    // an unrelated-but-self-consistent root at an advanced count opened cleanly.
+    if ContentDigest::of(&frontier_bytes).as_bytes() != frontier_digest.as_slice() {
+        return Err(FrontierError::Corrupt(
+            "active frontier digest does not hash its own bytes".into(),
+        ));
+    }
     if applied_count < stored.0 {
         return Err(FrontierError::Corrupt(
             "active frontier is behind its generation anchor".into(),
         ));
     }
-    if applied_count == stored.0 && (frontier_bytes != stored.1 || frontier_digest != stored.2) {
-        return Err(FrontierError::Corrupt(
-            "unadvanced active frontier is misbound to its generation anchor".into(),
-        ));
+    if applied_count == stored.0 {
+        if frontier_bytes != stored.1 || frontier_digest != stored.2 {
+            return Err(FrontierError::Corrupt(
+                "unadvanced active frontier is misbound to its generation anchor".into(),
+            ));
+        }
+    } else {
+        validate_anchored_tail_extends_to_frontier(
+            connection,
+            stored.0,
+            &stored.1,
+            &stored.2,
+            applied_count,
+            &frontier_bytes,
+            &frontier_digest,
+        )?;
     }
     let (materialized_count, materialized_frontier): (i64, Vec<u8>) = connection.query_row(
         "SELECT acceptance_sequence, frontier_root_digest
@@ -1181,9 +1202,129 @@ fn validate_checkpoint_generation_anchor(connection: &Connection) -> Result<(), 
             "materialization stamp is behind its generation anchor".into(),
         ));
     }
-    if materialized_count == applied_count && materialized_frontier != frontier_digest {
+    // A LAGGING stamp is still bound to something: the frontier at the sequence
+    // it claims. Leaving the lag interval unchecked was the same mistake as
+    // leaving the advanced frontier unchecked -- a zeroed digest on a lagging
+    // stamp opened cleanly. At the floor it must name the anchor's
+    // materialization root; above the floor, the post-root of the hot batch at
+    // that exact sequence.
+    let expected_materialized = if materialized_count == applied_count {
+        frontier_digest.clone()
+    } else if materialized_count == stored.0 {
+        stored.6.clone()
+    } else {
+        connection
+            .query_row(
+                "SELECT post_frontier_root_digest FROM applied_batches WHERE sequence = ?1",
+                params![materialized_count],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .ok_or_else(|| {
+                FrontierError::Corrupt(
+                    "materialization stamp names a sequence with no accepted batch".into(),
+                )
+            })?
+    };
+    if materialized_frontier != expected_materialized {
         return Err(FrontierError::Corrupt(
-            "materialization stamp is misbound to the active checkpoint frontier".into(),
+            "materialization stamp is misbound to the frontier at its own sequence".into(),
+        ));
+    }
+    // Projection evidence may not claim more than the stamp does. A torn stamp
+    // page after a materialized tail leaves exactly this shape: receipts and
+    // rows for a batch the stamp no longer admits.
+    let latest_receipt: Option<i64> = connection.query_row(
+        "SELECT MAX(acceptance_sequence) FROM materialization_batches",
+        [],
+        |row| row.get(0),
+    )?;
+    if let Some(latest) = latest_receipt {
+        if latest > materialized_count {
+            return Err(FrontierError::Corrupt(
+                "materialization receipts are ahead of the materialization stamp".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Prove that the active frontier is an EXTENSION of the immutable anchor, not
+/// merely a larger number than it.
+///
+/// Relaxing the anchor equality to `count >= floor` made the healthy forward
+/// move legal -- and made everything else legal too: at an advanced count,
+/// neither the frontier bytes nor the digest were compared with anything at
+/// all, so a self-consistent but wholly unrelated root passed reopen. Verified
+/// by probe, not by reading.
+///
+/// What binds them is the retained hot tail. Each `applied_batches` row carries
+/// the prior and post frontier roots of one transition, so the tail is a chain:
+/// it must start at the anchored root, be contiguous, and end at the active
+/// frontier. Cost is O(tail), which is bounded by the tail and not by the
+/// covered history (I-14).
+///
+/// Per D-3 the SQLite side is a disposable cache: a failure here routes the
+/// caller to rebuild, and must never be repaired by trusting the rows.
+fn validate_anchored_tail_extends_to_frontier(
+    connection: &Connection,
+    covered_count: i64,
+    anchored_bytes: &[u8],
+    anchored_digest: &[u8],
+    applied_count: i64,
+    frontier_bytes: &[u8],
+    frontier_digest: &[u8],
+) -> Result<(), FrontierError> {
+    let mut statement = connection.prepare(
+        "SELECT sequence, prior_frontier_root, prior_frontier_root_digest,
+                post_frontier_root, post_frontier_root_digest
+         FROM applied_batches ORDER BY sequence",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, Vec<u8>>(4)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let expected_len = usize::try_from(applied_count.saturating_sub(covered_count))
+        .map_err(|_| FrontierError::Corrupt("anchored tail length is invalid".into()))?;
+    if rows.len() != expected_len {
+        return Err(FrontierError::Corrupt(
+            "anchored tail does not hold exactly the batches above the covered floor".into(),
+        ));
+    }
+    let mut previous_bytes = anchored_bytes;
+    let mut previous_digest = anchored_digest;
+    for (offset, (sequence, prior, prior_digest, post, post_digest)) in rows.iter().enumerate() {
+        let expected_sequence = covered_count
+            .checked_add(1 + offset as i64)
+            .ok_or_else(|| FrontierError::Corrupt("anchored tail sequence overflowed".into()))?;
+        if *sequence != expected_sequence {
+            return Err(FrontierError::Corrupt(
+                "anchored tail is not contiguous above the covered floor".into(),
+            ));
+        }
+        if prior.as_slice() != previous_bytes || prior_digest.as_slice() != previous_digest {
+            return Err(FrontierError::Corrupt(
+                "anchored tail does not chain back to its generation anchor".into(),
+            ));
+        }
+        if ContentDigest::of(post).as_bytes() != post_digest.as_slice() {
+            return Err(FrontierError::Corrupt(
+                "anchored tail post-root digest does not hash its own bytes".into(),
+            ));
+        }
+        previous_bytes = post;
+        previous_digest = post_digest;
+    }
+    if previous_bytes != frontier_bytes || previous_digest != frontier_digest {
+        return Err(FrontierError::Corrupt(
+            "active frontier is not the end of the anchored tail".into(),
         ));
     }
     Ok(())
@@ -3220,33 +3361,128 @@ fn validate_request_shape(request: &PhysicalApplyRequest) -> Result<(), Frontier
     Ok(())
 }
 
-/// Name a covered re-delivery instead of reporting it as an ordering fault.
+/// The parts of an installed `checkpoint_generation_anchor` that apply and
+/// reopen validation need. Reading it is one row; an ordinary live database has
+/// no such row and gets `None`.
+struct CheckpointAnchorFacts {
+    covered_count: u64,
+    covered_batch_root: Option<MapLink>,
+    checkpoint_frontier_root: Vec<u8>,
+    checkpoint_frontier_root_digest: ContentDigest,
+    materialization_frontier_root_digest: ContentDigest,
+}
+
+fn load_checkpoint_anchor_facts(
+    connection: &Connection,
+) -> Result<Option<CheckpointAnchorFacts>, FrontierError> {
+    let row = connection
+        .query_row(
+            "SELECT covered_count, covered_batch_root_key, covered_batch_root_digest,
+                    checkpoint_frontier_root, checkpoint_frontier_root_digest,
+                    materialization_frontier_root_digest
+             FROM checkpoint_generation_anchor WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((count, root_key, root_digest, frontier, frontier_digest, materialization)) = row
+    else {
+        return Ok(None);
+    };
+    let covered_batch_root_digest = decode_digest(&root_digest)?;
+    let covered_batch_root = match root_key {
+        Some(key) => Some(MapLink {
+            key: decode_id(&key, "covered batch root key")?.into(),
+            digest: covered_batch_root_digest,
+        }),
+        None => None,
+    };
+    Ok(Some(CheckpointAnchorFacts {
+        covered_count: u64::try_from(count)
+            .map_err(|_| FrontierError::Corrupt("covered count is invalid".into()))?,
+        covered_batch_root,
+        checkpoint_frontier_root: frontier,
+        checkpoint_frontier_root_digest: decode_digest(&frontier_digest)?,
+        materialization_frontier_root_digest: decode_digest(&materialization)?,
+    }))
+}
+
+/// Is `batch_id` in the SEALED covered map -- as opposed to merely in the active
+/// map, which also holds the hot tail?
 ///
-/// A batch whose id is already in SEALED covered history has an acceptance
-/// sequence at or below the covered floor, so the ordinary sequence check
-/// refuses it -- but as `AcceptanceOrder`, which says "you sent me the wrong
-/// next batch" about a batch we in fact already have. On a live database that
-/// case is a `Duplicate`, so the anchored path must not answer it with a
-/// different, misleading fault.
+/// The distinction is the whole point. An id that is in the active map but has
+/// no `applied_batches` row is EITHER a covered batch whose row left SQLite at
+/// the cutover, OR a hot batch whose row was lost. The first is an ordinary
+/// re-delivery; the second is corruption, and reporting it as a re-delivery
+/// would hide it. Only a descent of the anchor's covered root can tell them
+/// apart.
+fn is_covered_batch(
+    connection: &Connection,
+    sealed: &dyn SealedAcceptedIndexRead,
+    anchor: &CheckpointAnchorFacts,
+    batch_id: [u8; 16],
+) -> Result<bool, FrontierError> {
+    let Some(root) = anchor.covered_batch_root.clone() else {
+        return Ok(false);
+    };
+    let mut current = Some(root);
+    let mut depth = 0;
+    while let Some(link) = current {
+        ensure_depth(depth, "covered accepted batch lookup")?;
+        let node = load_composite_batch_map_node(connection, sealed, &link)?;
+        match batch_id.cmp(&node.batch_id) {
+            Ordering::Equal => return Ok(true),
+            Ordering::Less => current = node.left,
+            Ordering::Greater => current = node.right,
+        }
+        depth += 1;
+    }
+    Ok(false)
+}
+
+/// Refuse a batch whose id the frontier ALREADY CONTAINS but whose exact record
+/// is not in SQLite.
 ///
-/// This probe runs ONLY on the already-failing branch. The healthy path pays
-/// nothing: a batch that passes the sequence check never reaches here.
-fn covered_redelivery_refusal(
+/// This runs unconditionally on the checkpoint path, before the sequence check
+/// and before insertion -- not, as it first did, only on the branch where the
+/// sequence was already wrong. That earlier placement was free on the healthy
+/// path and wrong: a covered id offered at exactly `current + 1` skipped the
+/// probe entirely, `upsert_batch_map` took its `Ordering::Equal` arm, and the
+/// covered key's value was REPLACED. The batch that had been accepted was erased
+/// from the authenticated map while the sequence advanced, which is precisely
+/// the state the sealed three-root count check would later reject -- after
+/// SQLite had committed. Verified by probe before this guard existed.
+fn guard_batch_already_accepted(
     connection: &Connection,
     sealed: Option<&dyn SealedAcceptedIndexRead>,
     current_root: &PhysicalFrontierRoot,
     batch_id: [u8; 16],
-    expected: u64,
-    found: u64,
-) -> FrontierError {
-    if sealed.is_some() {
-        match batch_map_value(connection, sealed, current_root, batch_id) {
-            Ok(Some(_)) => return FrontierError::CoveredBatchRedelivery(batch_id),
-            Ok(None) => {}
-            Err(error) => return error,
-        }
+) -> Result<(), FrontierError> {
+    let Some(sealed) = sealed else {
+        return Ok(());
+    };
+    if batch_map_value(connection, Some(sealed), current_root, batch_id)?.is_none() {
+        return Ok(());
     }
-    FrontierError::AcceptanceOrder { expected, found }
+    let Some(anchor) = load_checkpoint_anchor_facts(connection)? else {
+        return Ok(());
+    };
+    if is_covered_batch(connection, sealed, &anchor, batch_id)? {
+        return Err(FrontierError::CoveredBatchRedelivery(batch_id));
+    }
+    Err(FrontierError::Corrupt(format!(
+        "authenticated accepted batch {} is missing its exact record",
+        HexId(&batch_id)
+    )))
 }
 
 pub fn preflight(
@@ -3321,6 +3557,7 @@ fn preflight_inner(
         }
         return Err(FrontierError::BatchCollision(batch.batch_id));
     }
+    guard_batch_already_accepted(connection, sealed, current_root, batch.batch_id)?;
     for dependency in &batch.causal_dependency_heads {
         if authenticated_batch_record(connection, sealed, current_root, *dependency, None)?
             .is_none()
@@ -3333,14 +3570,10 @@ fn preflight_inner(
         .checked_add(1)
         .ok_or_else(|| FrontierError::Corrupt("applied batch sequence overflowed".into()))?;
     if batch.acceptance_sequence != expected {
-        return Err(covered_redelivery_refusal(
-            connection,
-            sealed,
-            current_root,
-            batch.batch_id,
+        return Err(FrontierError::AcceptanceOrder {
             expected,
-            batch.acceptance_sequence,
-        ));
+            found: batch.acceptance_sequence,
+        });
     }
     if current_root != &batch.prior_frontier_root
         || batch.post_frontier_root.acceptance_sequence != batch.acceptance_sequence
@@ -3547,6 +3780,7 @@ fn apply_with_transaction_policy(
         }
         return Err(FrontierError::BatchCollision(batch.batch_id));
     }
+    guard_batch_already_accepted(connection, sealed, current_root, batch.batch_id)?;
 
     for dependency in &batch.causal_dependency_heads {
         if authenticated_batch_record(connection, sealed, current_root, *dependency, None)?
@@ -3560,14 +3794,10 @@ fn apply_with_transaction_policy(
         .checked_add(1)
         .ok_or_else(|| FrontierError::Corrupt("applied batch sequence overflowed".into()))?;
     if batch.acceptance_sequence != expected_sequence {
-        return Err(covered_redelivery_refusal(
-            connection,
-            sealed,
-            current_root,
-            batch.batch_id,
-            expected_sequence,
-            batch.acceptance_sequence,
-        ));
+        return Err(FrontierError::AcceptanceOrder {
+            expected: expected_sequence,
+            found: batch.acceptance_sequence,
+        });
     }
     if current_root != &batch.prior_frontier_root
         || batch.post_frontier_root.acceptance_sequence != batch.acceptance_sequence
@@ -5229,7 +5459,7 @@ mod tests {
             "apply must name the covered re-delivery"
         );
 
-        // The neuter: the probe renames ONLY a batch the frontier really
+        // The neuter: the guard names ONLY a batch the frontier really
         // contains. An ordinary out-of-order batch is still an ordering fault.
         let mut out_of_order = request.clone();
         out_of_order.batch.acceptance_sequence = 7;
@@ -5240,6 +5470,98 @@ mod tests {
                 found: 7
             })
         ));
+    }
+
+    /// The re-delivery that a lazy probe missed, and that silently ERASED an
+    /// accepted batch.
+    ///
+    /// The guard first ran only on the branch where the sequence check had
+    /// already failed -- free on the healthy path, and wrong. A covered id
+    /// offered at exactly `current + 1`, with a post root constructed to match,
+    /// skipped the probe entirely: `upsert_batch_map` took its `Ordering::Equal`
+    /// arm, REPLACED the covered key's value, and the frontier advanced with the
+    /// map count unchanged. Confirmed by probe before the guard moved; that is
+    /// the state the sealed three-root count check rejects, after SQLite has
+    /// already committed.
+    #[test]
+    fn a_covered_id_offered_at_the_expected_next_sequence_cannot_replace_its_map_value() {
+        let (_path, mut database, store, installed, request, _entries) =
+            anchored_candidate_with_covered_history();
+        let covered = id(101);
+        let peer = id(900);
+        let reader = SealedAcceptedIndexReader::new(&store);
+
+        let mut collide = request.clone();
+        collide.batch.batch_id = covered;
+        let clock_value = causal_clock_counter_digest(peer, 2);
+        let clock_root = MapLink {
+            key: peer.into(),
+            digest: authenticated_map_node_digest(peer.into(), clock_value, None, None),
+        };
+        let record_digest = accepted_batch_causal_record_digest(&collide.batch, &clock_root);
+        let (post_key, post_digest) = batch_map_root(&[(covered, record_digest)]);
+        let mut post = installed.clone();
+        post.acceptance_sequence = 2;
+        post.batch_map_root_key = post_key;
+        post.batch_map_root_digest = post_digest;
+        post.canonical_bytes = b"the covered key, replaced".to_vec();
+        post.state_digest = ContentDigest::of(b"replaced");
+        collide.batch.post_frontier_root = post;
+        assert_eq!(
+            collide.batch.acceptance_sequence, 2,
+            "the EXPECTED next sequence"
+        );
+
+        assert!(
+            matches!(
+                database.apply_checkpoint(&reader, &installed, &collide),
+                Err(FrontierError::CoveredBatchRedelivery(id)) if id == covered
+            ),
+            "a covered id at the expected next sequence must not be insertable"
+        );
+        assert!(database.load_all_batches().unwrap().is_empty());
+        assert_eq!(database.read_frontier().unwrap().applied_batch_count, 1);
+    }
+
+    /// F3-1: a LOST HOT ROW is corruption, not a re-delivery.
+    ///
+    /// Both shapes look the same from `load_batch`: an id that is in the
+    /// authenticated map with no `applied_batches` row. Only a descent of the
+    /// ANCHOR's covered root tells them apart, and calling the second one a
+    /// re-delivery would hide real damage behind an ordinary-sounding refusal.
+    #[test]
+    fn a_lost_hot_row_is_corruption_not_a_covered_redelivery() {
+        let (path, mut database, store, installed, request, _entries) =
+            anchored_candidate_with_covered_history();
+        let reader = SealedAcceptedIndexReader::new(&store);
+        let tail_id = request.batch.batch_id;
+        database
+            .apply_checkpoint(&reader, &installed, &request)
+            .unwrap();
+        let after = request.batch.post_frontier_root.clone();
+        drop(database);
+
+        // Lose the HOT row while its id stays in the authenticated map.
+        {
+            let connection = Connection::open(&path.path).unwrap();
+            connection
+                .execute(
+                    "DELETE FROM applied_batches WHERE batch_id = ?1",
+                    params![tail_id.as_slice()],
+                )
+                .unwrap();
+        }
+        let mut database = PhysicalSqliteDatabase::open_writable(&path.path).unwrap();
+        let mut redelivery = request.clone();
+        redelivery.batch.prior_frontier_root = after.clone();
+        let error = database
+            .apply_checkpoint(&reader, &after, &redelivery)
+            .expect_err("a lost hot row must not be accepted");
+        assert!(
+            matches!(&error, FrontierError::Corrupt(message)
+                if message.contains("is missing its exact record")),
+            "lost hot row misclassified: {error:?}"
+        );
     }
 
     /// C2: candidate variants alone are not enough. A promoted anchored
@@ -5264,9 +5586,15 @@ mod tests {
         assert_eq!(database.read_frontier().unwrap().applied_batch_count, 2);
     }
 
-    /// Relaxing the anchor to a floor must not relax it into nothing. Each
-    /// arm below is the neuter of one surviving refusal: damage the row it
-    /// guards and the open has to refuse, naming that arm.
+    /// Relaxing the anchor to a floor must not relax it into nothing.
+    ///
+    /// Each arm below is the neuter of one surviving refusal: damage the row it
+    /// guards and the open has to refuse, naming that arm. The first version of
+    /// this test covered only three arms and left two intervals completely
+    /// unchecked — an advanced frontier unbound to anything, and a LAGGING
+    /// materialization stamp whose digest could be any 32 bytes. Both were
+    /// confirmed open by probe, which is why the matrix here is the shape it is:
+    /// a floor is not a check, it is the absence of one everywhere above it.
     #[test]
     fn an_anchored_database_still_refuses_damage_below_and_beyond_its_floor() {
         fn advanced_anchored_database() -> TestDatabase {
@@ -5295,35 +5623,88 @@ mod tests {
             }
         }
 
-        // The frontier may not fall below the covered floor.
+        /// A root that is internally consistent -- bytes plus their own digest --
+        /// and has nothing to do with this database. Crude damage (`x'00'`) is
+        /// caught by the self-binding check and never reaches the arms below it.
+        fn foreign_root(label: &str) -> String {
+            let bytes = label.as_bytes();
+            let digest = ContentDigest::of(bytes);
+            format!("x'{}', x'{}'", hex(bytes), hex(digest.as_bytes()))
+        }
+
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+
+        // --- the frontier row ---
+
         assert!(
             refusal("UPDATE frontier SET applied_batch_count = 0 WHERE singleton = 1")
                 .contains("active frontier is behind its generation anchor"),
         );
-        // Still at the floor, so it must still BE the anchored root.
-        assert!(refusal(
-            "UPDATE frontier SET applied_batch_count = 1, frontier_root = x'00' \
-                 WHERE singleton = 1"
-        )
+        assert!(
+            refusal("UPDATE frontier SET frontier_root = x'00' WHERE singleton = 1")
+                .contains("active frontier digest does not hash its own bytes"),
+        );
+        assert!(refusal(&format!(
+            "UPDATE frontier SET applied_batch_count = 1,
+                 (frontier_root, frontier_root_digest) = ({})
+                 WHERE singleton = 1",
+            foreign_root("a foreign root at the floor")
+        ))
         .contains("unadvanced active frontier is misbound to its generation anchor"),);
-        // Projection rows for batches the frontier never accepted.
+        // The interval the floor opened: advanced, self-consistent, unrelated.
+        assert!(refusal(&format!(
+            "UPDATE frontier SET (frontier_root, frontier_root_digest) = ({})
+                 WHERE singleton = 1",
+            foreign_root("a foreign root above the floor")
+        ))
+        .contains("active frontier is not the end of the anchored tail"),);
+
+        // --- the retained tail that binds them ---
+
+        assert!(refusal("DELETE FROM applied_batches")
+            .contains("anchored tail does not hold exactly the batches above the covered floor"),);
+        assert!(refusal(&format!(
+            "UPDATE applied_batches SET (prior_frontier_root, prior_frontier_root_digest) = ({})",
+            foreign_root("a tail that starts somewhere else")
+        ))
+        .contains("anchored tail does not chain back to its generation anchor"),);
+
+        // --- the materialization stamp ---
+
         assert!(refusal(
             "UPDATE materialization_stamp SET acceptance_sequence = 9 WHERE singleton = 1"
         )
         .contains("materialization stamp is ahead of the active checkpoint frontier"),);
-        // Projection rows missing from inside the sealed region.
         assert!(refusal(
             "UPDATE materialization_stamp SET acceptance_sequence = 0 WHERE singleton = 1"
         )
         .contains("materialization stamp is behind its generation anchor"),);
-        // Same sequence, different frontier: the stamp is bound to the wrong root.
+        // The second interval the floor opened: the stamp LAGS legitimately
+        // here (the tail carries no materialization), and its digest was
+        // therefore compared with nothing at all.
+        assert!(refusal(
+            "UPDATE materialization_stamp SET frontier_root_digest = x'\
+                 0000000000000000000000000000000000000000000000000000000000000000' \
+                 WHERE singleton = 1"
+        )
+        .contains("materialization stamp is misbound to the frontier at its own sequence"),);
         assert!(refusal(
             "UPDATE materialization_stamp SET acceptance_sequence = 2, \
                  frontier_root_digest = x'\
                  0000000000000000000000000000000000000000000000000000000000000000' \
                  WHERE singleton = 1"
         )
-        .contains("materialization stamp is misbound to the active checkpoint frontier"),);
+        .contains("materialization stamp is misbound to the frontier at its own sequence"),);
+        // Projection evidence claiming more than the stamp admits -- the shape a
+        // torn stamp page leaves after a materialized tail.
+        assert!(refusal(
+            "INSERT INTO materialization_batches (acceptance_sequence, batch_id, input_digest)
+                 VALUES (5, x'00000000000000000000000000000042', x'\
+                 0000000000000000000000000000000000000000000000000000000000000000')"
+        )
+        .contains("materialization receipts are ahead of the materialization stamp"),);
     }
 
     /// The fix: with the reader injected, the same tail batch applies.
