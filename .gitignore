@@ -1,2 +1,12 @@
 /target/
 certification-receipt*.txt
+
+# Lane and verification evidence. Workers and adversarial passes write these to
+# the worktree root; the manager archives what is load-bearing under
+# tine-agents/evidence/ and cites it there. They must never enter the tracked
+# tree -- on 2026-09-02 a wave pushed 24 such files to both public remotes,
+# leaking private worktree paths and dossier names.
+/*.log
+/baseline-*.txt
+/necessity-*.txt
+/RECEIPT*.md
