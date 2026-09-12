@@ -1124,6 +1124,17 @@ fn validate_checkpoint_generation_anchor(connection: &Connection) -> Result<(), 
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
+    // SHAPE, and deliberately only shape. A 32-byte digest that is simply the
+    // WRONG 32 bytes passes here, and verification confirmed it: the database
+    // opens, a new tail commits over it, and it reopens clean. That is not
+    // closable on this path. Authenticating the link needs either a sealed
+    // reader -- which reopen validation does not have, by construction -- or a
+    // decode of `checkpoint_frontier_root`, whose bytes this layer treats as
+    // opaque (the fixtures pass literal blobs, which is the layer boundary
+    // showing through). It fails safe when it is USED: `is_covered_batch`
+    // descends from this root and a wrong digest resolves to nothing. So the
+    // exposure is a delayed, loud failure rather than a silent wrong answer,
+    // and under D-3 that routes to a rebuild. Recorded as follow-up E3.
     let covered_root_shape_is_valid = if covered_count == 0 {
         covered_root_key.is_none()
             && covered_root_digest.as_slice() == authenticated_map_empty_digest().as_bytes()
@@ -1889,10 +1900,24 @@ fn materialize_covered_causal_clock(
     // The full pass is not a rebuild in the expensive sense: every node is
     // `INSERT OR IGNORE`, so a clock that is already complete costs index probes
     // and writes nothing, and one that has lost a row is REPAIRED on the spot.
-    // That self-heal is the property the fast path silently removed. The cost is
-    // O(peers * log peers) per covered dependency head -- bounded by DEVICES,
-    // not by edits -- and it is stated that way in the design rather than
-    // optimized away.
+    // That self-heal is the property the fast path silently removed.
+    //
+    // Be precise about what the deletion costs, because the first version of
+    // this comment was not. The cost is O(peers * log peers) per covered
+    // dependency head, and the SIZE of that term is bounded by devices rather
+    // than by history -- but it is now paid on EVERY apply, so a tail of T
+    // batches sharing one covered head pays it T times. Verification measured
+    // ~32,300 VM instructions per apply at 64 peers, writing ~5 rows. Saying
+    // "bounded by devices, not by edits", as this comment did, was true of the
+    // term and false of the total, which is precisely the elision the deleted
+    // fast path used to cover.
+    //
+    // Accepted, not optimized away: peers are devices, the per-operation cost
+    // is small beside the document materialization on the same path, and it
+    // grows with neither the graph nor its lifetime (I-14). What was lost is
+    // amortization over a long replay. Anything that restores it must prove
+    // subtree COMPLETENESS more cheaply than walking it -- a present root row
+    // is not that proof.
     let mut link = None;
     for entry in entries {
         link = Some(upsert_causal_clock(
@@ -3752,11 +3777,23 @@ fn guard_terminal_prefix_candidate(
 /// treap insertions, measured at 1498 hot rows for a 256-peer clock.
 ///
 /// That term is bounded by PEER count, not by history: a peer is a replica, not
-/// an edit. It is also paid once — `materialize_covered_causal_clock` returns
-/// the existing link when the clock is already present, so the second tail
-/// descending from the same covered parent writes one insertion path, not a
-/// rebuild. `an_anchored_apply_reads_the_path_not_the_covered_history` measures
-/// all three terms; do not restate the bound without re-reading it.
+/// an edit. It is **not** amortized across a tail. An earlier revision of this
+/// comment said it was "paid once" because a reuse fast path returned the
+/// existing link when the clock root was already present; that path was
+/// UNSOUND (it read one present root row as proof of a whole subtree) and was
+/// deleted. Every apply now walks the full clock, so T tail batches sharing one
+/// covered head cost T · O(peers · log peers) — measured at ~32,300 SQLite VM
+/// instructions per apply for a 64-peer clock, each of which writes only about
+/// five new rows. `INSERT OR IGNORE` bounds the WRITES, not the work.
+///
+/// That is accepted rather than fixed: peers are devices, so the per-operation
+/// cost is a few thousand instructions on a path already doing document
+/// materialization, and it does not grow with the graph or its history. What it
+/// costs is the amortization a long rebuild used to get. Restoring that needs a
+/// completeness proof that is cheaper than the walk and sound against a missing
+/// descendant — not the deleted shortcut.
+/// `an_anchored_apply_reads_the_path_not_the_covered_history` measures the first
+/// two terms; do not restate the bound without re-reading it.
 pub fn apply_checkpoint_candidate(
     connection: &mut Connection,
     sealed: &dyn SealedAcceptedIndexRead,
@@ -5635,13 +5672,21 @@ mod tests {
             .expect("a second tail may descend from the same covered parent");
         let rows_after_second = clock_rows(&path);
         let added = rows_after_second - rows_after_first;
-        // Measured: 5. That is one insertion path into a 64-node treap -- the
-        // second tail's own dot -- not a rebuild of the 64-peer covered clock,
-        // which cost hundreds of rows the first time. The bound asserted here is
-        // the shape (a path), not the exact number.
+        // Measured: 5 -- one insertion path into a 64-node treap, the second
+        // tail's own dot, against hundreds of rows for the first tail.
+        //
+        // Read this for exactly what it says: the WRITES are idempotent. It used
+        // to be captioned as proof that the covered clock was "reused", and that
+        // reading was wrong even before the reuse fast path was deleted, because
+        // `INSERT OR IGNORE` makes a full re-walk write nothing either. A row
+        // count cannot tell a re-walk from a skip. After the deletion the clock
+        // IS fully re-walked on every apply (~32,300 VM instructions at 64
+        // peers) and this assertion does not move -- so if you are here to check
+        // whether materialization is amortized, this is not the test, and there
+        // is not one. See `apply_checkpoint_candidate`'s cost note.
         assert!(
             added < 20,
-            "the covered clock was rebuilt instead of being reused: {added} new rows"
+            "a second tail must write only its own dot, got {added} new rows"
         );
         assert!(added > 0, "the second tail must write its own dot");
     }
@@ -6207,11 +6252,15 @@ mod tests {
             "the EXPECTED next sequence"
         );
         let error = database.apply(&after_first, &replace).unwrap_err();
+        // The GUARD's message specifically, not "either refusal fired". Accepting
+        // the `Ordering::Equal` message here too would let each of D2's two
+        // defenses stand in for the other: verification neutered the guard, the
+        // upsert arm refused instead, and this test stayed green. It is supposed
+        // to fail when the guard is gone.
         assert!(
             matches!(&error, FrontierError::Corrupt(message)
-                if message.contains("is missing its exact record")
-                    || message.contains("accepted batch map already contains")),
-            "ordinary apply must refuse a covered id it cannot classify, got {error:?}"
+                if message.contains("is missing its exact record")),
+            "ordinary apply must refuse at the GUARD, got {error:?}"
         );
         assert_eq!(database.read_frontier().unwrap().applied_batch_count, 2);
         drop(database);
@@ -6244,9 +6293,55 @@ mod tests {
         let error = apply_checkpoint(&mut connection, &reader, &after, &second).unwrap_err();
         assert!(
             matches!(&error, FrontierError::Corrupt(message)
-                if message.contains("is missing its exact record")
-                    || message.contains("accepted batch map already contains")),
-            "an unanchored database must refuse it too, got {error:?}"
+                if message.contains("is missing its exact record")),
+            "an unanchored database must refuse at the GUARD too, got {error:?}"
+        );
+    }
+
+    /// The `Ordering::Equal` arm on its own terms.
+    ///
+    /// D2 was fixed on two channels so that a gap in either is survivable, and
+    /// a two-channel fix has to be proved one channel at a time. The test above
+    /// drives the guard; nothing drove this arm, because no legitimate caller
+    /// reaches it -- which is the point of it existing. So call it directly.
+    /// Neuter either channel and exactly one of the two tests goes red.
+    #[test]
+    fn upsert_batch_map_refuses_a_key_it_already_holds() {
+        let (path, database, _) = initialized_facade();
+        drop(database);
+        let connection = reopen_connection(&path);
+
+        let batch_id = id(7);
+        let first = ContentDigest::of(b"first value");
+        let link = upsert_batch_map(&connection, None, None, batch_id, first, 0).unwrap();
+        assert_eq!(
+            load_batch_map_node_for_apply(&connection, None, &link)
+                .unwrap()
+                .value_digest,
+            first,
+            "the premise: the key is in the map with its first value"
+        );
+
+        let error = upsert_batch_map(
+            &connection,
+            None,
+            Some(link.clone()),
+            batch_id,
+            ContentDigest::of(b"replacement value"),
+            0,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, FrontierError::Corrupt(message)
+                if message.contains("accepted batch map already contains")),
+            "re-inserting a present key must refuse, got {error:?}"
+        );
+        assert_eq!(
+            load_batch_map_node_for_apply(&connection, None, &link)
+                .unwrap()
+                .value_digest,
+            first,
+            "and must leave the accepted value alone"
         );
     }
 
@@ -6432,6 +6527,31 @@ mod tests {
                  0000000000000000000000000000000000000000000000000000000000000000')"
         )
         .contains("materialization receipts are ahead of the materialization stamp"),);
+
+        // --- the anchor's own covered batch root ---
+        //
+        // The table has a CHECK tying the root to the covered count, but a CHECK
+        // is a WRITE-time rule and reopen is the READ path -- so these cases need
+        // `ignore_check_constraints` to be written at all, which is exactly the
+        // argument for checking them again on read. A torn page does not consult
+        // a CHECK either.
+        //
+        // The NULL arm is not cosmetic: `is_covered_batch` reads a NULL root as
+        // "the covered map is empty", so without this refusal a nonzero-count
+        // anchor turns every genuine covered re-delivery into a corruption
+        // report about the wrong thing.
+        assert!(refusal(
+            "PRAGMA ignore_check_constraints = ON;
+             UPDATE checkpoint_generation_anchor SET covered_batch_root_key = NULL
+                 WHERE singleton = 1"
+        )
+        .contains("covered batch root does not match its covered count"),);
+        assert!(refusal(
+            "PRAGMA ignore_check_constraints = ON;
+             UPDATE checkpoint_generation_anchor SET covered_batch_root_digest = x'00'
+                 WHERE singleton = 1"
+        )
+        .contains("covered batch root does not match its covered count"),);
     }
 
     /// The fix: with the reader injected, the same tail batch applies.
