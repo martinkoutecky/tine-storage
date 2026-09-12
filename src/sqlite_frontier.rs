@@ -866,6 +866,12 @@ fn validate_checkpoint_anchor_input(
     root: &PhysicalCheckpointFrontierRoot,
     anchor: &PhysicalCheckpointGenerationAnchor,
 ) -> Result<(), FrontierError> {
+    // Shape first: the field-by-field comparison below can be satisfied by a
+    // root that is internally inconsistent -- in particular an overlay that
+    // claims to be empty while naming a root the candidate cannot walk. The
+    // empty-overlay precondition is only worth anything if it is checked at
+    // INSTALLATION, not just on the reads that come later.
+    validate_checkpoint_root_shape(root)?;
     let generation = &anchor.generation;
     let count = generation.covered_count;
     let terminal_pair_is_valid = if count == 0 {
@@ -5087,6 +5093,33 @@ mod tests {
                 Err(FrontierError::Corrupt(_))
             ),
             "a nonempty overlay must name its root"
+        );
+
+        // And the check is wired where it matters: INSTALLATION, not only the
+        // reads that come later. Without this the precondition would be
+        // discovered by a candidate that had already been built.
+        let mut root = checkpoint_root_fixture();
+        root.document_map_root_key = Some(AuthenticatedMapKey::from(id(5)));
+        let anchor = PhysicalCheckpointGenerationAnchor {
+            generation: root.generation.clone(),
+            checkpoint_frontier_root: root.canonical_bytes.clone(),
+            terminal_batch_id: None,
+            terminal_evidence_digest: None,
+            materialization_frontier_root_digest: root.digest(),
+        };
+        let path = TestDatabase::new();
+        let database = PhysicalSqliteDatabase::open_writable(&path.path).unwrap();
+        assert!(
+            matches!(
+                database.initialize_checkpoint_candidate_schema(
+                    claim(),
+                    &root,
+                    &anchor,
+                    test_parse_config_hash(),
+                ),
+                Err(FrontierError::Corrupt(_))
+            ),
+            "an anchored candidate must not be installable with an unwalkable overlay"
         );
     }
 
