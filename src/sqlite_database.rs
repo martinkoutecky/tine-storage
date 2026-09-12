@@ -303,6 +303,28 @@ impl PhysicalSqliteDatabase {
         Ok(result)
     }
 
+    /// [`Self::apply`] for a LIVE anchored database. See
+    /// [`sqlite_frontier::apply_checkpoint`].
+    pub fn apply_checkpoint(
+        &mut self,
+        sealed: &dyn SealedAcceptedIndexRead,
+        current_root: &PhysicalFrontierRoot,
+        request: &PhysicalApplyRequest,
+    ) -> Result<ApplyResult, FrontierError> {
+        let result =
+            sqlite_frontier::apply_checkpoint(&mut self.connection, sealed, current_root, request)?;
+        if matches!(
+            result.disposition,
+            sqlite_frontier::ApplyDisposition::Applied
+        ) {
+            self.write_instrumentation.ordinary_transactions = self
+                .write_instrumentation
+                .ordinary_transactions
+                .saturating_add(1);
+        }
+        Ok(result)
+    }
+
     /// Begin one unpublished disposable-candidate transaction. Only the
     /// candidate apply method below can join it; ordinary live apply refuses a
     /// caller-owned transaction.
@@ -334,6 +356,50 @@ impl PhysicalSqliteDatabase {
             ));
         }
         sqlite_frontier::apply_candidate(&mut self.connection, current_root, request)
+    }
+
+    /// Apply one transition into an ANCHORED candidate, resolving covered
+    /// history through the injected sealed accepted index. See
+    /// [`sqlite_frontier::apply_checkpoint_candidate`].
+    pub fn apply_checkpoint_candidate(
+        &mut self,
+        sealed: &dyn SealedAcceptedIndexRead,
+        current_root: &PhysicalFrontierRoot,
+        request: &PhysicalApplyRequest,
+    ) -> Result<ApplyResult, FrontierError> {
+        self.require_candidate_build()?;
+        sqlite_frontier::apply_checkpoint_candidate(
+            &mut self.connection,
+            sealed,
+            current_root,
+            request,
+        )
+    }
+
+    /// [`Self::apply_terminal_prefix_candidate`] for an anchored candidate.
+    pub fn apply_checkpoint_terminal_prefix_candidate(
+        &mut self,
+        sealed: &dyn SealedAcceptedIndexRead,
+        current_root: &PhysicalFrontierRoot,
+        request: &PhysicalApplyRequest,
+    ) -> Result<ApplyResult, FrontierError> {
+        self.require_candidate_build()?;
+        sqlite_frontier::apply_checkpoint_terminal_prefix_candidate(
+            &mut self.connection,
+            sealed,
+            current_root,
+            request,
+        )
+    }
+
+    /// [`Self::preflight`] for an anchored candidate.
+    pub fn preflight_checkpoint(
+        &self,
+        sealed: &dyn SealedAcceptedIndexRead,
+        current_root: &PhysicalFrontierRoot,
+        request: &PhysicalApplyRequest,
+    ) -> Result<PreflightDisposition, FrontierError> {
+        sqlite_frontier::preflight_checkpoint(&self.connection, sealed, current_root, request)
     }
 
     /// Retain one authenticated history transition for a fresh terminal

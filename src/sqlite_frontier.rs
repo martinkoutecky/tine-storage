@@ -14,8 +14,8 @@ use rusqlite::{params, Connection, OptionalExtension as _, Transaction, Transact
 use crate::sealed_accepted_index_impl::{
     accepted_causal_record_digest, authenticated_map_empty_digest, authenticated_map_node_digest,
     authenticated_map_priority_order, causal_clock_counter_digest, AuthenticatedMapKey,
-    AuthenticatedMapLinkV1, SealedAcceptedCausalRecordV2, SealedAcceptedIndexError,
-    SealedAcceptedIndexRead, MAX_AUTHENTICATED_MAP_KEY_BYTES,
+    AuthenticatedMapLinkV1, SealedAcceptedCausalClockEntryV2, SealedAcceptedCausalRecordV2,
+    SealedAcceptedIndexError, SealedAcceptedIndexRead, MAX_AUTHENTICATED_MAP_KEY_BYTES,
 };
 use crate::sqlite_materialization::{
     self, ApplyChangeInstrumentation, MaterializationError, PhysicalMaterializationChange,
@@ -561,6 +561,24 @@ pub enum FrontierError {
     FrontierRegression,
     BatchCollision([u8; 16]),
     MaterializationCollision([u8; 16]),
+    /// A batch whose id the anchored frontier already contains inside its
+    /// SEALED covered history was offered again.
+    ///
+    /// This is deliberately its own refusal rather than a `Duplicate`
+    /// disposition. Deciding it were a duplicate means answering "is the
+    /// re-delivery equal to what we accepted?", and on covered history the
+    /// exact `applied_batches` row that `stored_matches_request` compares --
+    /// `semantic_effect` included -- is gone; the sealed causal record carries
+    /// the batch id, manifest fingerprint, event-binding digest, causal dot and
+    /// canonical clock, and nothing else. A commitment-based equivalence over
+    /// the binding digest may well be the right contract, but that is a trust
+    /// boundary change, not an implementation detail, so storage refuses and
+    /// names the case instead of guessing an equivalence forward.
+    ///
+    /// Safety does not depend on that decision: a covered id can never be
+    /// re-inserted, because its acceptance sequence is at or below the covered
+    /// floor and apply admits only `current + 1`.
+    CoveredBatchRedelivery([u8; 16]),
     InjectedFailure,
 }
 
@@ -595,6 +613,11 @@ impl fmt::Display for FrontierError {
             }
             Self::FrontierRegression => formatter.write_str("accepted frontier regression"),
             Self::BatchCollision(id) => write!(formatter, "batch {} collides", HexId(id)),
+            Self::CoveredBatchRedelivery(id) => write!(
+                formatter,
+                "batch {} was already accepted into sealed covered history",
+                HexId(id)
+            ),
             Self::MaterializationCollision(id) => {
                 write!(
                     formatter,
@@ -1087,9 +1110,31 @@ fn validate_checkpoint_generation_anchor(connection: &Connection) -> Result<(), 
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
-    if frontier_bytes != stored.1 || frontier_digest != stored.2 || applied_count < stored.0 {
+    // The anchor is a FLOOR, not a freeze.
+    //
+    // This equality used to be unconditional, which was right while an anchored
+    // candidate could never advance: nothing could be applied to one, so its
+    // active frontier had to be exactly the anchored root. Once a tail batch can
+    // be applied, that same check refuses the healthy database it just produced
+    // -- apply advances the active frontier's bytes, digest and count, so the
+    // very next open reported `Corrupt`. A one-way door: the candidate accepted
+    // work and could then never be opened again.
+    //
+    // A refusal has to name an in-scope failure, and "the frontier moved forward"
+    // is not one; it is the path working. What the anchor legitimately proves is
+    // that this database has not gone BACKWARDS below its covered floor. The
+    // remaining protections are unchanged and are the ones that actually detect
+    // damage: `read_frontier` rejects a frontier whose digest does not match its
+    // own bytes, the anchor's own digest/bytes binding is checked above, and the
+    // materialization stamp must still agree with the active frontier below.
+    if applied_count < stored.0 {
         return Err(FrontierError::Corrupt(
-            "active frontier is behind or misbound to its generation anchor".into(),
+            "active frontier is behind its generation anchor".into(),
+        ));
+    }
+    if applied_count == stored.0 && (frontier_bytes != stored.1 || frontier_digest != stored.2) {
+        return Err(FrontierError::Corrupt(
+            "unadvanced active frontier is misbound to its generation anchor".into(),
         ));
     }
     let (materialized_count, materialized_frontier): (i64, Vec<u8>) = connection.query_row(
@@ -1098,9 +1143,41 @@ fn validate_checkpoint_generation_anchor(connection: &Connection) -> Result<(), 
         [],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if materialized_count != applied_count || materialized_frontier != frontier_digest {
+    // The stamp is a floor too, for the same reason and with the same hazard.
+    //
+    // At candidate build the stamp is written to exactly the anchored root, so
+    // equality was true then. It stops being true the moment a tail batch is
+    // applied without a materialization change: apply only advances the stamp
+    // when `request.materialization` is present (`apply_change_inner`), and an
+    // unmaterialized accepted batch is an ordinary production shape -- Tine
+    // builds `PhysicalApplyRequest.materialization` from an `Option`. An
+    // ordinary database opens fine in that state; an anchored one refused, so
+    // the second unmaterialized tail batch would have been a one-way door of
+    // exactly the same class as the frontier check above.
+    //
+    // The in-scope failure this still names: a stamp AHEAD of the active
+    // frontier means the graph projection carries rows for batches the frontier
+    // never accepted -- the shape a partially rolled back or externally
+    // truncated file leaves behind (crash/power loss, torn write, disk error),
+    // and the one that would let a query answer from a batch that was undone.
+    // A stamp BELOW the covered floor means materialization rows inside the
+    // sealed region are missing, which the candidate was built to carry. Both
+    // are damage; neither is the healthy path moving forward. Per D-3 the
+    // caller treats this disposable cache as rebuildable rather than
+    // authoritative.
+    if materialized_count > applied_count {
         return Err(FrontierError::Corrupt(
-            "materialization stamp is not bound to the active checkpoint frontier".into(),
+            "materialization stamp is ahead of the active checkpoint frontier".into(),
+        ));
+    }
+    if materialized_count < stored.0 {
+        return Err(FrontierError::Corrupt(
+            "materialization stamp is behind its generation anchor".into(),
+        ));
+    }
+    if materialized_count == applied_count && materialized_frontier != frontier_digest {
+        return Err(FrontierError::Corrupt(
+            "materialization stamp is misbound to the active checkpoint frontier".into(),
         ));
     }
     Ok(())
@@ -1553,6 +1630,7 @@ fn load_hot_batch_map_node(
 
 fn batch_map_value(
     connection: &Connection,
+    sealed: Option<&dyn SealedAcceptedIndexRead>,
     root: &PhysicalFrontierRoot,
     batch_id: [u8; 16],
 ) -> Result<Option<ContentDigest>, FrontierError> {
@@ -1571,7 +1649,7 @@ fn batch_map_value(
     let mut depth = 0;
     while let Some(link) = current {
         ensure_depth(depth, "accepted batch lookup")?;
-        let node = load_batch_map_node(connection, &link)?;
+        let node = load_batch_map_node_for_apply(connection, sealed, &link)?;
         match batch_id.cmp(&node.batch_id) {
             Ordering::Equal => return Ok(Some(node.value_digest)),
             Ordering::Less => current = node.left,
@@ -1580,6 +1658,53 @@ fn batch_map_value(
         depth += 1;
     }
     Ok(None)
+}
+
+/// Rebuild a covered batch's causal clock as hot `causal_clock_nodes` rows and
+/// prove the result against the root the sealed record commits to.
+///
+/// `expected` is passed in rather than recomputed here on purpose. Both sides
+/// derived from the same entry vector would move together under any
+/// perturbation, which is the shape of a check that cannot fail; taking the
+/// expected root as an argument is what lets
+/// `a_perturbed_covered_clock_cannot_pass_its_canonical_root` perturb exactly
+/// one side and see this refuse.
+fn materialize_covered_causal_clock(
+    connection: &Connection,
+    batch_id: &[u8; 16],
+    entries: &[SealedAcceptedCausalClockEntryV2],
+    expected: Option<AuthenticatedMapLinkV1>,
+) -> Result<MapLink, FrontierError> {
+    let mut link = None;
+    for entry in entries {
+        link = Some(upsert_causal_clock(
+            connection,
+            link,
+            entry.peer_id,
+            entry.counter,
+            0,
+        )?);
+    }
+    let link = link.ok_or_else(|| {
+        FrontierError::Corrupt(format!(
+            "covered accepted batch {} has an empty causal clock",
+            HexId(batch_id)
+        ))
+    })?;
+    let expected = expected.ok_or_else(|| {
+        FrontierError::Corrupt(format!(
+            "covered accepted batch {} derived an empty canonical clock root",
+            HexId(batch_id)
+        ))
+    })?;
+    if link.key != expected.key || link.digest != expected.digest {
+        return Err(FrontierError::Corrupt(format!(
+            "covered accepted batch {} rebuilt a causal clock that differs from its canonical \
+             root",
+            HexId(batch_id)
+        )));
+    }
+    Ok(link)
 }
 
 fn validate_checkpoint_root_shape(
@@ -1598,6 +1723,18 @@ fn validate_checkpoint_root_shape(
         || root.sequence_count != count
         || root.generation.covered_count > count
         || root.document_overlay_count > root.document_count
+        // The generation-relative document overlay is empty exactly when it has
+        // no root. The anchor separately requires the overlay to be empty AT
+        // the cutover (`validate_checkpoint_anchor_input`), and those two
+        // together are what make covered document nodes unreachable: apply
+        // seeds its document descent from `document_map_root_key` and walks
+        // `frontier_documents`, which has no sealed seam, so an anchored
+        // candidate that started with an overlay root would fault on a node
+        // that is not there. Starting from `None` makes every overlay node a
+        // tail apply writes hot by construction.
+        || (root.document_overlay_count == 0)
+            != (root.document_map_root_key.is_none()
+                && root.document_map_root_digest == authenticated_map_empty_digest())
         || !roots_match_count(root.batch_map_root_key, root.batch_map_root_digest)
         || !roots_match_count(root.status_map_root_key, root.status_map_root_digest)
         || (count == 0) != root.sequence_root_digest.is_none()
@@ -1633,6 +1770,29 @@ fn load_composite_batch_map_node(
             digest: child.digest,
         }),
     })
+}
+
+/// Resolve one accepted-batch node for a path that may or may not be anchored.
+///
+/// `None` is the LIVE database: every node is a row, and this is exactly the hot
+/// read it has always been, so the live apply path keeps its current cost and
+/// behaviour. `Some` is an anchored candidate, whose covered nodes left SQLite at
+/// the generation cutover and survive only as sealed accepted-index objects.
+///
+/// Falling back is sound rather than merely convenient: SQLite and sealed map
+/// nodes are the SAME tree, not two encodings that happen to agree.
+/// `sqlite_frontier` and the sealed writer both call
+/// `authenticated_map_node_digest` and `authenticated_map_priority` from
+/// `sealed_accepted_index_impl`, so a node has one identity on both sides.
+fn load_batch_map_node_for_apply(
+    connection: &Connection,
+    sealed: Option<&dyn SealedAcceptedIndexRead>,
+    expected: &MapLink,
+) -> Result<BatchMapNode, FrontierError> {
+    match sealed {
+        Some(sealed) => load_composite_batch_map_node(connection, sealed, expected),
+        None => load_batch_map_node(connection, expected),
+    }
 }
 
 fn batch_map_value_checkpoint(
@@ -1716,13 +1876,23 @@ fn validate_stored_batch_physical(record: &StoredBatch) -> Result<(), FrontierEr
     Ok(())
 }
 
+/// Resolve one accepted batch, hot or covered.
+///
+/// `sealed` is `None` on a live database, where every accepted batch has a row
+/// and a missing one is corruption. On an anchored candidate it is `Some`, and a
+/// batch below the generation cutover legitimately has NO row: it is answered by
+/// its sealed causal record instead. That record carries the whole
+/// `canonical_causal_clock`, which is why a covered ancestor needs neither a
+/// `semantic_effect` (read only on the `Hot` branch, by
+/// `validate_stored_batch_physical`) nor any `causal_clock_nodes` row.
 fn authenticated_batch_record(
     connection: &Connection,
+    sealed: Option<&dyn SealedAcceptedIndexRead>,
     root: &PhysicalFrontierRoot,
     batch_id: [u8; 16],
     expected_value: Option<ContentDigest>,
-) -> Result<Option<StoredBatch>, FrontierError> {
-    let Some(value) = batch_map_value(connection, root, batch_id)? else {
+) -> Result<Option<CheckpointAuthenticatedBatchRecord>, FrontierError> {
+    let Some(value) = batch_map_value(connection, sealed, root, batch_id)? else {
         return Ok(None);
     };
     if expected_value.is_some_and(|expected| expected != value) {
@@ -1731,27 +1901,27 @@ fn authenticated_batch_record(
             HexId(&batch_id)
         )));
     }
-    let record = load_batch(connection, batch_id)?.ok_or_else(|| {
-        FrontierError::Corrupt(format!(
+    if let Some(record) = load_batch(connection, batch_id)? {
+        validate_stored_batch_physical(&record)?;
+        let authenticated = CheckpointAuthenticatedBatchRecord::Hot(record);
+        let (peer, counter) = authenticated.causal_dot()?;
+        if authenticated.clock_counter(connection, peer)? != Some(counter) {
+            return Err(FrontierError::Corrupt(format!(
+                "accepted batch {} causal dot is absent from its authenticated clock",
+                HexId(&batch_id)
+            )));
+        }
+        return Ok(Some(authenticated));
+    }
+    let Some(sealed) = sealed else {
+        return Err(FrontierError::Corrupt(format!(
             "authenticated accepted batch {} is missing its exact record",
             HexId(&batch_id)
-        ))
-    })?;
-    validate_stored_batch_physical(&record)?;
-    let peer = decode_id(&record.causal_peer_id, "causal peer ID")?;
-    let clock_root = MapLink {
-        key: decode_id(&record.causal_clock_root_key, "causal clock root key")?.into(),
-        digest: decode_digest(&record.causal_clock_root_digest)?,
-    };
-    if causal_clock_lookup(connection, Some(clock_root), peer)?
-        != Some(record.causal_counter as u64)
-    {
-        return Err(FrontierError::Corrupt(format!(
-            "accepted batch {} causal dot is absent from its authenticated clock",
-            HexId(&batch_id)
         )));
-    }
-    Ok(Some(record))
+    };
+    Ok(Some(CheckpointAuthenticatedBatchRecord::Covered(
+        sealed.sealed_causal_record(batch_id, value)?,
+    )))
 }
 
 pub fn contains_batch(
@@ -1759,7 +1929,8 @@ pub fn contains_batch(
     root: &PhysicalFrontierRoot,
     batch_id: [u8; 16],
 ) -> Result<bool, FrontierError> {
-    authenticated_batch_record(connection, root, batch_id, None).map(|record| record.is_some())
+    authenticated_batch_record(connection, None, root, batch_id, None)
+        .map(|record| record.is_some())
 }
 
 pub fn authenticate_batch(
@@ -1768,7 +1939,7 @@ pub fn authenticate_batch(
     batch_id: [u8; 16],
     causal_record_digest: ContentDigest,
 ) -> Result<bool, FrontierError> {
-    authenticated_batch_record(connection, root, batch_id, Some(causal_record_digest))
+    authenticated_batch_record(connection, None, root, batch_id, Some(causal_record_digest))
         .map(|record| record.is_some())
 }
 
@@ -1787,6 +1958,42 @@ impl CheckpointAuthenticatedBatchRecord {
                 })?,
             )),
             Self::Covered(record) => Ok((record.causal_peer_id, record.causal_counter)),
+        }
+    }
+
+    /// This record's causal clock as a hot map link the frontier can union.
+    ///
+    /// `Hot` already has one. `Covered` does not and cannot: its clock nodes
+    /// left SQLite at the generation cutover. It carries the whole clock as a
+    /// sorted `(peer, counter)` vector instead, so the nodes are rebuilt here.
+    ///
+    /// Rebuilding is cheap and BOUNDED BY PEER COUNT, not by history -- which is
+    /// why this is materialized rather than making `union_clocks` composite.
+    /// A composite union would thread the reader through six recursive load
+    /// sites to avoid work that is already small.
+    ///
+    /// The rebuild is CHECKED, not trusted: `clock_root()` derives the canonical
+    /// root from the same vector by a different construction (a Cartesian build
+    /// over sorted entries, rather than repeated treap insertion). They must
+    /// agree, and they can only agree if the rebuilt tree is the same tree --
+    /// node priority folds the key alone, so shape is a function of the key set,
+    /// not of insertion order. A silent divergence here would corrupt causal
+    /// ordering, which is the one thing no later check would catch.
+    fn clock_link(&self, connection: &Connection) -> Result<MapLink, FrontierError> {
+        match self {
+            Self::Hot(record) => Ok(MapLink {
+                key: decode_id(&record.causal_clock_root_key, "causal clock root key")?.into(),
+                digest: decode_digest(&record.causal_clock_root_digest)?,
+            }),
+            Self::Covered(record) => materialize_covered_causal_clock(
+                connection,
+                &record.batch_id,
+                &record.canonical_causal_clock,
+                record
+                    .clock_root()
+                    .map_err(FrontierError::SealedAcceptedIndex)?
+                    .root,
+            ),
         }
     }
 
@@ -1922,23 +2129,19 @@ pub fn batch_descends_from(
     descendant: [u8; 16],
     ancestor: [u8; 16],
 ) -> Result<bool, FrontierError> {
-    let descendant =
-        authenticated_batch_record(connection, root, descendant, None)?.ok_or_else(|| {
+    let descendant = authenticated_batch_record(connection, None, root, descendant, None)?
+        .ok_or_else(|| {
             FrontierError::Corrupt(
                 "descendant batch is absent from the authenticated accepted map".into(),
             )
         })?;
-    let Some(ancestor) = authenticated_batch_record(connection, root, ancestor, None)? else {
+    let Some(ancestor) = authenticated_batch_record(connection, None, root, ancestor, None)? else {
         return Ok(false);
     };
-    let peer = decode_id(&ancestor.causal_peer_id, "causal peer ID")?;
-    let counter = u64::try_from(ancestor.causal_counter)
-        .map_err(|_| FrontierError::Corrupt("stored causal counter is invalid".into()))?;
-    let clock = MapLink {
-        key: decode_id(&descendant.causal_clock_root_key, "causal clock root key")?.into(),
-        digest: decode_digest(&descendant.causal_clock_root_digest)?,
-    };
-    Ok(causal_clock_lookup(connection, Some(clock), peer)?.is_some_and(|found| found >= counter))
+    let (peer, counter) = ancestor.causal_dot()?;
+    Ok(descendant
+        .clock_counter(connection, peer)?
+        .is_some_and(|found| found >= counter))
 }
 
 #[derive(Clone)]
@@ -2728,22 +2931,15 @@ fn split_clock(
 
 fn derive_causal_clock_root(
     transaction: &Connection,
+    sealed: Option<&dyn SealedAcceptedIndexRead>,
     root: &PhysicalFrontierRoot,
     batch: &PhysicalAcceptedBatch,
 ) -> Result<MapLink, FrontierError> {
     let mut clock = None;
     for parent in &batch.causal_dependency_heads {
-        let record = authenticated_batch_record(transaction, root, *parent, None)?
+        let record = authenticated_batch_record(transaction, sealed, root, *parent, None)?
             .ok_or(FrontierError::MissingDependency(*parent))?;
-        clock = union_clocks(
-            transaction,
-            clock,
-            Some(MapLink {
-                key: decode_id(&record.causal_clock_root_key, "causal clock root key")?.into(),
-                digest: decode_digest(&record.causal_clock_root_digest)?,
-            }),
-            0,
-        )?;
+        clock = union_clocks(transaction, clock, Some(record.clock_link(transaction)?), 0)?;
     }
     let expected = causal_clock_lookup(transaction, clock.clone(), batch.causal_peer_id)?
         .unwrap_or(0)
@@ -2806,6 +3002,7 @@ fn write_batch_map_node(
 
 fn upsert_batch_map(
     connection: &Connection,
+    sealed: Option<&dyn SealedAcceptedIndexRead>,
     root: Option<MapLink>,
     batch_id: [u8; 16],
     value_digest: ContentDigest,
@@ -2823,7 +3020,7 @@ fn upsert_batch_map(
             },
         );
     };
-    let mut node = load_batch_map_node(connection, &root)?;
+    let mut node = load_batch_map_node_for_apply(connection, sealed, &root)?;
     match batch_id.cmp(&node.batch_id) {
         Ordering::Equal => {
             node.value_digest = value_digest;
@@ -2832,6 +3029,7 @@ fn upsert_batch_map(
         Ordering::Less => {
             node.left = Some(upsert_batch_map(
                 connection,
+                sealed,
                 node.left.take(),
                 batch_id,
                 value_digest,
@@ -2840,7 +3038,7 @@ fn upsert_batch_map(
             if node.left.as_ref().is_some_and(|left| {
                 authenticated_map_priority_order(left.key, node.batch_id.into()).is_lt()
             }) {
-                rotate_batch_right(connection, node)
+                rotate_batch_right(connection, sealed, node)
             } else {
                 write_batch_map_node(connection, &node)
             }
@@ -2848,6 +3046,7 @@ fn upsert_batch_map(
         Ordering::Greater => {
             node.right = Some(upsert_batch_map(
                 connection,
+                sealed,
                 node.right.take(),
                 batch_id,
                 value_digest,
@@ -2856,7 +3055,7 @@ fn upsert_batch_map(
             if node.right.as_ref().is_some_and(|right| {
                 authenticated_map_priority_order(right.key, node.batch_id.into()).is_lt()
             }) {
-                rotate_batch_left(connection, node)
+                rotate_batch_left(connection, sealed, node)
             } else {
                 write_batch_map_node(connection, &node)
             }
@@ -2866,12 +3065,13 @@ fn upsert_batch_map(
 
 fn rotate_batch_right(
     connection: &Connection,
+    sealed: Option<&dyn SealedAcceptedIndexRead>,
     mut node: BatchMapNode,
 ) -> Result<MapLink, FrontierError> {
     let left = node.left.take().ok_or_else(|| {
         FrontierError::Corrupt("accepted batch-map rotation has no left child".into())
     })?;
-    let mut left_node = load_batch_map_node(connection, &left)?;
+    let mut left_node = load_batch_map_node_for_apply(connection, sealed, &left)?;
     node.left = left_node.right.take();
     left_node.right = Some(write_batch_map_node(connection, &node)?);
     write_batch_map_node(connection, &left_node)
@@ -2879,12 +3079,13 @@ fn rotate_batch_right(
 
 fn rotate_batch_left(
     connection: &Connection,
+    sealed: Option<&dyn SealedAcceptedIndexRead>,
     mut node: BatchMapNode,
 ) -> Result<MapLink, FrontierError> {
     let right = node.right.take().ok_or_else(|| {
         FrontierError::Corrupt("accepted batch-map rotation has no right child".into())
     })?;
-    let mut right_node = load_batch_map_node(connection, &right)?;
+    let mut right_node = load_batch_map_node_for_apply(connection, sealed, &right)?;
     node.right = right_node.left.take();
     right_node.left = Some(write_batch_map_node(connection, &node)?);
     write_batch_map_node(connection, &right_node)
@@ -3013,8 +3214,62 @@ fn validate_request_shape(request: &PhysicalApplyRequest) -> Result<(), Frontier
     Ok(())
 }
 
+/// Name a covered re-delivery instead of reporting it as an ordering fault.
+///
+/// A batch whose id is already in SEALED covered history has an acceptance
+/// sequence at or below the covered floor, so the ordinary sequence check
+/// refuses it -- but as `AcceptanceOrder`, which says "you sent me the wrong
+/// next batch" about a batch we in fact already have. On a live database that
+/// case is a `Duplicate`, so the anchored path must not answer it with a
+/// different, misleading fault.
+///
+/// This probe runs ONLY on the already-failing branch. The healthy path pays
+/// nothing: a batch that passes the sequence check never reaches here.
+fn covered_redelivery_refusal(
+    connection: &Connection,
+    sealed: Option<&dyn SealedAcceptedIndexRead>,
+    current_root: &PhysicalFrontierRoot,
+    batch_id: [u8; 16],
+    expected: u64,
+    found: u64,
+) -> FrontierError {
+    if sealed.is_some() {
+        match batch_map_value(connection, sealed, current_root, batch_id) {
+            Ok(Some(_)) => return FrontierError::CoveredBatchRedelivery(batch_id),
+            Ok(None) => {}
+            Err(error) => return error,
+        }
+    }
+    FrontierError::AcceptanceOrder { expected, found }
+}
+
 pub fn preflight(
     connection: &Connection,
+    current_root: &PhysicalFrontierRoot,
+    request: &PhysicalApplyRequest,
+) -> Result<PreflightDisposition, FrontierError> {
+    preflight_inner(connection, None, current_root, request)
+}
+
+/// [`preflight`] for an anchored candidate, resolving covered ancestors through
+/// the sealed accepted index.
+///
+/// Preflight shares the apply path's covered-`load_batch` shape, so it needs the
+/// same treatment: on an anchored candidate a re-delivered covered batch has no
+/// row, and answering "is this new?" from the row alone reports New for a batch
+/// the frontier already contains.
+pub fn preflight_checkpoint(
+    connection: &Connection,
+    sealed: &dyn SealedAcceptedIndexRead,
+    current_root: &PhysicalFrontierRoot,
+    request: &PhysicalApplyRequest,
+) -> Result<PreflightDisposition, FrontierError> {
+    preflight_inner(connection, Some(sealed), current_root, request)
+}
+
+fn preflight_inner(
+    connection: &Connection,
+    sealed: Option<&dyn SealedAcceptedIndexRead>,
     current_root: &PhysicalFrontierRoot,
     request: &PhysicalApplyRequest,
 ) -> Result<PreflightDisposition, FrontierError> {
@@ -3034,14 +3289,16 @@ pub fn preflight(
             key: decode_id(&existing.causal_clock_root_key, "causal clock root key")?.into(),
             digest: decode_digest(&existing.causal_clock_root_digest)?,
         };
-        if authenticated_batch_record(connection, current_root, batch.batch_id, None)?.is_none() {
+        if authenticated_batch_record(connection, sealed, current_root, batch.batch_id, None)?
+            .is_none()
+        {
             return Err(FrontierError::Corrupt(format!(
                 "stored batch {} is absent from the authenticated accepted map",
                 HexId(&batch.batch_id)
             )));
         }
         if stored_matches_request(&existing, batch)? {
-            if batch_map_value(connection, current_root, batch.batch_id)?
+            if batch_map_value(connection, sealed, current_root, batch.batch_id)?
                 != Some(accepted_batch_causal_record_digest(batch, &clock_root))
             {
                 return Err(FrontierError::Corrupt(format!(
@@ -3059,7 +3316,9 @@ pub fn preflight(
         return Err(FrontierError::BatchCollision(batch.batch_id));
     }
     for dependency in &batch.causal_dependency_heads {
-        if authenticated_batch_record(connection, current_root, *dependency, None)?.is_none() {
+        if authenticated_batch_record(connection, sealed, current_root, *dependency, None)?
+            .is_none()
+        {
             return Err(FrontierError::MissingDependency(*dependency));
         }
     }
@@ -3068,10 +3327,14 @@ pub fn preflight(
         .checked_add(1)
         .ok_or_else(|| FrontierError::Corrupt("applied batch sequence overflowed".into()))?;
     if batch.acceptance_sequence != expected {
-        return Err(FrontierError::AcceptanceOrder {
+        return Err(covered_redelivery_refusal(
+            connection,
+            sealed,
+            current_root,
+            batch.batch_id,
             expected,
-            found: batch.acceptance_sequence,
-        });
+            batch.acceptance_sequence,
+        ));
     }
     if current_root != &batch.prior_frontier_root
         || batch.post_frontier_root.acceptance_sequence != batch.acceptance_sequence
@@ -3093,7 +3356,7 @@ pub fn apply(
     current_root: &PhysicalFrontierRoot,
     request: &PhysicalApplyRequest,
 ) -> Result<ApplyResult, FrontierError> {
-    apply_with_transaction_policy(connection, current_root, request, false, true)
+    apply_with_transaction_policy(connection, None, current_root, request, false, true)
 }
 
 /// Apply one transition inside a candidate-build transaction already owned by
@@ -3104,7 +3367,7 @@ pub fn apply_candidate(
     current_root: &PhysicalFrontierRoot,
     request: &PhysicalApplyRequest,
 ) -> Result<ApplyResult, FrontierError> {
-    apply_with_transaction_policy(connection, current_root, request, true, true)
+    apply_with_transaction_policy(connection, None, current_root, request, true, true)
 }
 
 /// Apply one authenticated accepted-prefix transition while constructing a
@@ -3117,6 +3380,16 @@ pub fn apply_terminal_prefix_candidate(
     current_root: &PhysicalFrontierRoot,
     request: &PhysicalApplyRequest,
 ) -> Result<ApplyResult, FrontierError> {
+    guard_terminal_prefix_candidate(connection, request)?;
+    apply_with_transaction_policy(connection, None, current_root, request, true, false)
+}
+
+/// The two preconditions a terminal-prefix candidate apply owns, shared by the
+/// live and anchored entry points so they cannot drift apart.
+fn guard_terminal_prefix_candidate(
+    connection: &Connection,
+    request: &PhysicalApplyRequest,
+) -> Result<(), FrontierError> {
     if request.materialization.is_some() || request.materialization_input_digest.is_some() {
         return Err(FrontierError::InvalidInput(
             "terminal prefix candidate accepts history without materialization".into(),
@@ -3131,11 +3404,76 @@ pub fn apply_terminal_prefix_candidate(
             "terminal prefix candidate requires an unseeded document frontier".into(),
         ));
     }
-    apply_with_transaction_policy(connection, current_root, request, true, false)
+    Ok(())
+}
+
+/// Apply one transition into an ANCHORED candidate, resolving covered history
+/// through the injected sealed accepted index.
+///
+/// This is [`apply_candidate`] for a database whose covered history left SQLite
+/// at a generation cutover. Without the reader the first tail apply fails at
+/// `load_batch_map_node` — `validate_checkpoint_anchor_input` requires the
+/// installed root to name the covered batch-map root, so the walk starts covered
+/// by construction and there is no empty-tree option.
+///
+/// The reader is consulted only where a node is genuinely absent from SQLite,
+/// and the nodes on the descent path are then written back as ORDINARY HOT
+/// ROWS. Those rows are NOT copies of the sealed nodes: a path node has one
+/// child link changed, so it is a structurally new node at a new digest, and a
+/// rotation rewrites its participants the same way. Nodes OFF the path are not
+/// touched at all and stay reachable only as sealed links.
+///
+/// What is preserved is the tree, not the bytes. Node priority folds the KEY
+/// alone (`authenticated_map_priority_order`), and the sealed writer folds it
+/// the same way, so for a given key/value set the treap is canonical: the
+/// resulting root digest equals a from-empty replay of the same history
+/// regardless of insertion order.
+///
+/// Cost is one descent: O(height), expected O(log n) under digest-derived
+/// priorities, and hard-refused above the 256-node depth ceiling
+/// (`MAX_MAP_DEPTH`) — plus one composite lookup per causal dependency head.
+pub fn apply_checkpoint_candidate(
+    connection: &mut Connection,
+    sealed: &dyn SealedAcceptedIndexRead,
+    current_root: &PhysicalFrontierRoot,
+    request: &PhysicalApplyRequest,
+) -> Result<ApplyResult, FrontierError> {
+    apply_with_transaction_policy(connection, Some(sealed), current_root, request, true, true)
+}
+
+/// [`apply`] for a LIVE anchored database, resolving covered history through
+/// the sealed accepted index.
+///
+/// Candidate variants alone are not enough. Once an anchored candidate is
+/// promoted, its hot batch-map root still carries off-path child links into
+/// sealed covered nodes, so the next ordinary live apply meets exactly the same
+/// absent node — at a causal dependency head, or during the insertion descent.
+/// Calling [`apply`] there (`sealed = None`) reproduces the failure this whole
+/// seam exists to remove.
+pub fn apply_checkpoint(
+    connection: &mut Connection,
+    sealed: &dyn SealedAcceptedIndexRead,
+    current_root: &PhysicalFrontierRoot,
+    request: &PhysicalApplyRequest,
+) -> Result<ApplyResult, FrontierError> {
+    apply_with_transaction_policy(connection, Some(sealed), current_root, request, false, true)
+}
+
+/// [`apply_terminal_prefix_candidate`] for an anchored candidate. See
+/// [`apply_checkpoint_candidate`] for what the reader is for.
+pub fn apply_checkpoint_terminal_prefix_candidate(
+    connection: &mut Connection,
+    sealed: &dyn SealedAcceptedIndexRead,
+    current_root: &PhysicalFrontierRoot,
+    request: &PhysicalApplyRequest,
+) -> Result<ApplyResult, FrontierError> {
+    guard_terminal_prefix_candidate(connection, request)?;
+    apply_with_transaction_policy(connection, Some(sealed), current_root, request, true, false)
 }
 
 fn apply_with_transaction_policy(
     connection: &mut Connection,
+    sealed: Option<&dyn SealedAcceptedIndexRead>,
     current_root: &PhysicalFrontierRoot,
     request: &PhysicalApplyRequest,
     candidate_build: bool,
@@ -3158,7 +3496,7 @@ fn apply_with_transaction_policy(
             digest: decode_digest(&existing.causal_clock_root_digest)?,
         };
         let authenticated =
-            authenticated_batch_record(connection, current_root, batch.batch_id, None)?;
+            authenticated_batch_record(connection, sealed, current_root, batch.batch_id, None)?;
         if authenticated.is_none() {
             return Err(FrontierError::Corrupt(format!(
                 "stored batch {} is absent from the authenticated accepted map",
@@ -3166,7 +3504,7 @@ fn apply_with_transaction_policy(
             )));
         }
         if stored_matches_request(&existing, batch)? {
-            if batch_map_value(connection, current_root, batch.batch_id)?
+            if batch_map_value(connection, sealed, current_root, batch.batch_id)?
                 != Some(accepted_batch_causal_record_digest(
                     batch,
                     &existing_clock_root,
@@ -3205,7 +3543,9 @@ fn apply_with_transaction_policy(
     }
 
     for dependency in &batch.causal_dependency_heads {
-        if authenticated_batch_record(connection, current_root, *dependency, None)?.is_none() {
+        if authenticated_batch_record(connection, sealed, current_root, *dependency, None)?
+            .is_none()
+        {
             return Err(FrontierError::MissingDependency(*dependency));
         }
     }
@@ -3214,10 +3554,14 @@ fn apply_with_transaction_policy(
         .checked_add(1)
         .ok_or_else(|| FrontierError::Corrupt("applied batch sequence overflowed".into()))?;
     if batch.acceptance_sequence != expected_sequence {
-        return Err(FrontierError::AcceptanceOrder {
-            expected: expected_sequence,
-            found: batch.acceptance_sequence,
-        });
+        return Err(covered_redelivery_refusal(
+            connection,
+            sealed,
+            current_root,
+            batch.batch_id,
+            expected_sequence,
+            batch.acceptance_sequence,
+        ));
     }
     if current_root != &batch.prior_frontier_root
         || batch.post_frontier_root.acceptance_sequence != batch.acceptance_sequence
@@ -3240,6 +3584,7 @@ fn apply_with_transaction_policy(
         }
         return apply_in_open_transaction(
             OpenApplyTransaction::Candidate(connection),
+            sealed,
             current_root,
             request,
             &stored_frontier,
@@ -3254,6 +3599,7 @@ fn apply_with_transaction_policy(
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let result = apply_in_open_transaction(
         OpenApplyTransaction::Ordinary(&transaction),
+        sealed,
         current_root,
         request,
         &stored_frontier,
@@ -3279,6 +3625,7 @@ impl OpenApplyTransaction<'_, '_> {
 
 fn apply_in_open_transaction(
     transaction: OpenApplyTransaction<'_, '_>,
+    sealed: Option<&dyn SealedAcceptedIndexRead>,
     current_root: &PhysicalFrontierRoot,
     request: &PhysicalApplyRequest,
     stored_frontier: &StoredFrontier,
@@ -3294,10 +3641,11 @@ fn apply_in_open_transaction(
             "physical frontier changed while beginning apply".into(),
         ));
     }
-    let clock_root = derive_causal_clock_root(connection, current_root, batch)?;
+    let clock_root = derive_causal_clock_root(connection, sealed, current_root, batch)?;
     let causal_record_digest = accepted_batch_causal_record_digest(batch, &clock_root);
     let post_batch_root = upsert_batch_map(
         connection,
+        sealed,
         current_root.batch_map_root_key.map(|key| MapLink {
             key: key.into(),
             digest: current_root.batch_map_root_digest,
@@ -4039,30 +4387,19 @@ mod tests {
         ));
     }
 
-    /// FAIL-BEFORE for the anchored-apply release: a tail batch cannot be
-    /// applied over covered history.
-    ///
-    /// This is the blocker that stops Tine's rebaselining P4c cutover. After a
-    /// generation cutover the covered history leaves SQLite and survives only as
-    /// sealed accepted-index objects. `initialize_checkpoint_candidate_schema`
-    /// creates EMPTY `accepted_batch_nodes`/`causal_clock_nodes`/`applied_batches`,
-    /// while `validate_checkpoint_anchor_input` REQUIRES the installed frontier
-    /// root to name the covered batch-map root -- so the first tail apply walks
-    /// from a root whose nodes are not rows, by construction.
-    ///
-    /// The read family already handles this through an injected sealed reader
-    /// (see `checkpoint_covered_reads_use_the_injected_sealed_reader_without_sql_history_rows`,
-    /// which proves the covered reads work with zero SQL history rows). `apply`
-    /// never got that treatment: it takes a bare `PhysicalFrontierRoot` and no
-    /// reader, so it has no way to resolve a covered node.
-    ///
-    /// When the anchored-apply work lands, this test must be REPLACED by its
-    /// positive counterpart, not deleted: the same fixture applying the same
-    /// tail batch successfully, with the resulting batch-map root asserted equal
-    /// to a from-empty hot replay of the whole history.
-    #[test]
-    fn a_tail_batch_cannot_be_applied_over_covered_history_today() {
+    /// One anchored candidate whose history is covered: present as sealed
+    /// objects, absent as rows. Returns the store, the installed live root, and
+    /// one ordinary tail batch that causally descends from the covered one.
+    fn anchored_candidate_with_covered_history() -> (
+        TestDatabase,
+        PhysicalSqliteDatabase,
+        TestSealedStore,
+        PhysicalFrontierRoot,
+        PhysicalApplyRequest,
+        Vec<([u8; 16], ContentDigest)>,
+    ) {
         let covered_batch_id = id(101);
+        let tail_id = id(102);
         let peer_id = id(900);
         let causal = SealedAcceptedCausalRecordV2 {
             batch_id: covered_batch_id,
@@ -4143,7 +4480,7 @@ mod tests {
         };
 
         let path = TestDatabase::new();
-        let mut database = PhysicalSqliteDatabase::open_writable(&path.path).unwrap();
+        let database = PhysicalSqliteDatabase::open_writable(&path.path).unwrap();
         database
             .initialize_checkpoint_candidate_schema(
                 claim(),
@@ -4152,12 +4489,11 @@ mod tests {
                 test_parse_config_hash(),
             )
             .unwrap();
-        // The premise: covered history is present as sealed objects and absent
-        // as rows. If this ever stops holding, the test below stops meaning
-        // anything.
+        // The premise. If covered history ever stops being absent as rows, every
+        // assertion below stops meaning anything.
         assert!(database.load_all_batches().unwrap().is_empty());
 
-        // The installed live root, as apply sees it: it names the COVERED batch
+        // The installed live root, as apply sees it. It names the COVERED batch
         // map root, because the anchor validation requires exactly that.
         let installed = PhysicalFrontierRoot {
             canonical_bytes,
@@ -4170,9 +4506,7 @@ mod tests {
             state_digest: ContentDigest::of(b"state"),
         };
 
-        // One ordinary tail batch, causally descending from the covered one.
-        let tail_id = id(102);
-        let tail = PhysicalAcceptedBatch {
+        let mut tail = PhysicalAcceptedBatch {
             batch_id: tail_id,
             manifest_digest: ContentDigest::of(b"tail manifest"),
             event_binding_digest: ContentDigest::of(b"tail event"),
@@ -4190,20 +4524,139 @@ mod tests {
             acceptance_sequence: 2,
             retained_bytes: 20,
         };
+        // The tail's own clock is the covered clock advanced by one dot: the
+        // covered record holds {peer: 1}, so the union with this batch's dot is
+        // {peer: 2}.
+        let clock_value = causal_clock_counter_digest(peer_id, 2);
+        let clock_root = MapLink {
+            key: peer_id.into(),
+            digest: authenticated_map_node_digest(peer_id.into(), clock_value, None, None),
+        };
+        let record_digest = accepted_batch_causal_record_digest(&tail, &clock_root);
+        let mut entries = vec![(covered_batch_id, causal_address), (tail_id, record_digest)];
+        entries.sort_unstable_by_key(|entry| entry.0);
+        let (post_key, post_digest) = batch_map_root(&entries);
+        let mut post = installed.clone();
+        post.acceptance_sequence = 2;
+        post.batch_map_root_key = post_key;
+        post.batch_map_root_digest = post_digest;
+        post.canonical_bytes = b"covered checkpoint frontier + tail".to_vec();
+        post.state_digest = ContentDigest::of(b"state after tail");
+        tail.post_frontier_root = post;
+
         let request = PhysicalApplyRequest {
             batch: tail,
             materialization: None,
             materialization_input_digest: None,
             fault: ApplyFault::None,
         };
+        (path, database, store, installed, request, entries)
+    }
 
+    /// One more ordinary tail batch on top of `prior`, so a test can prove what
+    /// the SECOND anchored apply does. `documents` is both the affected set and
+    /// the complete document frontier after this batch.
+    fn anchored_tail(
+        prior: &PhysicalFrontierRoot,
+        prior_entries: &[([u8; 16], ContentDigest)],
+        parent: [u8; 16],
+        documents: &[PhysicalFrontierDocument],
+    ) -> (PhysicalApplyRequest, Vec<([u8; 16], ContentDigest)>) {
+        let sequence = prior.acceptance_sequence + 1;
+        let peer = id(900);
+        let batch_id = id(100 + u128::from(sequence));
+        let mut batch = PhysicalAcceptedBatch {
+            batch_id,
+            manifest_digest: ContentDigest::of(&[b'm', sequence as u8]),
+            event_binding_digest: ContentDigest::of(&[b'e', sequence as u8]),
+            semantic_effect: vec![b's', sequence as u8],
+            semantic_effect_digest: ContentDigest::of(&[b's', sequence as u8]),
+            dependency_frontier: vec![b'd', sequence as u8],
+            prior_frontier_root: prior.clone(),
+            post_frontier_root: prior.clone(),
+            affected_documents: documents.to_vec(),
+            affected_documents_bytes: documents
+                .iter()
+                .flat_map(|document| {
+                    document
+                        .document_key
+                        .as_slice()
+                        .iter()
+                        .copied()
+                        .chain(document.canonical_bytes.iter().copied())
+                })
+                .collect(),
+            causal_dependency_heads: vec![parent],
+            causal_dependency_heads_bytes: parent.to_vec(),
+            causal_peer_id: peer,
+            causal_counter: sequence,
+            acceptance_sequence: sequence,
+            retained_bytes: sequence * 10,
+        };
+        let clock_value = causal_clock_counter_digest(peer, sequence);
+        let clock_root = MapLink {
+            key: peer.into(),
+            digest: authenticated_map_node_digest(peer.into(), clock_value, None, None),
+        };
+        let record_digest = accepted_batch_causal_record_digest(&batch, &clock_root);
+        let mut entries = prior_entries.to_vec();
+        entries.push((batch_id, record_digest));
+        entries.sort_unstable_by_key(|entry| entry.0);
+        let document_entries = documents
+            .iter()
+            .map(|document| {
+                (
+                    document.document_key,
+                    ContentDigest::of(&document.canonical_bytes),
+                )
+            })
+            .collect::<Vec<_>>();
+        let (document_key, document_digest) = map_root(&document_entries);
+        let (post_key, post_digest) = batch_map_root(&entries);
+        let mut post = prior.clone();
+        post.acceptance_sequence = sequence;
+        post.document_count = documents.len() as u64;
+        post.document_map_root_key = document_key;
+        post.document_map_root_digest = document_digest;
+        post.batch_map_root_key = post_key;
+        post.batch_map_root_digest = post_digest;
+        post.canonical_bytes = format!("covered checkpoint frontier + {sequence}").into_bytes();
+        post.state_digest = ContentDigest::of(&sequence.to_be_bytes());
+        batch.post_frontier_root = post;
+        (
+            PhysicalApplyRequest {
+                batch,
+                materialization: None,
+                materialization_input_digest: None,
+                fault: ApplyFault::None,
+            },
+            entries,
+        )
+    }
+
+    /// The blocker this release exists to remove: without the sealed reader, a
+    /// tail batch cannot be applied over covered history at all.
+    ///
+    /// After a generation cutover the covered history leaves SQLite and survives
+    /// only as sealed accepted-index objects.
+    /// `initialize_checkpoint_candidate_schema` creates EMPTY
+    /// `accepted_batch_nodes` / `causal_clock_nodes` / `applied_batches`, while
+    /// `validate_checkpoint_anchor_input` REQUIRES the installed frontier root to
+    /// name the covered batch-map root — so the walk starts covered by
+    /// construction and there is no empty-tree option.
+    ///
+    /// This is the NECESSITY GATE for `apply_checkpoint_candidate`. It must keep
+    /// failing here, because the ordinary live apply must not silently acquire a
+    /// fallback: on a live database a missing accepted-batch node IS corruption,
+    /// and answering it from elsewhere would hide real damage.
+    #[test]
+    fn a_tail_batch_over_covered_history_needs_the_sealed_reader() {
+        let (_path, mut database, _store, installed, request, _entries) =
+            anchored_candidate_with_covered_history();
         database.begin_candidate_build().unwrap();
         let error = database
             .apply_candidate(&installed, &request)
-            .expect_err("applying a tail batch over covered history cannot succeed on v0.20.0");
-
-        // Name the exact failure. A different error would mean the blocker is
-        // somewhere else and the design aimed at the wrong site.
+            .expect_err("the live apply has no way to resolve a covered node");
         let FrontierError::Corrupt(detail) = &error else {
             panic!("expected a Corrupt failure naming the missing covered node, got {error:?}");
         };
@@ -4211,6 +4664,646 @@ mod tests {
             detail.contains("accepted-batch node") && detail.contains("missing"),
             "expected the covered accepted-batch node walk to fail, got {detail:?}"
         );
+    }
+
+    /// An anchored database that accepted a tail batch can still be REOPENED.
+    ///
+    /// The anchor validator used to require the active frontier to equal the
+    /// anchored root exactly. That was right while nothing could be applied to an
+    /// anchored candidate, and became a one-way door the moment something could:
+    /// apply advances the frontier's bytes, digest and count, so the database
+    /// that had just successfully accepted work refused to open, reporting
+    /// `Corrupt("active frontier is behind or misbound to its generation
+    /// anchor")`. The cutover would have produced exactly one usable session.
+    ///
+    /// Verified by this test before the fix; the anchor is now a floor.
+    #[test]
+    fn an_anchored_database_reopens_after_accepting_a_tail_batch() {
+        let (path, mut database, store, installed, request, _entries) =
+            anchored_candidate_with_covered_history();
+        database.begin_candidate_build().unwrap();
+        let reader = SealedAcceptedIndexReader::new(&store);
+        database
+            .apply_checkpoint_candidate(&reader, &installed, &request)
+            .unwrap();
+        database.finish_candidate_build().unwrap();
+        drop(database);
+
+        let reopened = PhysicalSqliteDatabase::open_writable(&path.path).unwrap();
+        reopened
+            .validate_schema_and_claim(claim())
+            .expect("an anchored database that accepted a tail batch must still open");
+        // It really did advance -- otherwise this would pass vacuously.
+        assert_eq!(reopened.read_frontier().unwrap().applied_batch_count, 2);
+    }
+
+    /// Counts what an anchored apply actually asks the sealed index for.
+    ///
+    /// The row delta in `accepted_batch_nodes` cannot answer the boundedness
+    /// question on its own: it is blind to a read-only walk of the whole covered
+    /// tree, and `INSERT OR IGNORE` hides rewrites of nodes already present.
+    /// This counts the reads.
+    use crate::sealed_accepted_index::SealedAuthenticatedMapNodeV2;
+
+    struct CountingSealedReader<'a> {
+        inner: &'a dyn SealedAcceptedIndexRead,
+        map_nodes: std::cell::Cell<usize>,
+        causal_records: std::cell::Cell<usize>,
+    }
+
+    impl<'a> CountingSealedReader<'a> {
+        fn new(inner: &'a dyn SealedAcceptedIndexRead) -> Self {
+            Self {
+                inner,
+                map_nodes: std::cell::Cell::new(0),
+                causal_records: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl SealedAcceptedIndexRead for CountingSealedReader<'_> {
+        fn sealed_map_node(
+            &self,
+            link: AuthenticatedMapLinkV1,
+        ) -> Result<SealedAuthenticatedMapNodeV2, SealedAcceptedIndexError> {
+            self.map_nodes.set(self.map_nodes.get() + 1);
+            self.inner.sealed_map_node(link)
+        }
+
+        fn sealed_causal_record(
+            &self,
+            batch_id: [u8; 16],
+            address: ContentDigest,
+        ) -> Result<SealedAcceptedCausalRecordV2, SealedAcceptedIndexError> {
+            self.causal_records.set(self.causal_records.get() + 1);
+            self.inner.sealed_causal_record(batch_id, address)
+        }
+    }
+
+    /// An anchored candidate over `covered` sealed batches, each from its own
+    /// peer at counter 1, plus one tail batch depending on the first of them.
+    fn anchored_candidate_over(
+        covered: u128,
+    ) -> (
+        TestDatabase,
+        PhysicalSqliteDatabase,
+        TestSealedStore,
+        PhysicalFrontierRoot,
+        PhysicalApplyRequest,
+    ) {
+        assert!(covered >= 1);
+        let mut store = TestSealedStore::default();
+        let mut writer = SealedAcceptedIndexWriter::new(&mut store);
+        let mut batch_root = AuthenticatedMapRootV1::empty();
+        let mut entries = Vec::new();
+        for index in 0..covered {
+            let peer_id = id(1000 + index);
+            let batch_id = id(2000 + index);
+            let causal = SealedAcceptedCausalRecordV2 {
+                batch_id,
+                manifest_fingerprint: ContentDigest::of(b"manifest"),
+                event_binding_digest: ContentDigest::of(b"event"),
+                causal_peer_id: peer_id,
+                causal_counter: 1,
+                canonical_causal_clock: vec![SealedAcceptedCausalClockEntryV2 {
+                    peer_id,
+                    counter: 1,
+                }],
+            };
+            let address = writer.publish_causal(&causal).unwrap();
+            batch_root = writer.upsert_map(batch_root, batch_id, address).unwrap();
+            entries.push((batch_id, address));
+        }
+        drop(writer);
+        entries.sort_unstable_by_key(|entry| entry.0);
+
+        let covered_count = u64::try_from(covered).unwrap();
+        let covered_root_key = batch_root
+            .root
+            .map(|link| key_as_id(link.key, "test batch ID").unwrap());
+        let empty = authenticated_map_empty_digest();
+        let generation = PhysicalCheckpointGenerationBinding {
+            generation_id: id(2),
+            predecessor_generation_id: Some(id(1)),
+            full_anchor_generation_id: id(2),
+            covered_count,
+            covered_document_count: 0,
+            covered_block_count: 0,
+            covered_retained_bytes_total: 10,
+            covered_semantic_capsules_root_digest: ContentDigest::of(b"capsules"),
+            covered_batch_root_key: covered_root_key,
+            covered_batch_root_digest: batch_root.root_digest(),
+            covered_status_root_key: covered_root_key,
+            covered_status_root_digest: batch_root.root_digest(),
+            covered_sequence_root_digest: Some(ContentDigest::of(b"sequence")),
+            covered_sequence_height: 0,
+            covered_causal_tip_root_key: Some(id(1000)),
+            covered_causal_tip_root_digest: ContentDigest::of(b"tip"),
+            covered_head_facts_root_digest: ContentDigest::of(b"heads"),
+            current_projection_payload_pins_root_digest: ContentDigest::of(b"payloads"),
+            nonlinear_state_root_digest: ContentDigest::of(b"nonlinear"),
+            retention_pins_root_digest: ContentDigest::of(b"retention"),
+        };
+        let canonical_bytes = format!("covered checkpoint frontier over {covered}").into_bytes();
+        let checkpoint_root = PhysicalCheckpointFrontierRoot {
+            canonical_bytes: canonical_bytes.clone(),
+            acceptance_sequence: covered_count,
+            document_count: 0,
+            document_overlay_count: 0,
+            retained_bytes_total: 10,
+            document_map_root_key: None,
+            document_map_root_digest: empty,
+            batch_map_root_key: covered_root_key,
+            batch_map_root_digest: batch_root.root_digest(),
+            batch_map_count: covered_count,
+            status_map_root_key: covered_root_key,
+            status_map_root_digest: batch_root.root_digest(),
+            status_map_count: covered_count,
+            sequence_root_digest: Some(ContentDigest::of(b"sequence")),
+            sequence_height: 0,
+            sequence_count: covered_count,
+            generation: generation.clone(),
+            state_digest: ContentDigest::of(b"state"),
+        };
+        let anchor = PhysicalCheckpointGenerationAnchor {
+            generation,
+            checkpoint_frontier_root: canonical_bytes.clone(),
+            terminal_batch_id: Some(id(2000 + covered - 1)),
+            terminal_evidence_digest: Some(ContentDigest::of(b"evidence")),
+            materialization_frontier_root_digest: checkpoint_root.digest(),
+        };
+        let path = TestDatabase::new();
+        let database = PhysicalSqliteDatabase::open_writable(&path.path).unwrap();
+        database
+            .initialize_checkpoint_candidate_schema(
+                claim(),
+                &checkpoint_root,
+                &anchor,
+                test_parse_config_hash(),
+            )
+            .unwrap();
+        assert!(database.load_all_batches().unwrap().is_empty());
+
+        let installed = PhysicalFrontierRoot {
+            canonical_bytes,
+            acceptance_sequence: covered_count,
+            document_count: 0,
+            document_map_root_key: None,
+            document_map_root_digest: empty,
+            batch_map_root_key: covered_root_key,
+            batch_map_root_digest: batch_root.root_digest(),
+            state_digest: ContentDigest::of(b"state"),
+        };
+
+        let parent = id(2000);
+        let tail_peer = id(900);
+        let tail_id = id(3000);
+        let mut tail = PhysicalAcceptedBatch {
+            batch_id: tail_id,
+            manifest_digest: ContentDigest::of(b"tail manifest"),
+            event_binding_digest: ContentDigest::of(b"tail event"),
+            semantic_effect: b"tail effect".to_vec(),
+            semantic_effect_digest: ContentDigest::of(b"tail effect"),
+            dependency_frontier: b"tail dependency".to_vec(),
+            prior_frontier_root: installed.clone(),
+            post_frontier_root: installed.clone(),
+            affected_documents: Vec::new(),
+            affected_documents_bytes: Vec::new(),
+            causal_dependency_heads: vec![parent],
+            causal_dependency_heads_bytes: parent.to_vec(),
+            causal_peer_id: tail_peer,
+            causal_counter: 1,
+            acceptance_sequence: covered_count + 1,
+            retained_bytes: 20,
+        };
+        // The tail's clock is its parent's clock ({peer 1000: 1}) unioned with
+        // its own dot ({peer 900: 1}).
+        let mut clock_entries = vec![
+            (
+                AuthenticatedMapKey::from(tail_peer),
+                causal_clock_counter_digest(tail_peer, 1),
+            ),
+            (
+                AuthenticatedMapKey::from(id(1000)),
+                causal_clock_counter_digest(id(1000), 1),
+            ),
+        ];
+        clock_entries.sort_unstable_by_key(|entry| entry.0);
+        let (clock_key, clock_digest) = map_root(&clock_entries);
+        let clock_root = MapLink {
+            key: clock_key.unwrap(),
+            digest: clock_digest,
+        };
+        let record_digest = accepted_batch_causal_record_digest(&tail, &clock_root);
+        let mut post_entries = entries.clone();
+        post_entries.push((tail_id, record_digest));
+        post_entries.sort_unstable_by_key(|entry| entry.0);
+        let (post_key, post_digest) = batch_map_root(&post_entries);
+        let mut post = installed.clone();
+        post.acceptance_sequence = covered_count + 1;
+        post.batch_map_root_key = post_key;
+        post.batch_map_root_digest = post_digest;
+        post.canonical_bytes = format!("covered checkpoint frontier over {covered} + tail").into();
+        post.state_digest = ContentDigest::of(b"state after tail");
+        tail.post_frontier_root = post;
+
+        let request = PhysicalApplyRequest {
+            batch: tail,
+            materialization: None,
+            materialization_input_digest: None,
+            fault: ApplyFault::None,
+        };
+        (path, database, store, installed, request)
+    }
+
+    /// I-14: the cost of one anchored apply tracks the TREE, not the history.
+    ///
+    /// The claim the campaign rests on is not "O(log n)" as a hard fact -- treap
+    /// depth is expected-logarithmic under digest-derived priorities, with a
+    /// hard 256-node refusal ceiling (`MAX_AUTHENTICATED_MAP_DEPTH`). What must
+    /// be true is that a 256x larger covered history does not cost 256x more.
+    /// Reads, not row growth, are what is counted: a read-only walk of the whole
+    /// covered tree would leave the row delta untouched.
+    #[test]
+    fn an_anchored_apply_reads_the_path_not_the_covered_history() {
+        fn sealed_reads(covered: u128) -> (usize, usize) {
+            let (_path, mut database, store, installed, request) = anchored_candidate_over(covered);
+            let inner = SealedAcceptedIndexReader::new(&store);
+            let counting = CountingSealedReader::new(&inner);
+            database
+                .apply_checkpoint(&counting, &installed, &request)
+                .expect("a tail batch applies over covered history");
+            (counting.map_nodes.get(), counting.causal_records.get())
+        }
+
+        let (small_nodes, small_records) = sealed_reads(1);
+        let (large_nodes, large_records) = sealed_reads(256);
+        println!("sealed map-node reads: 1 covered => {small_nodes}, 256 covered => {large_nodes}");
+
+        // Causal-record reads track the dependency-head count, not the history
+        // size. Two per head, not one: the validation loop authenticates each
+        // head and `derive_causal_clock_root` then loads the same record again
+        // to union its clock. That is a constant factor on a one-element list,
+        // deliberately left alone rather than cached across the two phases.
+        assert_eq!(small_records, 2);
+        assert_eq!(large_records, 2);
+
+        // 256x the history. Measured: 3 reads over 1 covered batch, 18 over
+        // 256 -- two descents' worth of nodes, times a small constant. A walk
+        // would be at least 256. The ceiling is deliberately generous: this
+        // must fail on a walk, not on an extra probe.
+        assert!(
+            large_nodes <= 48,
+            "sealed map-node reads grew with history, not with depth: \
+             {small_nodes} over 1 batch, {large_nodes} over 256"
+        );
+        assert!(large_nodes > small_nodes, "the deeper tree must cost more");
+    }
+
+    /// A minimal checkpoint frontier root that passes
+    /// `validate_checkpoint_root_shape`, so a test can break exactly one field.
+    fn checkpoint_root_fixture() -> PhysicalCheckpointFrontierRoot {
+        let empty = authenticated_map_empty_digest();
+        PhysicalCheckpointFrontierRoot {
+            canonical_bytes: b"shape fixture".to_vec(),
+            acceptance_sequence: 0,
+            document_count: 0,
+            document_overlay_count: 0,
+            retained_bytes_total: 0,
+            document_map_root_key: None,
+            document_map_root_digest: empty,
+            batch_map_root_key: None,
+            batch_map_root_digest: empty,
+            batch_map_count: 0,
+            status_map_root_key: None,
+            status_map_root_digest: empty,
+            status_map_count: 0,
+            sequence_root_digest: None,
+            sequence_height: 0,
+            sequence_count: 0,
+            generation: PhysicalCheckpointGenerationBinding {
+                generation_id: id(2),
+                predecessor_generation_id: None,
+                full_anchor_generation_id: id(2),
+                covered_count: 0,
+                covered_document_count: 0,
+                covered_block_count: 0,
+                covered_retained_bytes_total: 0,
+                covered_semantic_capsules_root_digest: ContentDigest::of(b"capsules"),
+                covered_batch_root_key: None,
+                covered_batch_root_digest: empty,
+                covered_status_root_key: None,
+                covered_status_root_digest: empty,
+                covered_sequence_root_digest: None,
+                covered_sequence_height: 0,
+                covered_causal_tip_root_key: None,
+                covered_causal_tip_root_digest: ContentDigest::of(b"tip"),
+                covered_head_facts_root_digest: ContentDigest::of(b"heads"),
+                current_projection_payload_pins_root_digest: ContentDigest::of(b"payloads"),
+                nonlinear_state_root_digest: ContentDigest::of(b"nonlinear"),
+                retention_pins_root_digest: ContentDigest::of(b"retention"),
+            },
+            state_digest: ContentDigest::of(b"state"),
+        }
+    }
+
+    /// C5: the document overlay starts empty, so every overlay node a tail
+    /// apply writes is hot -- and the NEXT apply can descend into it.
+    ///
+    /// This is the half that cannot be argued from the anchor check alone.
+    /// `upsert_frontier_map` has no sealed seam: its descent loads
+    /// `frontier_documents` only, and a node that is not there is a hard
+    /// corruption error. The anchor requires `document_overlay_count == 0` at
+    /// the cutover, which makes the FIRST apply safe; this proves the second
+    /// one, which descends through what the first wrote.
+    #[test]
+    fn a_second_anchored_apply_descends_through_the_overlay_the_first_wrote() {
+        let (_path, mut database, store, installed, first, entries) =
+            anchored_candidate_with_covered_history();
+        let reader = SealedAcceptedIndexReader::new(&store);
+        database
+            .apply_checkpoint(&reader, &installed, &first)
+            .unwrap();
+
+        let document = PhysicalFrontierDocument {
+            document_key: key(41),
+            canonical_bytes: b"overlay written by the second apply".to_vec(),
+        };
+        let after_first = first.batch.post_frontier_root.clone();
+        let (second, second_entries) = anchored_tail(
+            &after_first,
+            &entries,
+            first.batch.batch_id,
+            std::slice::from_ref(&document),
+        );
+        let after_second = second.batch.post_frontier_root.clone();
+        database
+            .apply_checkpoint(&reader, &after_first, &second)
+            .expect("a tail batch may introduce the first overlay document");
+        assert!(after_second.document_map_root_key.is_some());
+
+        // The third apply REWRITES that document, so its descent must load the
+        // node the second apply wrote. A sealed link here would fault.
+        let updated = PhysicalFrontierDocument {
+            document_key: key(41),
+            canonical_bytes: b"overlay rewritten by the third apply".to_vec(),
+        };
+        let (third, _) = anchored_tail(
+            &after_second,
+            &second_entries,
+            second.batch.batch_id,
+            std::slice::from_ref(&updated),
+        );
+        let result = database
+            .apply_checkpoint(&reader, &after_second, &third)
+            .expect("the overlay node the previous apply wrote is hot and usable");
+        assert_eq!(result.disposition, ApplyDisposition::Applied);
+        assert_eq!(database.read_frontier().unwrap().applied_batch_count, 4);
+    }
+
+    /// C5, the shape half: an overlay that claims to be empty may not carry a
+    /// root, and one that carries a root may not claim to be empty. The anchor
+    /// requires `document_overlay_count == 0`; without this, that check could
+    /// be satisfied by a root the candidate cannot walk.
+    #[test]
+    fn a_checkpoint_root_may_not_disagree_with_itself_about_the_overlay() {
+        let (_path, _database, _store, _installed, _request, _entries) =
+            anchored_candidate_with_covered_history();
+        let mut root = checkpoint_root_fixture();
+        assert!(validate_checkpoint_root_shape(&root).is_ok());
+
+        root.document_map_root_key = Some(AuthenticatedMapKey::from(id(5)));
+        assert!(matches!(
+            validate_checkpoint_root_shape(&root),
+            Err(FrontierError::Corrupt(_))
+        ));
+
+        let mut root = checkpoint_root_fixture();
+        root.document_overlay_count = 1;
+        root.document_count = 1;
+        assert!(
+            matches!(
+                validate_checkpoint_root_shape(&root),
+                Err(FrontierError::Corrupt(_))
+            ),
+            "a nonempty overlay must name its root"
+        );
+    }
+
+    /// C8-4: the covered-clock check is one-sided, and demonstrably so.
+    ///
+    /// `materialize_covered_causal_clock` rebuilds the clock from the sealed
+    /// entry vector and compares it with the root the sealed record commits to.
+    /// Recomputing both from one vector would move both together under any
+    /// perturbation -- a check that cannot fail. Here the expected root is taken
+    /// from the UNPERTURBED record and only the entries are perturbed.
+    #[test]
+    fn a_perturbed_covered_clock_cannot_pass_its_canonical_root() {
+        let (_database, connection, _empty) = initialized();
+        let record = SealedAcceptedCausalRecordV2 {
+            batch_id: id(77),
+            manifest_fingerprint: ContentDigest::of(b"manifest"),
+            event_binding_digest: ContentDigest::of(b"event"),
+            causal_peer_id: id(901),
+            causal_counter: 4,
+            canonical_causal_clock: vec![
+                SealedAcceptedCausalClockEntryV2 {
+                    peer_id: id(901),
+                    counter: 4,
+                },
+                SealedAcceptedCausalClockEntryV2 {
+                    peer_id: id(902),
+                    counter: 9,
+                },
+                SealedAcceptedCausalClockEntryV2 {
+                    peer_id: id(903),
+                    counter: 2,
+                },
+            ],
+        };
+        let canonical = record.clock_root().unwrap().root;
+
+        // Honest input: the rebuild reproduces the canonical root.
+        materialize_covered_causal_clock(
+            &connection,
+            &record.batch_id,
+            &record.canonical_causal_clock,
+            canonical,
+        )
+        .expect("an honest covered clock rebuilds to its canonical root");
+
+        // One counter moved on the WRITE side only.
+        let mut perturbed = record.canonical_causal_clock.clone();
+        perturbed[1].counter += 1;
+        let error =
+            materialize_covered_causal_clock(&connection, &record.batch_id, &perturbed, canonical)
+                .expect_err("a perturbed counter must not pass the canonical root");
+        assert!(
+            matches!(&error, FrontierError::Corrupt(message)
+                if message.contains("differs from its canonical root")),
+            "unexpected refusal: {error:?}"
+        );
+
+        // A peer added on the write side only.
+        let mut extra = record.canonical_causal_clock.clone();
+        extra.push(SealedAcceptedCausalClockEntryV2 {
+            peer_id: id(904),
+            counter: 1,
+        });
+        assert!(matches!(
+            materialize_covered_causal_clock(&connection, &record.batch_id, &extra, canonical),
+            Err(FrontierError::Corrupt(_))
+        ));
+
+        // An empty clock is refused rather than silently rebuilding nothing.
+        assert!(matches!(
+            materialize_covered_causal_clock(&connection, &record.batch_id, &[], canonical),
+            Err(FrontierError::Corrupt(_))
+        ));
+    }
+
+    /// A covered re-delivery is refused BY NAME, not as an ordering fault.
+    ///
+    /// On a live database, re-offering an accepted batch is a `Duplicate`. On an
+    /// anchored one the exact `applied_batches` row `stored_matches_request`
+    /// compares is gone with the covered history, so storage cannot answer
+    /// "equal to what we accepted?" -- and the sequence check would otherwise
+    /// report `AcceptanceOrder`, which says "wrong next batch" about a batch we
+    /// already have. See `FrontierError::CoveredBatchRedelivery`.
+    #[test]
+    fn a_covered_redelivery_is_named_rather_than_reported_as_an_ordering_fault() {
+        let (_path, mut database, store, installed, request, _entries) =
+            anchored_candidate_with_covered_history();
+        let covered_batch_id = id(101);
+        let mut redelivery = request.clone();
+        redelivery.batch.batch_id = covered_batch_id;
+        redelivery.batch.acceptance_sequence = 1;
+        let reader = SealedAcceptedIndexReader::new(&store);
+
+        assert!(
+            matches!(
+                database.preflight_checkpoint(&reader, &installed, &redelivery),
+                Err(FrontierError::CoveredBatchRedelivery(id)) if id == covered_batch_id
+            ),
+            "preflight must name the covered re-delivery"
+        );
+        database.begin_candidate_build().unwrap();
+        assert!(
+            matches!(
+                database.apply_checkpoint_candidate(&reader, &installed, &redelivery),
+                Err(FrontierError::CoveredBatchRedelivery(id)) if id == covered_batch_id
+            ),
+            "apply must name the covered re-delivery"
+        );
+
+        // The neuter: the probe renames ONLY a batch the frontier really
+        // contains. An ordinary out-of-order batch is still an ordering fault.
+        let mut out_of_order = request.clone();
+        out_of_order.batch.acceptance_sequence = 7;
+        assert!(matches!(
+            database.apply_checkpoint_candidate(&reader, &installed, &out_of_order),
+            Err(FrontierError::AcceptanceOrder {
+                expected: 2,
+                found: 7
+            })
+        ));
+    }
+
+    /// C2: candidate variants alone are not enough. A promoted anchored
+    /// database still has sealed off-path links, so its ORDINARY live apply
+    /// needs the reader too.
+    #[test]
+    fn a_promoted_anchored_database_applies_a_tail_batch_through_ordinary_apply() {
+        let (_path, mut database, store, installed, request, _entries) =
+            anchored_candidate_with_covered_history();
+        let reader = SealedAcceptedIndexReader::new(&store);
+        assert!(
+            matches!(
+                database.apply(&installed, &request),
+                Err(FrontierError::Corrupt(_))
+            ),
+            "the necessity gate: ordinary apply without the reader must still fail"
+        );
+        let result = database
+            .apply_checkpoint(&reader, &installed, &request)
+            .expect("ordinary anchored apply resolves covered history");
+        assert_eq!(result.disposition, ApplyDisposition::Applied);
+        assert_eq!(database.read_frontier().unwrap().applied_batch_count, 2);
+    }
+
+    /// Relaxing the anchor to a floor must not relax it into nothing. Each
+    /// arm below is the neuter of one surviving refusal: damage the row it
+    /// guards and the open has to refuse, naming that arm.
+    #[test]
+    fn an_anchored_database_still_refuses_damage_below_and_beyond_its_floor() {
+        fn advanced_anchored_database() -> TestDatabase {
+            let (path, mut database, store, installed, request, _entries) =
+                anchored_candidate_with_covered_history();
+            database.begin_candidate_build().unwrap();
+            let reader = SealedAcceptedIndexReader::new(&store);
+            database
+                .apply_checkpoint_candidate(&reader, &installed, &request)
+                .unwrap();
+            database.finish_candidate_build().unwrap();
+            drop(database);
+            path
+        }
+
+        fn refusal(damage: &str) -> String {
+            let path = advanced_anchored_database();
+            {
+                let connection = Connection::open(&path.path).unwrap();
+                connection.execute_batch(damage).unwrap();
+            }
+            let reopened = PhysicalSqliteDatabase::open_writable(&path.path).unwrap();
+            match reopened.validate_schema_and_claim(claim()) {
+                Err(FrontierError::Corrupt(message)) => message,
+                other => panic!("damage `{damage}` opened anyway: {other:?}"),
+            }
+        }
+
+        // The frontier may not fall below the covered floor.
+        assert!(
+            refusal("UPDATE frontier SET applied_batch_count = 0 WHERE singleton = 1")
+                .contains("active frontier is behind its generation anchor"),
+        );
+        // Still at the floor, so it must still BE the anchored root.
+        assert!(refusal(
+            "UPDATE frontier SET applied_batch_count = 1, frontier_root = x'00' \
+                 WHERE singleton = 1"
+        )
+        .contains("unadvanced active frontier is misbound to its generation anchor"),);
+        // Projection rows for batches the frontier never accepted.
+        assert!(refusal(
+            "UPDATE materialization_stamp SET acceptance_sequence = 9 WHERE singleton = 1"
+        )
+        .contains("materialization stamp is ahead of the active checkpoint frontier"),);
+        // Projection rows missing from inside the sealed region.
+        assert!(refusal(
+            "UPDATE materialization_stamp SET acceptance_sequence = 0 WHERE singleton = 1"
+        )
+        .contains("materialization stamp is behind its generation anchor"),);
+        // Same sequence, different frontier: the stamp is bound to the wrong root.
+        assert!(refusal(
+            "UPDATE materialization_stamp SET acceptance_sequence = 2, \
+                 frontier_root_digest = x'\
+                 0000000000000000000000000000000000000000000000000000000000000000' \
+                 WHERE singleton = 1"
+        )
+        .contains("materialization stamp is misbound to the active checkpoint frontier"),);
+    }
+
+    /// The fix: with the reader injected, the same tail batch applies.
+    #[test]
+    fn an_anchored_candidate_applies_a_tail_batch_over_covered_history() {
+        let (_path, mut database, store, installed, request, _entries) =
+            anchored_candidate_with_covered_history();
+        database.begin_candidate_build().unwrap();
+        let reader = SealedAcceptedIndexReader::new(&store);
+        let result = database
+            .apply_checkpoint_candidate(&reader, &installed, &request)
+            .expect("a tail batch applies over covered history through the sealed reader");
+        assert_eq!(result.disposition, ApplyDisposition::Applied);
     }
 
     fn reference_target_name(source_page_id: [u8; 16]) -> String {
