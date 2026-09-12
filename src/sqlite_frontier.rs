@@ -3382,15 +3382,17 @@ fn validate_request_shape(request: &PhysicalApplyRequest) -> Result<(), Frontier
     Ok(())
 }
 
-/// The parts of an installed `checkpoint_generation_anchor` that apply and
-/// reopen validation need. Reading it is one row; an ordinary live database has
-/// no such row and gets `None`.
+/// The part of an installed `checkpoint_generation_anchor` that the apply path
+/// needs: the root of the SEALED covered batch map, which is what separates a
+/// covered re-delivery from a lost hot row. Reading it is one row; an ordinary
+/// live database has no such row and gets `None`.
+///
+/// Reopen validation reads the anchor row itself -- it needs every column, and
+/// it needs them as stored bytes rather than as a decoded link -- so it does
+/// not go through here. Deliberately only one field: an unused field on this
+/// struct would be a second, silently divergent reading of the same row.
 struct CheckpointAnchorFacts {
-    covered_count: u64,
     covered_batch_root: Option<MapLink>,
-    checkpoint_frontier_root: Vec<u8>,
-    checkpoint_frontier_root_digest: ContentDigest,
-    materialization_frontier_root_digest: ContentDigest,
 }
 
 fn load_checkpoint_anchor_facts(
@@ -3398,25 +3400,13 @@ fn load_checkpoint_anchor_facts(
 ) -> Result<Option<CheckpointAnchorFacts>, FrontierError> {
     let row = connection
         .query_row(
-            "SELECT covered_count, covered_batch_root_key, covered_batch_root_digest,
-                    checkpoint_frontier_root, checkpoint_frontier_root_digest,
-                    materialization_frontier_root_digest
+            "SELECT covered_batch_root_key, covered_batch_root_digest
              FROM checkpoint_generation_anchor WHERE singleton = 1",
             [],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Option<Vec<u8>>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, Vec<u8>>(3)?,
-                    row.get::<_, Vec<u8>>(4)?,
-                    row.get::<_, Vec<u8>>(5)?,
-                ))
-            },
+            |row| Ok((row.get::<_, Option<Vec<u8>>>(0)?, row.get::<_, Vec<u8>>(1)?)),
         )
         .optional()?;
-    let Some((count, root_key, root_digest, frontier, frontier_digest, materialization)) = row
-    else {
+    let Some((root_key, root_digest)) = row else {
         return Ok(None);
     };
     let covered_batch_root_digest = decode_digest(&root_digest)?;
@@ -3427,14 +3417,7 @@ fn load_checkpoint_anchor_facts(
         }),
         None => None,
     };
-    Ok(Some(CheckpointAnchorFacts {
-        covered_count: u64::try_from(count)
-            .map_err(|_| FrontierError::Corrupt("covered count is invalid".into()))?,
-        covered_batch_root,
-        checkpoint_frontier_root: frontier,
-        checkpoint_frontier_root_digest: decode_digest(&frontier_digest)?,
-        materialization_frontier_root_digest: decode_digest(&materialization)?,
-    }))
+    Ok(Some(CheckpointAnchorFacts { covered_batch_root }))
 }
 
 /// Is `batch_id` in the SEALED covered map -- as opposed to merely in the active
@@ -4105,6 +4088,23 @@ mod tests {
                 .unwrap();
             connection
         }
+    }
+
+    /// Open a fresh connection on an EXISTING test database path, with the same
+    /// pragmas `TestDatabase::create` uses. Reopening is the only way to prove
+    /// that a rolled-back or advanced anchored database still passes the
+    /// validation a real process runs at open.
+    fn reopen_connection(database: &TestDatabase) -> Connection {
+        let connection = Connection::open(&database.path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA synchronous = FULL;
+                 PRAGMA foreign_keys = ON;
+                 PRAGMA trusted_schema = OFF;",
+            )
+            .unwrap();
+        connection
     }
 
     impl Drop for TestDatabase {
@@ -4934,6 +4934,106 @@ mod tests {
         );
     }
 
+    /// F6-1: the fail-before proves the DEPENDENCY walk, by fixture.
+    ///
+    /// The message is the same from both covered-read sites, so the assertion
+    /// text cannot distinguish them: remove dependency validation and insertion
+    /// would fail identically, leaving the test green while proving nothing
+    /// about the site it names. Strip the covered dependency head instead. The
+    /// apply still fails -- later, inside `upsert_batch_map` -- which is what
+    /// shows the first failure in the ordinary fixture was the earlier site.
+    #[test]
+    fn a_tail_with_no_covered_dependency_still_fails_but_at_the_later_site() {
+        let (_path, mut database, _store, installed, request, _entries) =
+            anchored_candidate_with_covered_history();
+        let mut undepended = request.clone();
+        undepended.batch.causal_dependency_heads = Vec::new();
+        undepended.batch.causal_dependency_heads_bytes = Vec::new();
+        undepended.batch.causal_counter = 1;
+        database.begin_candidate_build().unwrap();
+        let error = database
+            .apply_candidate(&installed, &undepended)
+            .expect_err("insertion must still meet the covered node");
+        assert!(
+            matches!(&error, FrontierError::Corrupt(detail)
+                if detail.contains("accepted-batch node") && detail.contains("missing")),
+            "expected the insertion descent to fail, got {error:?}"
+        );
+    }
+
+    /// F6-3 (and design §3.1a): on WHOLLY HOT history the checkpoint entry
+    /// points must be the live ones.
+    ///
+    /// The additive `_checkpoint` variants exist so the live path keeps its
+    /// exact behaviour, and the reader is consulted only where a node is
+    /// genuinely absent. Nothing asserted either half. Here the same history is
+    /// applied through `apply` and through `apply_checkpoint`, and the counting
+    /// reader proves the second one never touched the sealed index at all.
+    #[test]
+    fn checkpoint_apply_equals_live_apply_on_wholly_hot_history() {
+        struct RefusingReader;
+        impl SealedAcceptedIndexRead for RefusingReader {
+            fn sealed_map_node(
+                &self,
+                _link: AuthenticatedMapLinkV1,
+            ) -> Result<SealedAuthenticatedMapNodeV2, SealedAcceptedIndexError> {
+                panic!("hot history must not consult the sealed index");
+            }
+            fn sealed_causal_record(
+                &self,
+                _batch_id: [u8; 16],
+                _address: ContentDigest,
+            ) -> Result<SealedAcceptedCausalRecordV2, SealedAcceptedIndexError> {
+                panic!("hot history must not consult the sealed index");
+            }
+        }
+
+        fn apply_three(checkpoint: bool) -> (PhysicalFrontierRoot, Vec<StoredBatch>) {
+            let (_database, mut connection, empty) = initialized();
+            let refusing = RefusingReader;
+            let counting = CountingSealedReader::new(&refusing);
+            let mut root = empty;
+            let mut entries: Vec<([u8; 16], ContentDigest)> = Vec::new();
+            let mut parent = None;
+            for sequence in 1..=3u64 {
+                let document = PhysicalFrontierDocument {
+                    document_key: key(200),
+                    canonical_bytes: format!("document {sequence}").into_bytes(),
+                };
+                let (request, next) =
+                    request(&root, sequence, parent, vec![document], &entries, true);
+                if checkpoint {
+                    apply_checkpoint(&mut connection, &counting, &root, &request).unwrap();
+                } else {
+                    apply(&mut connection, &root, &request).unwrap();
+                }
+                parent = Some(request.batch.batch_id);
+                root = request.batch.post_frontier_root.clone();
+                entries = next;
+            }
+            if checkpoint {
+                assert_eq!(counting.map_nodes.get(), 0);
+                assert_eq!(counting.causal_records.get(), 0);
+            }
+            let stored = read_frontier(&connection).unwrap();
+            let mut batches = load_all_batches(&connection).unwrap();
+            batches.sort_by_key(|batch| batch.sequence);
+            (
+                PhysicalFrontierRoot {
+                    canonical_bytes: stored.canonical_bytes,
+                    acceptance_sequence: stored.applied_batch_count,
+                    ..root
+                },
+                batches,
+            )
+        }
+
+        let (live_root, live_batches) = apply_three(false);
+        let (checkpoint_root, checkpoint_batches) = apply_three(true);
+        assert_eq!(live_root, checkpoint_root);
+        assert_eq!(live_batches, checkpoint_batches);
+    }
+
     /// An anchored database that accepted a tail batch can still be REOPENED.
     ///
     /// The anchor validator used to require the active frontier to equal the
@@ -4963,6 +5063,104 @@ mod tests {
             .expect("an anchored database that accepted a tail batch must still open");
         // It really did advance -- otherwise this would pass vacuously.
         assert_eq!(reopened.read_frontier().unwrap().applied_batch_count, 2);
+    }
+
+    /// §5 obligation 6, on the anchored path: an apply that fails between the
+    /// event insert and the commit must leave NOTHING behind, the database must
+    /// still open, and the same batch must then apply as ordinary new work.
+    ///
+    /// The ordinary-path rollback tests cannot stand in for this one. An
+    /// anchored database carries a generation anchor, and every reopen runs the
+    /// anchor validator; a partial anchored apply is therefore the one crash
+    /// shape that can strand a candidate at a state its own validator rejects.
+    /// It is also the shape a retry has to survive twice: once as rollback, and
+    /// once as the retried batch arriving at a frontier that never moved.
+    #[test]
+    fn an_anchored_apply_rolls_back_reopens_and_retries_after_a_failure() {
+        let (path, database, store, installed, request, _entries) =
+            anchored_candidate_with_covered_history();
+        drop(database);
+        let reader = SealedAcceptedIndexReader::new(&store);
+
+        let mut faulted = request.clone();
+        faulted.fault = ApplyFault::ReturnAfterInsert;
+        {
+            let mut connection = reopen_connection(&path);
+            assert_eq!(
+                apply_checkpoint(&mut connection, &reader, &installed, &faulted),
+                Err(FrontierError::InjectedFailure)
+            );
+            // The fault fires AFTER the event insert, so a missing rollback would
+            // be visible as a row here.
+            assert_eq!(read_frontier(&connection).unwrap().applied_batch_count, 1);
+            assert!(load_all_batches(&connection).unwrap().is_empty());
+        }
+
+        PhysicalSqliteDatabase::open_writable(&path.path)
+            .unwrap()
+            .validate_schema_and_claim(claim())
+            .expect("a rolled-back anchored apply must leave an openable database");
+
+        {
+            let mut connection = reopen_connection(&path);
+            let result = apply_checkpoint(&mut connection, &reader, &installed, &request)
+                .expect("the retried batch is ordinary new work, not a duplicate");
+            assert_eq!(result.disposition, ApplyDisposition::Applied);
+            assert_eq!(read_frontier(&connection).unwrap().applied_batch_count, 2);
+        }
+
+        PhysicalSqliteDatabase::open_writable(&path.path)
+            .unwrap()
+            .validate_schema_and_claim(claim())
+            .expect("the retried anchored database must still open");
+    }
+
+    /// Every other anchored fixture applies an UNMATERIALIZED tail, which leaves
+    /// the materialization stamp at the anchored floor. This one advances it.
+    ///
+    /// That matters because the stamp half of the anchor validator has three
+    /// arms -- stamp at the frontier, stamp at the floor, stamp between them --
+    /// and an anchored candidate that never materializes only ever exercises the
+    /// floor arm. A materialized tail lands on the first arm, where the expected
+    /// digest is the ACTIVE frontier's rather than the anchor's.
+    #[test]
+    fn an_anchored_materialized_tail_advances_the_stamp_and_still_reopens() {
+        let (path, mut database, store, installed, request, _entries) =
+            anchored_candidate_with_covered_history();
+        let mut materialized = request.clone();
+        materialized.materialization = Some(materialization(request.batch.batch_id));
+        materialized.materialization_input_digest = Some(ContentDigest::of(b"anchored tail input"));
+
+        database.begin_candidate_build().unwrap();
+        let reader = SealedAcceptedIndexReader::new(&store);
+        database
+            .apply_checkpoint_candidate(&reader, &installed, &materialized)
+            .unwrap();
+        database.finish_candidate_build().unwrap();
+        drop(database);
+
+        {
+            let connection = reopen_connection(&path);
+            let (sequence, digest): (i64, Vec<u8>) = connection
+                .query_row(
+                    "SELECT acceptance_sequence, frontier_root_digest
+                     FROM materialization_stamp WHERE singleton = 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            // Otherwise the reopen below would pass on the floor arm again.
+            assert_eq!(sequence, 2);
+            assert_eq!(
+                digest.as_slice(),
+                request.batch.post_frontier_root.digest().as_bytes()
+            );
+        }
+
+        PhysicalSqliteDatabase::open_writable(&path.path)
+            .unwrap()
+            .validate_schema_and_claim(claim())
+            .expect("an anchored database with a materialized tail must still open");
     }
 
     /// Counts what an anchored apply actually asks the sealed index for.
