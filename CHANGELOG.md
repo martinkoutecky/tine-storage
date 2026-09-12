@@ -5,6 +5,58 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.21.0] - 2026-09-12
+
+### Added
+
+- A tail batch can now be applied to an anchored checkpoint candidate whose
+  covered history has left SQLite and survives only as sealed accepted-index
+  objects. `PhysicalSqliteDatabase::apply_checkpoint`, `preflight_checkpoint`,
+  `apply_checkpoint_candidate` and `apply_checkpoint_terminal_prefix_candidate`
+  take a `SealedAcceptedIndexRead` and resolve accepted-batch, causal-clock and
+  membership questions across the hot/cold boundary. The reader is threaded
+  through as an `Option` that is `None` on every existing path, so live
+  behaviour is unchanged.
+
+- `FrontierError::CoveredBatchRedelivery` names the one question this layer
+  cannot answer: whether a re-delivered batch whose covered record has been
+  sealed is equivalent to what was accepted. The sealed record carries the batch
+  id, manifest fingerprint, event-binding digest, causal dot and canonical
+  clock, and not the `semantic_effect` the hot duplicate check compares, so the
+  layer refuses by name rather than guessing an equivalence. Deciding what a
+  caller should do with that refusal is deliberately left to the caller.
+
+### Changed
+
+- The checkpoint generation anchor and the materialization stamp are **floors,
+  rather than frozen equalities**. An anchored database that has accepted a tail
+  batch now reopens; previously the reopen validation required the anchor to
+  still equal the active frontier, which made the first accepted tail a one-way
+  door.
+
+- Reopen validation of an anchored database is stronger and bounded. The
+  retained tail must chain from the anchor to the active frontier, the active
+  frontier row must hash its own bytes, a lagging materialization stamp must
+  bind to the frontier at its own sequence, and the anchor's covered batch root
+  must agree in shape with its covered count. The tail check reads an indexed
+  count at or below the floor plus a range query limited to one more row than
+  the tail should hold, so its cost tracks the tail rather than whatever rows a
+  damaged database happens to contain.
+
+- Re-inserting a batch id the authenticated accepted map already holds is
+  refused instead of replacing the stored value, and an id present in that map
+  with no exact `applied_batches` record is refused whether or not a sealed
+  reader and anchor are available to classify why.
+
+- Materializing a covered causal clock always walks the whole clock. A reuse
+  shortcut that returned early when the clock's root row was present was
+  removed: content addressing authenticates a node's child links, not the
+  existence of the child rows, so a missing descendant was invisible to it. The
+  full pass uses `INSERT OR IGNORE` and repairs a clock that has lost a node.
+  The cost is O(peers x log peers) per covered dependency head and is paid on
+  every apply rather than once per clock; peers are devices, so the term grows
+  with neither the graph nor its history.
+
 ## [0.20.0] - 2026-09-08
 
 ### Added
