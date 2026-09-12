@@ -2327,6 +2327,41 @@ const TERMINAL_CONSTRUCTION_EMPTY_TABLES: [&str; 20] = [
 /// Refuse terminal construction unless every materialized table is still empty
 /// and the stamp has never advanced. A partially materialized candidate must
 /// take the ordinary replay path instead.
+/// The covered count of this candidate's checkpoint-generation anchor, or `None`
+/// when the candidate carries no anchor row.
+///
+/// Read from SQLite rather than taken as a parameter deliberately: the anchor row
+/// and the materialization stamp are installed in the same transaction by
+/// `sqlite_frontier::initialize_checkpoint_candidate_schema`, which has already
+/// proven `root.acceptance_sequence == generation.covered_count` through
+/// `validate_checkpoint_anchor_input`. A caller-supplied expectation could be
+/// wrong in exactly the case the check exists to catch, and this one cannot be
+/// talked out of its answer from outside the database.
+///
+/// The table is absent when materialization tables are created on their own,
+/// without the frontier schema, so absence is a legitimate answer and not an error.
+fn anchored_covered_count(transaction: &Connection) -> Result<Option<i64>, MaterializationError> {
+    let anchor_table_exists: bool = transaction.query_row(
+        "SELECT EXISTS (
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'checkpoint_generation_anchor'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !anchor_table_exists {
+        return Ok(None);
+    }
+    transaction
+        .query_row(
+            "SELECT covered_count FROM checkpoint_generation_anchor WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(MaterializationError::from)
+}
+
 pub(crate) fn begin_terminal_construction_in_open_candidate(
     transaction: &Connection,
 ) -> Result<(), MaterializationError> {
@@ -2347,10 +2382,43 @@ pub(crate) fn begin_terminal_construction_in_open_candidate(
         [],
         |row| row.get(0),
     )?;
-    if stamp_sequence != 0 {
-        return Err(MaterializationError::Contradiction(
-            "terminal construction requires an unstamped candidate".into(),
-        ));
+    // What a nonzero stamp MEANS on an already-proven-empty candidate depends on
+    // whether the candidate is anchored, so this cannot be an exact-zero test.
+    //
+    // Unanchored, a nonzero stamp is a claim to have materialized up to some
+    // sequence with no rows to show for it -- refuse. Anchored, the stamp is
+    // installed by `initialize_checkpoint_candidate_schema` from the generation's
+    // accepted cutoff C before any image row exists, so a stamp of exactly C is
+    // the NORMAL state at the start of construction; only disagreement with the
+    // anchor is evidence of damage.
+    //
+    // Refusing every nonzero stamp made the anchored candidate unconstructible:
+    // the initializer stamps C, this entry demanded 0, and the only other route
+    // (skip `begin`) collides in `finish`, which recreates the deferred indexes
+    // `begin` drops. That is a one-way door of the same shape as the two reopen
+    // equalities that became floors in 0.21.0 -- an exact equality outliving the
+    // moment its value could only be one thing.
+    //
+    // In-scope scenarios for both refusals (I-8): a crash or power loss between
+    // stamping and materializing, a torn or truncated write, and a disk error
+    // that leaves the stamp disagreeing with the anchor. Emptiness itself is
+    // already proven by the table scan above; this is only about the claim.
+    match anchored_covered_count(transaction)? {
+        None => {
+            if stamp_sequence != 0 {
+                return Err(MaterializationError::Contradiction(
+                    "terminal construction requires an unstamped candidate".into(),
+                ));
+            }
+        }
+        Some(covered_count) => {
+            if stamp_sequence != covered_count {
+                return Err(MaterializationError::Contradiction(format!(
+                    "terminal construction stamp {stamp_sequence} disagrees with its \
+                     checkpoint anchor covered count {covered_count}"
+                )));
+            }
+        }
     }
     transaction.execute(
         "UPDATE search_fts_build

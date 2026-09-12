@@ -59,6 +59,34 @@ than invented here so the application contract can pin and test its grammar.
 | `PackageStoreError::TransientNameCollision` | An honest concurrent Tine process claimed the caller-supplied `.install-*` or `.retired-*` name after recovery | Retry with a fresh transient name; this refusal is retryable and never permits replacement. |
 | `PackageStoreError::ImmutableVersionCollision` | Honest concurrent publishers supplied different bytes for one immutable package identity | Refuse the second publication and preserve the first complete winner. |
 
+### Terminal construction refusal scenarios
+
+Terminal construction populates a candidate's graph projection from checkpoint
+images. It begins only on a candidate whose materialized tables are still empty
+**and** whose materialization stamp is justified.
+
+| Boundary outcome | In-scope scenario | Contract |
+| --- | --- | --- |
+| `Contradiction("terminal construction requires an empty candidate but <table> has N rows")` | A crash, power loss, or retried construction left rows from a previous attempt | Refuse; the candidate is rebuilt rather than appended to. Emptiness is the precondition, checked per table. |
+| `Contradiction("terminal construction requires an unstamped candidate")` | An **unanchored** candidate carries a nonzero stamp: a claim to have materialized up to some sequence with no rows to show for it, from a crash between stamping and materializing, a torn write, or a disk error | Refuse. Nothing justifies the stamp. |
+| `Contradiction("terminal construction stamp S disagrees with its checkpoint anchor covered count C")` | An **anchored** candidate's stamp does not match the generation cutoff its validated anchor records — same in-scope causes as above | Refuse by name. Agreement with the anchor is the justification; disagreement is damage. |
+
+An anchored candidate stamped at exactly its anchor's covered count is the
+**normal** state at the start of construction, not a refusal:
+`initialize_checkpoint_candidate_schema` installs that stamp, in the same
+transaction as the anchor row, before any image row exists. It is admissible
+because `validate_checkpoint_anchor_input` has already proven
+`root.acceptance_sequence == generation.covered_count` at installation, so the
+value the check compares against was validated rather than asserted by a caller.
+
+Through 0.21.0 this entry refused every nonzero stamp, which made an anchored
+candidate unconstructible: `begin` refused the stamp the initializer had just
+installed, and the only other route -- skipping `begin` -- collides in `finish`,
+which recreates the deferred indexes `begin` drops. That is the same defect shape as the two
+reopen equalities 0.21.0 turned into floors -- an exact equality outliving the
+moment its value could only be one thing -- in a third location that sweep did
+not reach, because it scoped to the apply path and this is the construction path.
+
 ## Persistent-format identity
 
 `tine_storage::formats` collects every constant that describes bytes already on

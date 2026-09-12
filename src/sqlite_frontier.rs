@@ -7256,6 +7256,120 @@ mod tests {
         );
     }
 
+    /// The pass-after for the 0.22.0 construction fix. An anchored candidate is
+    /// stamped at its accepted cutoff C by `initialize_checkpoint_candidate_schema`
+    /// BEFORE any image row exists, so if terminal construction demands a zero
+    /// stamp the anchored candidate can never be populated at all: `begin` refuses,
+    /// and skipping `begin` makes `finish` collide recreating the indexes `begin`
+    /// drops. Before the fix this test fails at the `begin` call with
+    /// `Contradiction("terminal construction requires an unstamped candidate")`.
+    #[test]
+    fn an_anchored_candidate_can_begin_and_finish_terminal_construction() {
+        let (_database, mut physical, _store, installed, _request, _covered) =
+            anchored_candidate_with_covered_history();
+        // The premise, twice over: the cutoff is NONZERO, and covered history is
+        // absent as rows. If either stops holding this proves nothing.
+        assert_eq!(
+            installed.acceptance_sequence, 1,
+            "the fixture must be anchored at a nonzero cutoff"
+        );
+        assert!(physical.load_all_batches().unwrap().is_empty());
+
+        physical.begin_candidate_build().unwrap();
+        physical.begin_terminal_bootstrap_construction().unwrap();
+        physical
+            .finish_terminal_graph_projection_construction(
+                &[],
+                sqlite_materialization::PhysicalTerminalProjectionStamp {
+                    acceptance_sequence: installed.acceptance_sequence,
+                    frontier_root_digest: installed.digest(),
+                },
+            )
+            .unwrap();
+        physical.finish_candidate_build().unwrap();
+
+        // And the construction is readable at the anchor, not at zero.
+        assert_eq!(
+            physical
+                .materialized_read(installed.acceptance_sequence, installed.digest())
+                .unwrap()
+                .acceptance_sequence(),
+            installed.acceptance_sequence
+        );
+    }
+
+    /// Guard, not decoration. The fix admits a stamp that AGREES with the anchor;
+    /// it must not admit any nonzero stamp. Deleting the stamp check outright --
+    /// the obvious "simplification", since the table scan above already proves
+    /// emptiness -- passes the test above and fails this one.
+    #[test]
+    fn an_unanchored_candidate_still_refuses_a_stamped_construction() {
+        let (database, physical, _empty) = initialized_facade();
+        drop(physical);
+        let connection = reopen_connection(&database);
+        connection
+            .execute(
+                "UPDATE materialization_stamp SET acceptance_sequence = 7 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        // The premise: no anchor row, so nothing justifies that stamp.
+        let anchored: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM checkpoint_generation_anchor",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(anchored, 0, "this candidate must be unanchored");
+        drop(connection);
+
+        let mut physical = PhysicalSqliteDatabase::open_writable(&database.path).unwrap();
+        physical.begin_candidate_build().unwrap();
+        let error = physical
+            .begin_terminal_bootstrap_construction()
+            .unwrap_err();
+        assert!(
+            format!("{error}").contains("requires an unstamped candidate"),
+            "an unanchored stamped candidate must still be refused, got {error:?}"
+        );
+    }
+
+    /// The other half: an anchored candidate whose stamp does NOT match its
+    /// anchor is damage (crash between stamping and materializing, torn write,
+    /// disk error) and is refused by name.
+    #[test]
+    fn an_anchored_candidate_refuses_a_stamp_that_disagrees_with_its_anchor() {
+        let (database, physical, _store, _installed, _request, _covered) =
+            anchored_candidate_with_covered_history();
+        drop(physical);
+        let connection = reopen_connection(&database);
+        let covered: i64 = connection
+            .query_row(
+                "SELECT covered_count FROM checkpoint_generation_anchor WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE materialization_stamp SET acceptance_sequence = ?1 WHERE singleton = 1",
+                [covered + 41],
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut physical = PhysicalSqliteDatabase::open_writable(&database.path).unwrap();
+        physical.begin_candidate_build().unwrap();
+        let error = physical
+            .begin_terminal_bootstrap_construction()
+            .unwrap_err();
+        assert!(
+            format!("{error}").contains("disagrees with its checkpoint anchor covered count"),
+            "a stamp disagreeing with the anchor must be refused by name, got {error:?}"
+        );
+    }
+
     #[test]
     fn sequence_zero_genesis_seeds_overlay_without_fabricated_batches() {
         let mut genesis = root(0, &[], &[]);

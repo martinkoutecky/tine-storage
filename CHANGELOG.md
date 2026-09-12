@@ -5,6 +5,38 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.22.0] - 2026-09-12
+
+### Fixed
+
+- An anchored checkpoint candidate can now be populated at all. Terminal graph
+  projection construction refused **every** nonzero materialization stamp, while
+  `initialize_checkpoint_candidate_schema` stamps the generation's accepted
+  cutoff C in the same transaction as the anchor row, before any image row
+  exists. So `begin_terminal_bootstrap_construction` refused the stamp the
+  initializer had just installed, and the only other route -- skipping `begin` --
+  collides inside `finish`, which recreates the deferred indexes `begin` drops
+  (`index pages_name_idx already exists`). The anchored candidate was
+  unconstructible through both doors.
+
+  The stamp check is now an **agreement** check rather than an exact zero: an
+  unanchored candidate must still be unstamped, and an anchored candidate's stamp
+  must equal the covered count its validated anchor records. Both remain
+  refusals, and both name their in-scope scenarios in the README refusal table --
+  a crash between stamping and materializing, a torn write, a disk error. The
+  comparison value is read from the database rather than supplied by the caller,
+  because `validate_checkpoint_anchor_input` has already proven
+  `root.acceptance_sequence == generation.covered_count` at installation; a
+  caller-supplied expectation could be wrong in exactly the case being checked.
+
+  No schema, DDL or persistent-format change: `FORMAT_MANIFEST` is unchanged.
+
+  This is the same defect shape as the two reopen equalities 0.22.0's predecessor
+  turned into floors -- an exact equality outliving the moment its value could
+  only be one thing. It survived four adversarial passes on 0.21.0 because all
+  four scoped to the apply path, and this is the construction path. Found by a
+  real-database probe from the Tine side, not by reading a diff.
+
 ## [0.21.0] - 2026-09-12
 
 ### Added
