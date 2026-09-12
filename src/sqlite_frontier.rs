@@ -4039,6 +4039,180 @@ mod tests {
         ));
     }
 
+    /// FAIL-BEFORE for the anchored-apply release: a tail batch cannot be
+    /// applied over covered history.
+    ///
+    /// This is the blocker that stops Tine's rebaselining P4c cutover. After a
+    /// generation cutover the covered history leaves SQLite and survives only as
+    /// sealed accepted-index objects. `initialize_checkpoint_candidate_schema`
+    /// creates EMPTY `accepted_batch_nodes`/`causal_clock_nodes`/`applied_batches`,
+    /// while `validate_checkpoint_anchor_input` REQUIRES the installed frontier
+    /// root to name the covered batch-map root -- so the first tail apply walks
+    /// from a root whose nodes are not rows, by construction.
+    ///
+    /// The read family already handles this through an injected sealed reader
+    /// (see `checkpoint_covered_reads_use_the_injected_sealed_reader_without_sql_history_rows`,
+    /// which proves the covered reads work with zero SQL history rows). `apply`
+    /// never got that treatment: it takes a bare `PhysicalFrontierRoot` and no
+    /// reader, so it has no way to resolve a covered node.
+    ///
+    /// When the anchored-apply work lands, this test must be REPLACED by its
+    /// positive counterpart, not deleted: the same fixture applying the same
+    /// tail batch successfully, with the resulting batch-map root asserted equal
+    /// to a from-empty hot replay of the whole history.
+    #[test]
+    fn a_tail_batch_cannot_be_applied_over_covered_history_today() {
+        let covered_batch_id = id(101);
+        let peer_id = id(900);
+        let causal = SealedAcceptedCausalRecordV2 {
+            batch_id: covered_batch_id,
+            manifest_fingerprint: ContentDigest::of(b"manifest"),
+            event_binding_digest: ContentDigest::of(b"event"),
+            causal_peer_id: peer_id,
+            causal_counter: 1,
+            canonical_causal_clock: vec![SealedAcceptedCausalClockEntryV2 {
+                peer_id,
+                counter: 1,
+            }],
+        };
+        let mut store = TestSealedStore::default();
+        let mut writer = SealedAcceptedIndexWriter::new(&mut store);
+        let causal_address = writer.publish_causal(&causal).unwrap();
+        let batch_root = writer
+            .upsert_map(
+                AuthenticatedMapRootV1::empty(),
+                covered_batch_id,
+                causal_address,
+            )
+            .unwrap();
+        drop(writer);
+
+        let covered_root_key = batch_root
+            .root
+            .map(|link| key_as_id(link.key, "test batch ID").unwrap());
+        let empty = authenticated_map_empty_digest();
+        let generation = PhysicalCheckpointGenerationBinding {
+            generation_id: id(2),
+            predecessor_generation_id: Some(id(1)),
+            full_anchor_generation_id: id(2),
+            covered_count: 1,
+            covered_document_count: 0,
+            covered_block_count: 0,
+            covered_retained_bytes_total: 10,
+            covered_semantic_capsules_root_digest: ContentDigest::of(b"capsules"),
+            covered_batch_root_key: covered_root_key,
+            covered_batch_root_digest: batch_root.root_digest(),
+            covered_status_root_key: covered_root_key,
+            covered_status_root_digest: batch_root.root_digest(),
+            covered_sequence_root_digest: Some(ContentDigest::of(b"sequence")),
+            covered_sequence_height: 0,
+            covered_causal_tip_root_key: Some(peer_id),
+            covered_causal_tip_root_digest: ContentDigest::of(b"tip"),
+            covered_head_facts_root_digest: ContentDigest::of(b"heads"),
+            current_projection_payload_pins_root_digest: ContentDigest::of(b"payloads"),
+            nonlinear_state_root_digest: ContentDigest::of(b"nonlinear"),
+            retention_pins_root_digest: ContentDigest::of(b"retention"),
+        };
+        let canonical_bytes = b"covered checkpoint frontier".to_vec();
+        let checkpoint_root = PhysicalCheckpointFrontierRoot {
+            canonical_bytes: canonical_bytes.clone(),
+            acceptance_sequence: 1,
+            document_count: 0,
+            document_overlay_count: 0,
+            retained_bytes_total: 10,
+            document_map_root_key: None,
+            document_map_root_digest: empty,
+            batch_map_root_key: covered_root_key,
+            batch_map_root_digest: batch_root.root_digest(),
+            batch_map_count: 1,
+            status_map_root_key: covered_root_key,
+            status_map_root_digest: batch_root.root_digest(),
+            status_map_count: 1,
+            sequence_root_digest: Some(ContentDigest::of(b"sequence")),
+            sequence_height: 0,
+            sequence_count: 1,
+            generation: generation.clone(),
+            state_digest: ContentDigest::of(b"state"),
+        };
+        let anchor = PhysicalCheckpointGenerationAnchor {
+            generation,
+            checkpoint_frontier_root: canonical_bytes.clone(),
+            terminal_batch_id: Some(covered_batch_id),
+            terminal_evidence_digest: Some(ContentDigest::of(b"evidence")),
+            materialization_frontier_root_digest: checkpoint_root.digest(),
+        };
+
+        let path = TestDatabase::new();
+        let mut database = PhysicalSqliteDatabase::open_writable(&path.path).unwrap();
+        database
+            .initialize_checkpoint_candidate_schema(
+                claim(),
+                &checkpoint_root,
+                &anchor,
+                test_parse_config_hash(),
+            )
+            .unwrap();
+        // The premise: covered history is present as sealed objects and absent
+        // as rows. If this ever stops holding, the test below stops meaning
+        // anything.
+        assert!(database.load_all_batches().unwrap().is_empty());
+
+        // The installed live root, as apply sees it: it names the COVERED batch
+        // map root, because the anchor validation requires exactly that.
+        let installed = PhysicalFrontierRoot {
+            canonical_bytes,
+            acceptance_sequence: 1,
+            document_count: 0,
+            document_map_root_key: None,
+            document_map_root_digest: empty,
+            batch_map_root_key: covered_root_key,
+            batch_map_root_digest: batch_root.root_digest(),
+            state_digest: ContentDigest::of(b"state"),
+        };
+
+        // One ordinary tail batch, causally descending from the covered one.
+        let tail_id = id(102);
+        let tail = PhysicalAcceptedBatch {
+            batch_id: tail_id,
+            manifest_digest: ContentDigest::of(b"tail manifest"),
+            event_binding_digest: ContentDigest::of(b"tail event"),
+            semantic_effect: b"tail effect".to_vec(),
+            semantic_effect_digest: ContentDigest::of(b"tail effect"),
+            dependency_frontier: b"tail dependency".to_vec(),
+            prior_frontier_root: installed.clone(),
+            post_frontier_root: installed.clone(),
+            affected_documents: Vec::new(),
+            affected_documents_bytes: Vec::new(),
+            causal_dependency_heads: vec![covered_batch_id],
+            causal_dependency_heads_bytes: covered_batch_id.to_vec(),
+            causal_peer_id: peer_id,
+            causal_counter: 2,
+            acceptance_sequence: 2,
+            retained_bytes: 20,
+        };
+        let request = PhysicalApplyRequest {
+            batch: tail,
+            materialization: None,
+            materialization_input_digest: None,
+            fault: ApplyFault::None,
+        };
+
+        database.begin_candidate_build().unwrap();
+        let error = database
+            .apply_candidate(&installed, &request)
+            .expect_err("applying a tail batch over covered history cannot succeed on v0.20.0");
+
+        // Name the exact failure. A different error would mean the blocker is
+        // somewhere else and the design aimed at the wrong site.
+        let FrontierError::Corrupt(detail) = &error else {
+            panic!("expected a Corrupt failure naming the missing covered node, got {error:?}");
+        };
+        assert!(
+            detail.contains("accepted-batch node") && detail.contains("missing"),
+            "expected the covered accepted-batch node walk to fail, got {detail:?}"
+        );
+    }
+
     fn reference_target_name(source_page_id: [u8; 16]) -> String {
         format!("bootstrap-target-{}", u128::from_be_bytes(source_page_id))
     }
