@@ -1822,6 +1822,27 @@ fn materialize_covered_causal_clock(
     entries: &[SealedAcceptedCausalClockEntryV2],
     expected: Option<AuthenticatedMapLinkV1>,
 ) -> Result<MapLink, FrontierError> {
+    // If the clock is already here, do not rebuild it.
+    //
+    // Rebuilding is O(entries * log entries) treap insertions -- measured at
+    // 1498 rows for a 256-peer clock -- and the same covered record is a
+    // dependency head of several of the first tail batches after a cutover, so
+    // without this the cost is paid once per apply. The nodes are
+    // content-addressed and written inside the apply transaction, so a present
+    // root implies a complete subtree: there is no partial state to find.
+    if let Some(expected) = expected {
+        let present: bool = connection.query_row(
+            "SELECT EXISTS (SELECT 1 FROM causal_clock_nodes WHERE node_digest = ?1)",
+            params![expected.digest.as_bytes().as_slice()],
+            |row| row.get(0),
+        )?;
+        if present {
+            return Ok(MapLink {
+                key: expected.key,
+                digest: expected.digest,
+            });
+        }
+    }
     let mut link = None;
     for entry in entries {
         link = Some(upsert_causal_clock(
@@ -3668,9 +3689,20 @@ fn guard_terminal_prefix_candidate(
 /// resulting root digest equals a from-empty replay of the same history
 /// regardless of insertion order.
 ///
-/// Cost is one descent: O(height), expected O(log n) under digest-derived
-/// priorities, and hard-refused above the 256-node depth ceiling
-/// (`MAX_MAP_DEPTH`) — plus one composite lookup per causal dependency head.
+/// Cost, stated in full rather than as the flattering half. The BATCH-MAP work
+/// is one descent: O(height), expected O(log n) under digest-derived priorities,
+/// hard-refused above the 256-node depth ceiling. The APPLY also carries two
+/// composite lookups per causal dependency head (the validation loop and
+/// `derive_causal_clock_root` each load it), and, for a COVERED head, one
+/// materialization of that head's canonical causal clock — O(peers · log peers)
+/// treap insertions, measured at 1498 hot rows for a 256-peer clock.
+///
+/// That term is bounded by PEER count, not by history: a peer is a replica, not
+/// an edit. It is also paid once — `materialize_covered_causal_clock` returns
+/// the existing link when the clock is already present, so the second tail
+/// descending from the same covered parent writes one insertion path, not a
+/// rebuild. `an_anchored_apply_reads_the_path_not_the_covered_history` measures
+/// all three terms; do not restate the bound without re-reading it.
 pub fn apply_checkpoint_candidate(
     connection: &mut Connection,
     sealed: &dyn SealedAcceptedIndexRead,
@@ -4986,25 +5018,33 @@ mod tests {
         TestSealedStore,
         PhysicalFrontierRoot,
         PhysicalApplyRequest,
+        Vec<([u8; 16], ContentDigest)>,
     ) {
         assert!(covered >= 1);
         let mut store = TestSealedStore::default();
         let mut writer = SealedAcceptedIndexWriter::new(&mut store);
         let mut batch_root = AuthenticatedMapRootV1::empty();
         let mut entries = Vec::new();
+        let mut clock: Vec<SealedAcceptedCausalClockEntryV2> = Vec::new();
         for index in 0..covered {
             let peer_id = id(1000 + index);
             let batch_id = id(2000 + index);
+            // Each covered batch OBSERVES every peer before it, so the last
+            // record's canonical clock carries `covered` entries. That is the
+            // worst case a valid record can present -- one peer per batch -- and
+            // it is the case the first version of this fixture avoided by
+            // depending on the FIRST covered batch, whose clock has one entry.
+            clock.push(SealedAcceptedCausalClockEntryV2 {
+                peer_id,
+                counter: 1,
+            });
             let causal = SealedAcceptedCausalRecordV2 {
                 batch_id,
                 manifest_fingerprint: ContentDigest::of(b"manifest"),
                 event_binding_digest: ContentDigest::of(b"event"),
                 causal_peer_id: peer_id,
                 causal_counter: 1,
-                canonical_causal_clock: vec![SealedAcceptedCausalClockEntryV2 {
-                    peer_id,
-                    counter: 1,
-                }],
+                canonical_causal_clock: clock.clone(),
             };
             let address = writer.publish_causal(&causal).unwrap();
             batch_root = writer.upsert_map(batch_root, batch_id, address).unwrap();
@@ -5091,7 +5131,9 @@ mod tests {
             state_digest: ContentDigest::of(b"state"),
         };
 
-        let parent = id(2000);
+        // Depend on the LAST covered batch: its canonical clock carries every
+        // peer, which is the term the batch-map height says nothing about.
+        let parent = id(2000 + covered - 1);
         let tail_peer = id(900);
         let tail_id = id(3000);
         let mut tail = PhysicalAcceptedBatch {
@@ -5112,18 +5154,18 @@ mod tests {
             acceptance_sequence: covered_count + 1,
             retained_bytes: 20,
         };
-        // The tail's clock is its parent's clock ({peer 1000: 1}) unioned with
-        // its own dot ({peer 900: 1}).
-        let mut clock_entries = vec![
-            (
-                AuthenticatedMapKey::from(tail_peer),
-                causal_clock_counter_digest(tail_peer, 1),
-            ),
-            (
-                AuthenticatedMapKey::from(id(1000)),
-                causal_clock_counter_digest(id(1000), 1),
-            ),
-        ];
+        // The tail's clock is its parent's clock -- every covered peer -- unioned
+        // with its own dot.
+        let mut clock_entries = vec![(
+            AuthenticatedMapKey::from(tail_peer),
+            causal_clock_counter_digest(tail_peer, 1),
+        )];
+        for entry in &clock {
+            clock_entries.push((
+                AuthenticatedMapKey::from(entry.peer_id),
+                causal_clock_counter_digest(entry.peer_id, entry.counter),
+            ));
+        }
         clock_entries.sort_unstable_by_key(|entry| entry.0);
         let (clock_key, clock_digest) = map_root(&clock_entries);
         let clock_root = MapLink {
@@ -5149,7 +5191,82 @@ mod tests {
             materialization_input_digest: None,
             fault: ApplyFault::None,
         };
-        (path, database, store, installed, request)
+        (path, database, store, installed, request, post_entries)
+    }
+
+    fn clock_rows(path: &TestDatabase) -> i64 {
+        let connection = Connection::open(&path.path).unwrap();
+        connection
+            .query_row("SELECT COUNT(*) FROM causal_clock_nodes", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+    }
+
+    /// A second tail from a DIFFERENT peer that descends from the same covered
+    /// parent -- two replicas branching off the last covered batch, which is
+    /// exactly the shape the first applies after a cutover take.
+    fn second_tail_over_the_same_covered_parent(
+        covered: u128,
+        prior: &PhysicalFrontierRoot,
+        prior_entries: &[([u8; 16], ContentDigest)],
+    ) -> PhysicalApplyRequest {
+        let parent = id(2000 + covered - 1);
+        let peer = id(901);
+        let batch_id = id(3001);
+        let mut batch = PhysicalAcceptedBatch {
+            batch_id,
+            manifest_digest: ContentDigest::of(b"second manifest"),
+            event_binding_digest: ContentDigest::of(b"second event"),
+            semantic_effect: b"second effect".to_vec(),
+            semantic_effect_digest: ContentDigest::of(b"second effect"),
+            dependency_frontier: b"second dependency".to_vec(),
+            prior_frontier_root: prior.clone(),
+            post_frontier_root: prior.clone(),
+            affected_documents: Vec::new(),
+            affected_documents_bytes: Vec::new(),
+            causal_dependency_heads: vec![parent],
+            causal_dependency_heads_bytes: parent.to_vec(),
+            causal_peer_id: peer,
+            causal_counter: 1,
+            acceptance_sequence: prior.acceptance_sequence + 1,
+            retained_bytes: 30,
+        };
+        let mut clock_entries = vec![(
+            AuthenticatedMapKey::from(peer),
+            causal_clock_counter_digest(peer, 1),
+        )];
+        for index in 0..covered {
+            let covered_peer = id(1000 + index);
+            clock_entries.push((
+                AuthenticatedMapKey::from(covered_peer),
+                causal_clock_counter_digest(covered_peer, 1),
+            ));
+        }
+        clock_entries.sort_unstable_by_key(|entry| entry.0);
+        let (clock_key, clock_digest) = map_root(&clock_entries);
+        let clock_root = MapLink {
+            key: clock_key.unwrap(),
+            digest: clock_digest,
+        };
+        let record_digest = accepted_batch_causal_record_digest(&batch, &clock_root);
+        let mut entries = prior_entries.to_vec();
+        entries.push((batch_id, record_digest));
+        entries.sort_unstable_by_key(|entry| entry.0);
+        let (post_key, post_digest) = batch_map_root(&entries);
+        let mut post = prior.clone();
+        post.acceptance_sequence = batch.acceptance_sequence;
+        post.batch_map_root_key = post_key;
+        post.batch_map_root_digest = post_digest;
+        post.canonical_bytes = b"a second tail over the same covered parent".to_vec();
+        post.state_digest = ContentDigest::of(b"second tail");
+        batch.post_frontier_root = post;
+        PhysicalApplyRequest {
+            batch,
+            materialization: None,
+            materialization_input_digest: None,
+            fault: ApplyFault::None,
+        }
     }
 
     /// I-14: the cost of one anchored apply tracks the TREE, not the history.
@@ -5162,19 +5279,36 @@ mod tests {
     /// covered tree would leave the row delta untouched.
     #[test]
     fn an_anchored_apply_reads_the_path_not_the_covered_history() {
-        fn sealed_reads(covered: u128) -> (usize, usize) {
-            let (_path, mut database, store, installed, request) = anchored_candidate_over(covered);
+        fn sealed_reads(covered: u128) -> (usize, usize, i64) {
+            let (path, mut database, store, installed, request, _entries) =
+                anchored_candidate_over(covered);
             let inner = SealedAcceptedIndexReader::new(&store);
             let counting = CountingSealedReader::new(&inner);
             database
                 .apply_checkpoint(&counting, &installed, &request)
                 .expect("a tail batch applies over covered history");
-            (counting.map_nodes.get(), counting.causal_records.get())
+            drop(database);
+            let connection = Connection::open(&path.path).unwrap();
+            let clock_nodes: i64 = connection
+                .query_row("SELECT COUNT(*) FROM causal_clock_nodes", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            (
+                counting.map_nodes.get(),
+                counting.causal_records.get(),
+                clock_nodes,
+            )
         }
 
-        let (small_nodes, small_records) = sealed_reads(1);
-        let (large_nodes, large_records) = sealed_reads(256);
-        println!("sealed map-node reads: 1 covered => {small_nodes}, 256 covered => {large_nodes}");
+        let (small_nodes, small_records, small_clock) = sealed_reads(1);
+        let (large_nodes, large_records, large_clock) = sealed_reads(256);
+        println!(
+            "1 covered  => {small_nodes} sealed map reads, {small_records} records, \
+             {small_clock} clock rows\n\
+             256 covered => {large_nodes} sealed map reads, {large_records} records, \
+             {large_clock} clock rows"
+        );
 
         // Causal-record reads track the dependency-head count, not the history
         // size. Two per head, not one: the validation loop authenticates each
@@ -5194,6 +5328,36 @@ mod tests {
              {small_nodes} over 1 batch, {large_nodes} over 256"
         );
         assert!(large_nodes > small_nodes, "the deeper tree must cost more");
+
+        // The clock term is real and is NOT bounded by the batch-map height:
+        // 1498 hot clock rows for a 256-peer covered clock, against 3 for one
+        // peer. It is bounded by PEER count -- devices, not edits -- and the
+        // repeat is bounded too: a second tail descending from the same covered
+        // parent finds the clock already materialized and rebuilds nothing.
+        assert!(large_clock > 100, "the fixture must exercise a wide clock");
+        let (path, mut database, store, installed, first, entries) = anchored_candidate_over(64);
+        let reader = SealedAcceptedIndexReader::new(&store);
+        database
+            .apply_checkpoint(&reader, &installed, &first)
+            .unwrap();
+        let after_first = first.batch.post_frontier_root.clone();
+        let rows_after_first: i64 = clock_rows(&path);
+
+        let second = second_tail_over_the_same_covered_parent(64, &after_first, &entries);
+        database
+            .apply_checkpoint(&reader, &after_first, &second)
+            .expect("a second tail may descend from the same covered parent");
+        let rows_after_second = clock_rows(&path);
+        let added = rows_after_second - rows_after_first;
+        // Measured: 5. That is one insertion path into a 64-node treap -- the
+        // second tail's own dot -- not a rebuild of the 64-peer covered clock,
+        // which cost hundreds of rows the first time. The bound asserted here is
+        // the shape (a path), not the exact number.
+        assert!(
+            added < 20,
+            "the covered clock was rebuilt instead of being reused: {added} new rows"
+        );
+        assert!(added > 0, "the second tail must write its own dot");
     }
 
     /// A minimal checkpoint frontier root that passes
@@ -5362,7 +5526,14 @@ mod tests {
     /// from the UNPERTURBED record and only the entries are perturbed.
     #[test]
     fn a_perturbed_covered_clock_cannot_pass_its_canonical_root() {
-        let (_database, connection, _empty) = initialized();
+        // One database per arm. `materialize_covered_causal_clock` returns the
+        // cached link when the expected root is already present, so an honest
+        // arm run first would answer every later arm without rebuilding -- and
+        // every perturbation would pass.
+        let (_d1, connection, _e1) = initialized();
+        let (_d2, perturbed_connection, _e2) = initialized();
+        let (_d3, extra_connection, _e3) = initialized();
+        let (_d4, empty_connection, _e4) = initialized();
         let record = SealedAcceptedCausalRecordV2 {
             batch_id: id(77),
             manifest_fingerprint: ContentDigest::of(b"manifest"),
@@ -5398,9 +5569,13 @@ mod tests {
         // One counter moved on the WRITE side only.
         let mut perturbed = record.canonical_causal_clock.clone();
         perturbed[1].counter += 1;
-        let error =
-            materialize_covered_causal_clock(&connection, &record.batch_id, &perturbed, canonical)
-                .expect_err("a perturbed counter must not pass the canonical root");
+        let error = materialize_covered_causal_clock(
+            &perturbed_connection,
+            &record.batch_id,
+            &perturbed,
+            canonical,
+        )
+        .expect_err("a perturbed counter must not pass the canonical root");
         assert!(
             matches!(&error, FrontierError::Corrupt(message)
                 if message.contains("differs from its canonical root")),
@@ -5414,13 +5589,18 @@ mod tests {
             counter: 1,
         });
         assert!(matches!(
-            materialize_covered_causal_clock(&connection, &record.batch_id, &extra, canonical),
+            materialize_covered_causal_clock(
+                &extra_connection,
+                &record.batch_id,
+                &extra,
+                canonical
+            ),
             Err(FrontierError::Corrupt(_))
         ));
 
         // An empty clock is refused rather than silently rebuilding nothing.
         assert!(matches!(
-            materialize_covered_causal_clock(&connection, &record.batch_id, &[], canonical),
+            materialize_covered_causal_clock(&empty_connection, &record.batch_id, &[], canonical),
             Err(FrontierError::Corrupt(_))
         ));
     }
