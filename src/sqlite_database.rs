@@ -203,6 +203,17 @@ impl PhysicalSqliteDatabase {
         sqlite_frontier::contains_batch(&self.connection, root, batch_id)
     }
 
+    /// The batch accepted at `sequence`, hot or -- on an anchored database --
+    /// covered.
+    pub fn sequence_batch_id(
+        &self,
+        sealed: Option<&dyn SealedAcceptedIndexRead>,
+        root: &PhysicalFrontierRoot,
+        sequence: u64,
+    ) -> Result<Option<[u8; 16]>, FrontierError> {
+        sqlite_frontier::sequence_batch_id(&self.connection, sealed, root, sequence)
+    }
+
     pub fn authenticate_batch(
         &self,
         root: &PhysicalFrontierRoot,

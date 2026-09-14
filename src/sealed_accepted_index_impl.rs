@@ -7,19 +7,9 @@ use serde::{
 
 use crate::ContentDigest;
 
-pub const SEALED_ACCEPTED_INDEX_SCHEMA_VERSION: u32 = 3;
-pub const SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION: u32 = 3;
 pub const SEALED_ACCEPTED_STATUS_SCHEMA_VERSION: u32 = 2;
-pub const SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION: u32 = 2;
-pub const SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION: u32 = 2;
-pub const SEALED_ACCEPTED_SEQUENCE_FANOUT: usize = 32;
-pub const SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY: usize = 1;
 
-/// Hard refusal ceiling for a corrupted or adversarially-shaped sealed index.
-///
-/// This is a reader work bound, not part of the bytes on disk. Healthy
-/// deterministic treaps are expected to remain far below it.
-pub const MAX_ACCEPTED_INDEX_DEPTH: usize = 256;
+pub const SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION: u32 = 2;
 
 /// Inclusive upper bound on one authenticated-map key, in bytes.
 ///
@@ -207,30 +197,29 @@ const AUTHENTICATED_MAP_EMPTY_DOMAIN: &[u8] = b"tine/oplog/authenticated-map/v1/
 const AUTHENTICATED_MAP_PRIORITY_DOMAIN: &[u8] = b"tine/oplog/authenticated-map/v1/priority\0";
 const AUTHENTICATED_MAP_NODE_DOMAIN: &[u8] = b"tine/oplog/authenticated-map/v2/node\0";
 const ACCEPTED_STATUS_DOMAIN: &[u8] = b"tine/oplog/accepted-status/v2\0";
-const ACCEPTED_SEQUENCE_ENTRY_DOMAIN: &[u8] = b"tine/oplog/accepted-sequence/v2/entry\0";
-const ACCEPTED_SEQUENCE_LEAF_DOMAIN: &[u8] = b"tine/oplog/accepted-sequence/v2/leaf\0";
-const ACCEPTED_SEQUENCE_NODE_DOMAIN: &[u8] = b"tine/oplog/accepted-sequence/v2/node\0";
+
 const CAUSAL_CLOCK_ENTRY_DOMAIN: &[u8] = b"tine/oplog/causal-clock-entry/v1\0";
 const ACCEPTED_CAUSAL_RECORD_DOMAIN: &[u8] = b"tine/oplog/accepted-causal-record/v1\0";
 const CAUSAL_PEER_TIP_DOMAIN: &[u8] = b"tine/oplog/causal-peer-tip/v2\0";
 
+/// What kind of sealed object an address names.
+///
+/// The treap and sequence-tree kinds left with the structures that used them:
+/// there are no map nodes and no sequence leaves/nodes any more, only records
+/// and the sorted tables that point at them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SealedAcceptedObjectKind {
-    MapNode,
     StatusRecord,
-    SequenceLeaf,
-    SequenceNode,
     CausalRecord,
+    Table,
 }
 
 impl fmt::Display for SealedAcceptedObjectKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::MapNode => "authenticated-map node",
             Self::StatusRecord => "accepted-status record",
-            Self::SequenceLeaf => "accepted-sequence leaf",
-            Self::SequenceNode => "accepted-sequence node",
             Self::CausalRecord => "accepted-causal record",
+            Self::Table => "sealed sorted table",
         })
     }
 }
@@ -269,54 +258,10 @@ impl fmt::Display for SealedAcceptedIndexError {
 
 impl std::error::Error for SealedAcceptedIndexError {}
 
-/// Content-addressed object access used by both the clean engine and SQLite.
-///
-/// Implementations must verify exact-existing publication according to their
-/// physical store contract. The sealed-index layer independently validates
-/// every canonical payload and logical address on read.
-pub trait SealedAcceptedIndexObjectStore {
-    fn read_sealed_accepted_object(
-        &self,
-        kind: SealedAcceptedObjectKind,
-        address: ContentDigest,
-    ) -> Result<Option<Vec<u8>>, SealedAcceptedIndexError>;
-
-    fn publish_sealed_accepted_object(
-        &mut self,
-        kind: SealedAcceptedObjectKind,
-        address: ContentDigest,
-        bytes: &[u8],
-    ) -> Result<(), SealedAcceptedIndexError>;
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct MapLinkWire {
-    key: AuthenticatedMapKey,
-    digest: [u8; 32],
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuthenticatedMapLinkV1 {
     pub key: AuthenticatedMapKey,
     pub digest: ContentDigest,
-}
-
-impl From<AuthenticatedMapLinkV1> for MapLinkWire {
-    fn from(value: AuthenticatedMapLinkV1) -> Self {
-        Self {
-            key: value.key,
-            digest: *value.digest.as_bytes(),
-        }
-    }
-}
-
-impl From<MapLinkWire> for AuthenticatedMapLinkV1 {
-    fn from(value: MapLinkWire) -> Self {
-        Self {
-            key: value.key,
-            digest: ContentDigest::from_bytes(value.digest),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -342,66 +287,6 @@ impl AuthenticatedMapRootV1 {
     pub fn root_digest(self) -> ContentDigest {
         self.root
             .map_or_else(authenticated_map_empty_digest, |root| root.digest)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SealedAuthenticatedMapNodeV2 {
-    pub key: AuthenticatedMapKey,
-    pub value_digest: ContentDigest,
-    pub left: Option<AuthenticatedMapLinkV1>,
-    pub right: Option<AuthenticatedMapLinkV1>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct MapNodeWireV2 {
-    schema: u32,
-    key: AuthenticatedMapKey,
-    value_digest: [u8; 32],
-    left: Option<MapLinkWire>,
-    right: Option<MapLinkWire>,
-}
-
-impl SealedAuthenticatedMapNodeV2 {
-    pub fn logical_digest(&self) -> ContentDigest {
-        authenticated_map_node_digest(
-            self.key,
-            self.value_digest,
-            self.left.map(|child| (child.key, child.digest)),
-            self.right.map(|child| (child.key, child.digest)),
-        )
-    }
-
-    pub fn encode(&self) -> Result<Vec<u8>, SealedAcceptedIndexError> {
-        canonical_encode(&MapNodeWireV2 {
-            schema: SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION,
-            key: self.key,
-            value_digest: *self.value_digest.as_bytes(),
-            left: self.left.map(Into::into),
-            right: self.right.map(Into::into),
-        })
-    }
-
-    pub fn decode(
-        expected: AuthenticatedMapLinkV1,
-        bytes: &[u8],
-    ) -> Result<Self, SealedAcceptedIndexError> {
-        let wire: MapNodeWireV2 = canonical_decode(bytes, "authenticated-map node")?;
-        if wire.schema != SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION || wire.key != expected.key {
-            return Err(corrupt("authenticated-map node schema/key mismatch"));
-        }
-        let node = Self {
-            key: wire.key,
-            value_digest: ContentDigest::from_bytes(wire.value_digest),
-            left: wire.left.map(Into::into),
-            right: wire.right.map(Into::into),
-        };
-        if !valid_map_children(node.key, node.left.as_ref(), node.right.as_ref())
-            || node.logical_digest() != expected.digest
-        {
-            return Err(corrupt("authenticated-map node binding mismatch"));
-        }
-        Ok(node)
     }
 }
 
@@ -579,215 +464,6 @@ impl AcceptedStatusRecordV2 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AcceptedSequenceEntryV2 {
-    pub sequence: u64,
-    pub batch_id: [u8; 16],
-    pub accepted_status_value_digest: ContentDigest,
-}
-
-impl AcceptedSequenceEntryV2 {
-    pub fn entry_digest(self) -> ContentDigest {
-        digest_fold(
-            ACCEPTED_SEQUENCE_ENTRY_DOMAIN,
-            &[
-                &self.sequence.to_be_bytes(),
-                &self.batch_id,
-                self.accepted_status_value_digest.as_bytes(),
-            ],
-        )
-    }
-
-    pub fn encode_leaf(self) -> Result<Vec<u8>, SealedAcceptedIndexError> {
-        canonical_encode(&AcceptedSequenceLeafWireV2 {
-            schema: SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION,
-            sequence_be: self.sequence.to_be_bytes(),
-            batch_id: self.batch_id,
-            accepted_status_value_digest: *self.accepted_status_value_digest.as_bytes(),
-        })
-    }
-
-    pub fn leaf_digest(self) -> Result<ContentDigest, SealedAcceptedIndexError> {
-        Ok(digest_fold(
-            ACCEPTED_SEQUENCE_LEAF_DOMAIN,
-            &[&self.encode_leaf()?],
-        ))
-    }
-
-    fn decode_leaf(
-        expected_sequence: u64,
-        expected_address: ContentDigest,
-        bytes: &[u8],
-    ) -> Result<Self, SealedAcceptedIndexError> {
-        let wire: AcceptedSequenceLeafWireV2 = canonical_decode(bytes, "accepted-sequence leaf")?;
-        let sequence = u64::from_be_bytes(wire.sequence_be);
-        let entry = Self {
-            sequence,
-            batch_id: wire.batch_id,
-            accepted_status_value_digest: ContentDigest::from_bytes(
-                wire.accepted_status_value_digest,
-            ),
-        };
-        if wire.schema != SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION
-            || sequence != expected_sequence
-            || entry.leaf_digest()? != expected_address
-        {
-            return Err(corrupt("accepted-sequence leaf binding mismatch"));
-        }
-        Ok(entry)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct AcceptedSequenceLeafWireV2 {
-    schema: u32,
-    sequence_be: [u8; 8],
-    batch_id: [u8; 16],
-    accepted_status_value_digest: [u8; 32],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AcceptedSequenceChildV2 {
-    pub first: u64,
-    pub last: u64,
-    pub digest: ContentDigest,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AcceptedSequenceNodeV2 {
-    pub height: u8,
-    pub first_leaf: u64,
-    pub children: Vec<AcceptedSequenceChildV2>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct AcceptedSequenceChildWireV2 {
-    first_be: [u8; 8],
-    last_be: [u8; 8],
-    digest: [u8; 32],
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct AcceptedSequenceNodeWireV2 {
-    schema: u32,
-    height: u8,
-    first_leaf_be: [u8; 8],
-    children: Vec<AcceptedSequenceChildWireV2>,
-}
-
-impl AcceptedSequenceNodeV2 {
-    pub fn encode(&self) -> Result<Vec<u8>, SealedAcceptedIndexError> {
-        validate_sequence_node(self)?;
-        canonical_encode(&AcceptedSequenceNodeWireV2 {
-            schema: SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION,
-            height: self.height,
-            first_leaf_be: self.first_leaf.to_be_bytes(),
-            children: self
-                .children
-                .iter()
-                .map(|child| AcceptedSequenceChildWireV2 {
-                    first_be: child.first.to_be_bytes(),
-                    last_be: child.last.to_be_bytes(),
-                    digest: *child.digest.as_bytes(),
-                })
-                .collect(),
-        })
-    }
-
-    pub fn digest(&self) -> Result<ContentDigest, SealedAcceptedIndexError> {
-        Ok(digest_fold(
-            ACCEPTED_SEQUENCE_NODE_DOMAIN,
-            &[&self.encode()?],
-        ))
-    }
-
-    fn decode(
-        expected_height: u8,
-        expected_first: u64,
-        expected_address: ContentDigest,
-        bytes: &[u8],
-    ) -> Result<Self, SealedAcceptedIndexError> {
-        let wire: AcceptedSequenceNodeWireV2 = canonical_decode(bytes, "accepted-sequence node")?;
-        let node = Self {
-            height: wire.height,
-            first_leaf: u64::from_be_bytes(wire.first_leaf_be),
-            children: wire
-                .children
-                .into_iter()
-                .map(|child| AcceptedSequenceChildV2 {
-                    first: u64::from_be_bytes(child.first_be),
-                    last: u64::from_be_bytes(child.last_be),
-                    digest: ContentDigest::from_bytes(child.digest),
-                })
-                .collect(),
-        };
-        if wire.schema != SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION
-            || node.height != expected_height
-            || node.first_leaf != expected_first
-            || node.digest()? != expected_address
-        {
-            return Err(corrupt("accepted-sequence node binding mismatch"));
-        }
-        validate_sequence_node(&node)?;
-        Ok(node)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AcceptedSequenceRootV2 {
-    pub len: u64,
-    pub height: u8,
-    pub root_digest: Option<ContentDigest>,
-}
-
-impl Default for AcceptedSequenceRootV2 {
-    fn default() -> Self {
-        Self::empty()
-    }
-}
-
-impl AcceptedSequenceRootV2 {
-    pub const fn empty() -> Self {
-        Self {
-            len: 0,
-            height: 0,
-            root_digest: None,
-        }
-    }
-
-    pub fn encode(self) -> Result<Vec<u8>, SealedAcceptedIndexError> {
-        validate_sequence_root(self)?;
-        canonical_encode(&AcceptedSequenceRootWireV2 {
-            schema: SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION,
-            len: self.len,
-            height: self.height,
-            root_digest: self.root_digest.map(|digest| *digest.as_bytes()),
-        })
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self, SealedAcceptedIndexError> {
-        let wire: AcceptedSequenceRootWireV2 = canonical_decode(bytes, "accepted-sequence root")?;
-        let root = Self {
-            len: wire.len,
-            height: wire.height,
-            root_digest: wire.root_digest.map(ContentDigest::from_bytes),
-        };
-        if wire.schema != SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION {
-            return Err(corrupt("accepted-sequence root schema mismatch"));
-        }
-        validate_sequence_root(root)?;
-        Ok(root)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct AcceptedSequenceRootWireV2 {
-    schema: u32,
-    len: u64,
-    height: u8,
-    root_digest: Option<[u8; 32]>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SealedAcceptedCausalClockEntryV2 {
     pub peer_id: [u8; 16],
     pub counter: u64,
@@ -960,31 +636,6 @@ impl CausalTipRecordV2 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SealedAcceptedIndexRootsV2 {
-    pub batch_map: AuthenticatedMapRootV1,
-    pub status_map: AuthenticatedMapRootV1,
-    pub sequence: AcceptedSequenceRootV2,
-}
-
-impl SealedAcceptedIndexRootsV2 {
-    pub fn validate_counts(self) -> Result<(), SealedAcceptedIndexError> {
-        if self.batch_map.count != self.status_map.count
-            || self.batch_map.count != self.sequence.len
-        {
-            return Err(corrupt("sealed accepted-index counts differ"));
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SealedAcceptedMembershipProofV2 {
-    pub sequence: AcceptedSequenceEntryV2,
-    pub status: AcceptedStatusRecordV2,
-    pub causal: SealedAcceptedCausalRecordV2,
-}
-
 /// Domain fields recovered from one exact canonical accepted-evidence value.
 ///
 /// `tine-storage` deliberately does not own Tine's accepted-evidence codec. The
@@ -1007,703 +658,76 @@ pub trait SealedAcceptedEvidenceDecoder {
     ) -> Result<AcceptedEvidenceBindingV2, SealedAcceptedIndexError>;
 }
 
-/// Read-only covered-node seam used by SQLite's hot-first composite index.
-///
-/// Implementations expose only already-sealed immutable objects. They cannot
-/// publish, enumerate, or reinterpret a missing covered object as an ordinary
-/// cache miss.
-pub trait SealedAcceptedIndexRead {
-    fn sealed_map_node(
-        &self,
-        link: AuthenticatedMapLinkV1,
-    ) -> Result<SealedAuthenticatedMapNodeV2, SealedAcceptedIndexError>;
-
-    fn sealed_causal_record(
-        &self,
-        batch_id: [u8; 16],
-        address: ContentDigest,
-    ) -> Result<SealedAcceptedCausalRecordV2, SealedAcceptedIndexError>;
+/// The two records one sealed accepted batch resolves to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedBatchRecords {
+    pub causal: SealedAcceptedCausalRecordV2,
+    pub status: AcceptedStatusRecordV2,
 }
 
-pub struct SealedAcceptedIndexReader<'a, Store> {
-    store: &'a Store,
-}
-
-impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexReader<'a, Store> {
-    pub const fn new(store: &'a Store) -> Self {
-        Self { store }
-    }
-
-    pub fn map_value(
+impl SealedBatchRecords {
+    /// The cross-checks the retired `prove_membership` performed, minus the
+    /// Merkle path.
+    ///
+    /// The path is gone on purpose (D-2, spec 4.3): Tine does not
+    /// re-authenticate its own previously established private state, and a
+    /// per-lookup proof walk is exactly that. What the proof ALSO did, and what
+    /// is worth keeping, is binding the two records and the caller's evidence
+    /// to one identity, which costs no reads at all. Callers that hold an
+    /// evidence decoder should call this; it is not free-standing validation
+    /// the reader can do for them, because `tine-storage` deliberately does not
+    /// own Tine's accepted-evidence codec.
+    pub fn verify<Decoder: SealedAcceptedEvidenceDecoder>(
         &self,
-        root: AuthenticatedMapRootV1,
-        key: impl Into<AuthenticatedMapKey>,
-    ) -> Result<Option<ContentDigest>, SealedAcceptedIndexError> {
-        let key = key.into();
-        validate_map_root(root)?;
-        let mut current = root.root;
-        for _ in 0..MAX_ACCEPTED_INDEX_DEPTH {
-            let Some(link) = current else { return Ok(None) };
-            let node = self.read_map_node(link)?;
-            match key.cmp(&node.key) {
-                Ordering::Equal => return Ok(Some(node.value_digest)),
-                Ordering::Less => current = node.left,
-                Ordering::Greater => current = node.right,
-            }
-        }
-        Err(SealedAcceptedIndexError::Capacity)
-    }
-
-    pub fn status(
-        &self,
-        root: AuthenticatedMapRootV1,
-        batch_id: [u8; 16],
-    ) -> Result<Option<AcceptedStatusRecordV2>, SealedAcceptedIndexError> {
-        let Some(address) = self.map_value(root, batch_id)? else {
-            return Ok(None);
-        };
-        let bytes = self.required(SealedAcceptedObjectKind::StatusRecord, address)?;
-        Ok(Some(AcceptedStatusRecordV2::decode(
-            batch_id, address, &bytes,
-        )?))
-    }
-
-    pub fn causal(
-        &self,
-        batch_id: [u8; 16],
-        address: ContentDigest,
-    ) -> Result<SealedAcceptedCausalRecordV2, SealedAcceptedIndexError> {
-        let bytes = self.required(SealedAcceptedObjectKind::CausalRecord, address)?;
-        SealedAcceptedCausalRecordV2::decode(batch_id, address, &bytes)
-    }
-
-    pub fn sequence_entry(
-        &self,
-        root: AcceptedSequenceRootV2,
-        sequence: u64,
-    ) -> Result<Option<AcceptedSequenceEntryV2>, SealedAcceptedIndexError> {
-        validate_sequence_root(root)?;
-        if sequence == 0 || sequence > root.len {
-            return Ok(None);
-        }
-        let mut address = root.root_digest.expect("validated nonempty sequence root");
-        let mut height = root.height;
-        let mut first = 1_u64;
-        let mut depth = 0usize;
-        while height > 0 {
-            if depth >= MAX_ACCEPTED_INDEX_DEPTH {
-                return Err(SealedAcceptedIndexError::Capacity);
-            }
-            let bytes = self.required(SealedAcceptedObjectKind::SequenceNode, address)?;
-            let node = AcceptedSequenceNodeV2::decode(height, first, address, &bytes)?;
-            let child = node
-                .children
-                .iter()
-                .find(|child| child.first <= sequence && sequence <= child.last)
-                .ok_or_else(|| corrupt("accepted-sequence node does not cover requested entry"))?;
-            address = child.digest;
-            first = child.first;
-            height -= 1;
-            depth += 1;
-        }
-        let bytes = self.required(SealedAcceptedObjectKind::SequenceLeaf, address)?;
-        Ok(Some(AcceptedSequenceEntryV2::decode_leaf(
-            sequence, address, &bytes,
-        )?))
-    }
-
-    pub fn prove_membership<Decoder: SealedAcceptedEvidenceDecoder>(
-        &self,
-        roots: SealedAcceptedIndexRootsV2,
         sequence: u64,
         batch_id: [u8; 16],
         evidence_decoder: &Decoder,
-    ) -> Result<Option<SealedAcceptedMembershipProofV2>, SealedAcceptedIndexError> {
-        roots.validate_counts()?;
-        let Some(sequence_entry) = self.sequence_entry(roots.sequence, sequence)? else {
-            return Ok(None);
-        };
-        if sequence_entry.batch_id != batch_id {
-            return Ok(None);
+    ) -> Result<(), SealedAcceptedIndexError> {
+        if self.causal.batch_id != batch_id || self.status.batch_id != batch_id {
+            return Err(corrupt("sealed batch records name another batch"));
         }
-        let Some(status) = self.status(roots.status_map, batch_id)? else {
-            return Err(corrupt("sequence names a missing accepted-status record"));
-        };
-        if sequence_entry.accepted_status_value_digest != status.value_digest() {
-            return Err(corrupt("sequence/status digest cross-check failed"));
+        if self.status.accepted_causal_record_digest != self.causal.address()? {
+            return Err(corrupt("status/causal record cross-check failed"));
         }
-        let Some(causal_address) = self.map_value(roots.batch_map, batch_id)? else {
-            return Err(corrupt(
-                "accepted-status record names a missing batch-map entry",
-            ));
-        };
-        if causal_address != status.accepted_causal_record_digest {
-            return Err(corrupt("status/batch-map causal digest cross-check failed"));
-        }
-        let causal = self.causal(batch_id, causal_address)?;
-        let evidence = evidence_decoder
-            .decode_accepted_evidence(status.evidence_schema, &status.exact_evidence_bytes)?;
+        let evidence = evidence_decoder.decode_accepted_evidence(
+            self.status.evidence_schema,
+            &self.status.exact_evidence_bytes,
+        )?;
         if evidence.batch_id != batch_id
             || evidence.acceptance_sequence != sequence
-            || evidence.manifest_fingerprint != causal.manifest_fingerprint
-            || evidence.event_binding_digest != causal.event_binding_digest
+            || evidence.manifest_fingerprint != self.causal.manifest_fingerprint
+            || evidence.event_binding_digest != self.causal.event_binding_digest
         {
             return Err(corrupt(
                 "accepted evidence/status/sequence/causal binding mismatch",
             ));
         }
-        Ok(Some(SealedAcceptedMembershipProofV2 {
-            sequence: sequence_entry,
-            status,
-            causal,
-        }))
-    }
-
-    pub fn read_map_node(
-        &self,
-        link: AuthenticatedMapLinkV1,
-    ) -> Result<SealedAuthenticatedMapNodeV2, SealedAcceptedIndexError> {
-        let bytes = self.required(SealedAcceptedObjectKind::MapNode, link.digest)?;
-        SealedAuthenticatedMapNodeV2::decode(link, &bytes)
-    }
-
-    fn required(
-        &self,
-        kind: SealedAcceptedObjectKind,
-        address: ContentDigest,
-    ) -> Result<Vec<u8>, SealedAcceptedIndexError> {
-        self.store
-            .read_sealed_accepted_object(kind, address)?
-            .ok_or(SealedAcceptedIndexError::Missing { kind, address })
+        Ok(())
     }
 }
 
-impl<Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexRead
-    for SealedAcceptedIndexReader<'_, Store>
-{
-    fn sealed_map_node(
-        &self,
-        link: AuthenticatedMapLinkV1,
-    ) -> Result<SealedAuthenticatedMapNodeV2, SealedAcceptedIndexError> {
-        self.read_map_node(link)
-    }
-
-    fn sealed_causal_record(
+/// The sealed accepted index, as the two POINT LOOKUPS its consumers need.
+///
+/// It used to be a NODE seam: SQLite descended one authenticated treap whose
+/// covered subtrees lived in sealed files, falling through per node. With
+/// immutable sorted tables there is no node to fall through to, and there is no
+/// shared tree to keep in step either -- the sealed side answers a question
+/// instead of exposing a structure.
+///
+/// Implementations expose only already-sealed immutable state. A missing
+/// covered batch is `Ok(None)` -- genuinely absent -- not a cache miss an
+/// implementation may reinterpret.
+pub trait SealedAcceptedIndexRead {
+    /// The causal and status records for `batch_id`, or `None` when the sealed
+    /// history does not contain it.
+    fn batch(
         &self,
         batch_id: [u8; 16],
-        address: ContentDigest,
-    ) -> Result<SealedAcceptedCausalRecordV2, SealedAcceptedIndexError> {
-        self.causal(batch_id, address)
-    }
-}
+    ) -> Result<Option<SealedBatchRecords>, SealedAcceptedIndexError>;
 
-pub struct SealedAcceptedIndexWriter<'a, Store> {
-    store: &'a mut Store,
-}
-
-impl<'a, Store: SealedAcceptedIndexObjectStore> SealedAcceptedIndexWriter<'a, Store> {
-    pub fn new(store: &'a mut Store) -> Self {
-        Self { store }
-    }
-
-    pub fn publish_status(
-        &mut self,
-        record: &AcceptedStatusRecordV2,
-    ) -> Result<ContentDigest, SealedAcceptedIndexError> {
-        let bytes = record.encode()?;
-        let address = record.value_digest();
-        self.store.publish_sealed_accepted_object(
-            SealedAcceptedObjectKind::StatusRecord,
-            address,
-            &bytes,
-        )?;
-        Ok(address)
-    }
-
-    pub fn publish_causal(
-        &mut self,
-        record: &SealedAcceptedCausalRecordV2,
-    ) -> Result<ContentDigest, SealedAcceptedIndexError> {
-        let bytes = record.encode()?;
-        let address = record.address()?;
-        self.store.publish_sealed_accepted_object(
-            SealedAcceptedObjectKind::CausalRecord,
-            address,
-            &bytes,
-        )?;
-        Ok(address)
-    }
-
-    pub fn upsert_map(
-        &mut self,
-        root: AuthenticatedMapRootV1,
-        key: impl Into<AuthenticatedMapKey>,
-        value_digest: ContentDigest,
-    ) -> Result<AuthenticatedMapRootV1, SealedAcceptedIndexError> {
-        let key = key.into();
-        validate_map_root(root)?;
-        let (link, inserted) = self.upsert_map_child(root.root, key, value_digest, 0)?;
-        Ok(AuthenticatedMapRootV1 {
-            count: if inserted {
-                root.count
-                    .checked_add(1)
-                    .ok_or(SealedAcceptedIndexError::Capacity)?
-            } else {
-                root.count
-            },
-            root: Some(link),
-        })
-    }
-
-    /// Remove one key by path copying, preserving every previous root.
-    ///
-    /// An absent key returns the identical root without publishing nodes. A
-    /// present key joins its two subtrees using the existing deterministic
-    /// priority order, yielding exactly the canonical root of the remaining
-    /// entries. Only the search/join paths are read or rewritten; no historical
-    /// objects are deleted by this operation. The caller owns root publication
-    /// and retirement of unreachable physical objects.
-    pub fn remove_map(
-        &mut self,
-        root: AuthenticatedMapRootV1,
-        key: impl Into<AuthenticatedMapKey>,
-    ) -> Result<AuthenticatedMapRootV1, SealedAcceptedIndexError> {
-        let key = key.into();
-        validate_map_root(root)?;
-        let (link, removed) = self.remove_map_child(root.root, key, 0)?;
-        if !removed {
-            return Ok(root);
-        }
-        let next = AuthenticatedMapRootV1 {
-            count: root
-                .count
-                .checked_sub(1)
-                .ok_or_else(|| corrupt("map removal underflow"))?,
-            root: link,
-        };
-        validate_map_root(next)?;
-        Ok(next)
-    }
-
-    pub fn append_sequence(
-        &mut self,
-        root: AcceptedSequenceRootV2,
-        entry: AcceptedSequenceEntryV2,
-    ) -> Result<AcceptedSequenceRootV2, SealedAcceptedIndexError> {
-        validate_sequence_root(root)?;
-        let expected = root
-            .len
-            .checked_add(1)
-            .ok_or(SealedAcceptedIndexError::Capacity)?;
-        if entry.sequence != expected {
-            return Err(SealedAcceptedIndexError::NonContiguousSequence {
-                expected,
-                actual: entry.sequence,
-            });
-        }
-        let leaf_bytes = entry.encode_leaf()?;
-        let leaf_digest = entry.leaf_digest()?;
-        self.store.publish_sealed_accepted_object(
-            SealedAcceptedObjectKind::SequenceLeaf,
-            leaf_digest,
-            &leaf_bytes,
-        )?;
-
-        let next_len = root
-            .len
-            .checked_add(1)
-            .ok_or(SealedAcceptedIndexError::Capacity)?;
-        if root.len == 0 {
-            return Ok(AcceptedSequenceRootV2 {
-                len: 1,
-                height: 0,
-                root_digest: Some(leaf_digest),
-            });
-        }
-
-        let old_capacity = sequence_capacity(root.height)?;
-        let (height, digest) = if root.len == old_capacity {
-            let right = self.build_sequence_path(root.height, entry.sequence, leaf_digest)?;
-            let node = AcceptedSequenceNodeV2 {
-                height: root
-                    .height
-                    .checked_add(1)
-                    .ok_or(SealedAcceptedIndexError::Capacity)?,
-                first_leaf: 1,
-                children: vec![
-                    AcceptedSequenceChildV2 {
-                        first: 1,
-                        last: root.len,
-                        digest: root.root_digest.expect("validated sequence root"),
-                    },
-                    AcceptedSequenceChildV2 {
-                        first: entry.sequence,
-                        last: entry.sequence,
-                        digest: right,
-                    },
-                ],
-            };
-            let digest = self.publish_sequence_node(&node)?;
-            (node.height, digest)
-        } else {
-            let digest = self.append_sequence_path(
-                root.height,
-                1,
-                root.root_digest.expect("validated sequence root"),
-                entry.sequence,
-                leaf_digest,
-                0,
-            )?;
-            (root.height, digest)
-        };
-        let next = AcceptedSequenceRootV2 {
-            len: next_len,
-            height,
-            root_digest: Some(digest),
-        };
-        validate_sequence_root(next)?;
-        Ok(next)
-    }
-
-    fn upsert_map_child(
-        &mut self,
-        current: Option<AuthenticatedMapLinkV1>,
-        key: AuthenticatedMapKey,
-        value_digest: ContentDigest,
-        depth: usize,
-    ) -> Result<(AuthenticatedMapLinkV1, bool), SealedAcceptedIndexError> {
-        ensure_index_depth(depth)?;
-        let Some(current) = current else {
-            return Ok((
-                self.publish_map_node(&SealedAuthenticatedMapNodeV2 {
-                    key,
-                    value_digest,
-                    left: None,
-                    right: None,
-                })?,
-                true,
-            ));
-        };
-        let mut node = self.read_map_node(current)?;
-        let inserted;
-        match key.cmp(&node.key) {
-            Ordering::Equal => {
-                node.value_digest = value_digest;
-                inserted = false;
-            }
-            Ordering::Less => {
-                let (left, was_inserted) =
-                    self.upsert_map_child(node.left.take(), key, value_digest, depth + 1)?;
-                node.left = Some(left);
-                inserted = was_inserted;
-                if authenticated_map_priority_order(left.key, node.key).is_lt() {
-                    return Ok((self.rotate_map_right(node)?, inserted));
-                }
-            }
-            Ordering::Greater => {
-                let (right, was_inserted) =
-                    self.upsert_map_child(node.right.take(), key, value_digest, depth + 1)?;
-                node.right = Some(right);
-                inserted = was_inserted;
-                if authenticated_map_priority_order(right.key, node.key).is_lt() {
-                    return Ok((self.rotate_map_left(node)?, inserted));
-                }
-            }
-        }
-        Ok((self.publish_map_node(&node)?, inserted))
-    }
-
-    fn remove_map_child(
-        &mut self,
-        current: Option<AuthenticatedMapLinkV1>,
-        key: AuthenticatedMapKey,
-        depth: usize,
-    ) -> Result<(Option<AuthenticatedMapLinkV1>, bool), SealedAcceptedIndexError> {
-        ensure_index_depth(depth)?;
-        let Some(current) = current else {
-            return Ok((None, false));
-        };
-        let mut node = self.read_map_node(current)?;
-        let removed = match key.cmp(&node.key) {
-            Ordering::Equal => {
-                return Ok((
-                    self.join_map_children(node.left, node.right, depth + 1)?,
-                    true,
-                ));
-            }
-            Ordering::Less => {
-                let (left, removed) = self.remove_map_child(node.left, key, depth + 1)?;
-                node.left = left;
-                removed
-            }
-            Ordering::Greater => {
-                let (right, removed) = self.remove_map_child(node.right, key, depth + 1)?;
-                node.right = right;
-                removed
-            }
-        };
-        if !removed {
-            return Ok((Some(current), false));
-        }
-        Ok((Some(self.publish_map_node(&node)?), true))
-    }
-
-    fn join_map_children(
-        &mut self,
-        left: Option<AuthenticatedMapLinkV1>,
-        right: Option<AuthenticatedMapLinkV1>,
-        depth: usize,
-    ) -> Result<Option<AuthenticatedMapLinkV1>, SealedAcceptedIndexError> {
-        ensure_index_depth(depth)?;
-        let (Some(left), Some(right)) = (left, right) else {
-            return Ok(left.or(right));
-        };
-        if left.key >= right.key {
-            return Err(corrupt("map join children are not ordered"));
-        }
-        let mut node;
-        if authenticated_map_priority_order(left.key, right.key).is_lt() {
-            node = self.read_map_node(left)?;
-            node.right = self.join_map_children(node.right, Some(right), depth + 1)?;
-        } else {
-            node = self.read_map_node(right)?;
-            node.left = self.join_map_children(Some(left), node.left, depth + 1)?;
-        }
-        Ok(Some(self.publish_map_node(&node)?))
-    }
-
-    fn rotate_map_right(
-        &mut self,
-        mut node: SealedAuthenticatedMapNodeV2,
-    ) -> Result<AuthenticatedMapLinkV1, SealedAcceptedIndexError> {
-        let left = node
-            .left
-            .take()
-            .ok_or_else(|| corrupt("right rotation has no left child"))?;
-        let mut left_node = self.read_map_node(left)?;
-        node.left = left_node.right.take();
-        left_node.right = Some(self.publish_map_node(&node)?);
-        self.publish_map_node(&left_node)
-    }
-
-    fn rotate_map_left(
-        &mut self,
-        mut node: SealedAuthenticatedMapNodeV2,
-    ) -> Result<AuthenticatedMapLinkV1, SealedAcceptedIndexError> {
-        let right = node
-            .right
-            .take()
-            .ok_or_else(|| corrupt("left rotation has no right child"))?;
-        let mut right_node = self.read_map_node(right)?;
-        node.right = right_node.left.take();
-        right_node.left = Some(self.publish_map_node(&node)?);
-        self.publish_map_node(&right_node)
-    }
-
-    fn read_map_node(
-        &self,
-        link: AuthenticatedMapLinkV1,
-    ) -> Result<SealedAuthenticatedMapNodeV2, SealedAcceptedIndexError> {
-        let bytes = self
-            .store
-            .read_sealed_accepted_object(SealedAcceptedObjectKind::MapNode, link.digest)?
-            .ok_or(SealedAcceptedIndexError::Missing {
-                kind: SealedAcceptedObjectKind::MapNode,
-                address: link.digest,
-            })?;
-        SealedAuthenticatedMapNodeV2::decode(link, &bytes)
-    }
-
-    fn publish_map_node(
-        &mut self,
-        node: &SealedAuthenticatedMapNodeV2,
-    ) -> Result<AuthenticatedMapLinkV1, SealedAcceptedIndexError> {
-        let address = node.logical_digest();
-        let bytes = node.encode()?;
-        self.store.publish_sealed_accepted_object(
-            SealedAcceptedObjectKind::MapNode,
-            address,
-            &bytes,
-        )?;
-        Ok(AuthenticatedMapLinkV1 {
-            key: node.key,
-            digest: address,
-        })
-    }
-
-    fn build_sequence_path(
-        &mut self,
-        height: u8,
-        sequence: u64,
-        leaf_digest: ContentDigest,
-    ) -> Result<ContentDigest, SealedAcceptedIndexError> {
-        if height == 0 {
-            return Ok(leaf_digest);
-        }
-        let child = self.build_sequence_path(height - 1, sequence, leaf_digest)?;
-        self.publish_sequence_node(&AcceptedSequenceNodeV2 {
-            height,
-            first_leaf: sequence,
-            children: vec![AcceptedSequenceChildV2 {
-                first: sequence,
-                last: sequence,
-                digest: child,
-            }],
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn append_sequence_path(
-        &mut self,
-        height: u8,
-        first: u64,
-        address: ContentDigest,
-        sequence: u64,
-        leaf_digest: ContentDigest,
-        depth: usize,
-    ) -> Result<ContentDigest, SealedAcceptedIndexError> {
-        ensure_index_depth(depth)?;
-        if height == 0 {
-            return Err(SealedAcceptedIndexError::Capacity);
-        }
-        let bytes = self
-            .store
-            .read_sealed_accepted_object(SealedAcceptedObjectKind::SequenceNode, address)?
-            .ok_or(SealedAcceptedIndexError::Missing {
-                kind: SealedAcceptedObjectKind::SequenceNode,
-                address,
-            })?;
-        let mut node = AcceptedSequenceNodeV2::decode(height, first, address, &bytes)?;
-        let child_capacity = sequence_capacity(height - 1)?;
-        let relative = sequence
-            .checked_sub(first)
-            .ok_or_else(|| corrupt("sequence append precedes subtree"))?;
-        let child_index: usize = (relative / child_capacity)
-            .try_into()
-            .map_err(|_| SealedAcceptedIndexError::Capacity)?;
-        if child_index > node.children.len() || child_index >= SEALED_ACCEPTED_SEQUENCE_FANOUT {
-            return Err(corrupt("accepted-sequence append is not left-packed"));
-        }
-        if child_index == node.children.len() {
-            let child = self.build_sequence_path(height - 1, sequence, leaf_digest)?;
-            node.children.push(AcceptedSequenceChildV2 {
-                first: sequence,
-                last: sequence,
-                digest: child,
-            });
-        } else {
-            let existing = node.children[child_index];
-            if sequence != existing.last.saturating_add(1) {
-                return Err(corrupt("accepted-sequence child append is not contiguous"));
-            }
-            let digest = if height == 1 {
-                if existing.first != existing.last {
-                    return Err(corrupt("accepted-sequence leaf child has a range"));
-                }
-                leaf_digest
-            } else {
-                self.append_sequence_path(
-                    height - 1,
-                    existing.first,
-                    existing.digest,
-                    sequence,
-                    leaf_digest,
-                    depth + 1,
-                )?
-            };
-            node.children[child_index] = AcceptedSequenceChildV2 {
-                first: existing.first,
-                last: sequence,
-                digest,
-            };
-        }
-        self.publish_sequence_node(&node)
-    }
-
-    fn publish_sequence_node(
-        &mut self,
-        node: &AcceptedSequenceNodeV2,
-    ) -> Result<ContentDigest, SealedAcceptedIndexError> {
-        let bytes = node.encode()?;
-        let digest = node.digest()?;
-        self.store.publish_sealed_accepted_object(
-            SealedAcceptedObjectKind::SequenceNode,
-            digest,
-            &bytes,
-        )?;
-        Ok(digest)
-    }
-}
-
-fn validate_map_root(root: AuthenticatedMapRootV1) -> Result<(), SealedAcceptedIndexError> {
-    if (root.count == 0) != root.root.is_none()
-        || (root.count == 0 && root.root_digest() != authenticated_map_empty_digest())
-    {
-        return Err(corrupt("authenticated-map root count/binding mismatch"));
-    }
-    Ok(())
-}
-
-fn valid_map_children(
-    key: AuthenticatedMapKey,
-    left: Option<&AuthenticatedMapLinkV1>,
-    right: Option<&AuthenticatedMapLinkV1>,
-) -> bool {
-    left.is_none_or(|child| {
-        child.key < key && authenticated_map_priority_order(key, child.key).is_lt()
-    }) && right.is_none_or(|child| {
-        child.key > key && authenticated_map_priority_order(key, child.key).is_lt()
-    })
-}
-
-fn validate_sequence_root(root: AcceptedSequenceRootV2) -> Result<(), SealedAcceptedIndexError> {
-    if (root.len == 0) != root.root_digest.is_none() || (root.len == 0 && root.height != 0) {
-        return Err(corrupt("accepted-sequence root count/binding mismatch"));
-    }
-    if root.len > 0 {
-        let capacity = sequence_capacity(root.height)?;
-        if root.len > capacity
-            || (root.height > 0 && root.len <= sequence_capacity(root.height - 1)?)
-        {
-            return Err(corrupt("accepted-sequence root height is not minimal"));
-        }
-    }
-    Ok(())
-}
-
-fn validate_sequence_node(node: &AcceptedSequenceNodeV2) -> Result<(), SealedAcceptedIndexError> {
-    if node.height == 0
-        || node.first_leaf == 0
-        || node.children.is_empty()
-        || node.children.len() > SEALED_ACCEPTED_SEQUENCE_FANOUT
-        || node.children[0].first != node.first_leaf
-    {
-        return Err(corrupt("accepted-sequence node shape is invalid"));
-    }
-    let child_capacity = sequence_capacity(node.height - 1)?;
-    for (index, child) in node.children.iter().enumerate() {
-        let expected_first = node
-            .first_leaf
-            .checked_add(
-                u64::try_from(index)
-                    .map_err(|_| SealedAcceptedIndexError::Capacity)?
-                    .checked_mul(child_capacity)
-                    .ok_or(SealedAcceptedIndexError::Capacity)?,
-            )
-            .ok_or(SealedAcceptedIndexError::Capacity)?;
-        if child.first != expected_first || child.last < child.first {
-            return Err(corrupt("accepted-sequence children are not left-packed"));
-        }
-        let used = child
-            .last
-            .checked_sub(child.first)
-            .and_then(|span| span.checked_add(1))
-            .ok_or(SealedAcceptedIndexError::Capacity)?;
-        if used > child_capacity || (index + 1 < node.children.len() && used != child_capacity) {
-            return Err(corrupt("accepted-sequence child range is not canonical"));
-        }
-    }
-    Ok(())
+    /// The batch accepted at `sequence`, or `None` when the sealed history does
+    /// not cover it.
+    fn sequence(&self, sequence: u64) -> Result<Option<[u8; 16]>, SealedAcceptedIndexError>;
 }
 
 fn validate_causal_clock(
@@ -1726,24 +750,6 @@ fn validate_causal_clock(
         return Err(corrupt("accepted-causal record clock is not canonical"));
     }
     Ok(())
-}
-
-fn sequence_capacity(height: u8) -> Result<u64, SealedAcceptedIndexError> {
-    let mut capacity = SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY as u64;
-    for _ in 0..height {
-        capacity = capacity
-            .checked_mul(SEALED_ACCEPTED_SEQUENCE_FANOUT as u64)
-            .ok_or(SealedAcceptedIndexError::Capacity)?;
-    }
-    Ok(capacity)
-}
-
-fn ensure_index_depth(depth: usize) -> Result<(), SealedAcceptedIndexError> {
-    if depth >= MAX_ACCEPTED_INDEX_DEPTH {
-        Err(SealedAcceptedIndexError::Capacity)
-    } else {
-        Ok(())
-    }
 }
 
 fn digest_fold(domain: &[u8], fields: &[&[u8]]) -> ContentDigest {
@@ -1775,63 +781,9 @@ fn canonical_decode<T: DeserializeOwned + Serialize>(
 fn corrupt(message: impl Into<String>) -> SealedAcceptedIndexError {
     SealedAcceptedIndexError::Corrupt(message.into())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Clone, Default)]
-    struct MemoryStore {
-        reads: std::cell::Cell<usize>,
-        publications: usize,
-        fail_publication: Option<usize>,
-        objects: Vec<(SealedAcceptedObjectKind, ContentDigest, Vec<u8>)>,
-    }
-
-    impl SealedAcceptedIndexObjectStore for MemoryStore {
-        fn read_sealed_accepted_object(
-            &self,
-            kind: SealedAcceptedObjectKind,
-            address: ContentDigest,
-        ) -> Result<Option<Vec<u8>>, SealedAcceptedIndexError> {
-            self.reads.set(self.reads.get() + 1);
-            Ok(self
-                .objects
-                .iter()
-                .find(|(stored_kind, stored_address, _)| {
-                    *stored_kind == kind && *stored_address == address
-                })
-                .map(|(_, _, bytes)| bytes.clone()))
-        }
-
-        fn publish_sealed_accepted_object(
-            &mut self,
-            kind: SealedAcceptedObjectKind,
-            address: ContentDigest,
-            bytes: &[u8],
-        ) -> Result<(), SealedAcceptedIndexError> {
-            self.publications += 1;
-            if self.fail_publication == Some(self.publications) {
-                return Err(SealedAcceptedIndexError::Store(
-                    "injected publication failure".into(),
-                ));
-            }
-            if let Some((_, _, existing)) =
-                self.objects
-                    .iter()
-                    .find(|(stored_kind, stored_address, _)| {
-                        *stored_kind == kind && *stored_address == address
-                    })
-            {
-                if existing != bytes {
-                    return Err(corrupt("same object address has different bytes"));
-                }
-                return Ok(());
-            }
-            self.objects.push((kind, address, bytes.to_vec()));
-            Ok(())
-        }
-    }
 
     fn digest(byte: u8) -> ContentDigest {
         ContentDigest::from_bytes([byte; 32])
@@ -1904,505 +856,44 @@ mod tests {
         }
     }
 
+    /// The cross-check `SealedBatchRecords::verify` exists for: the causal
+    /// record, the status record, the decoded evidence, the batch id and the
+    /// acceptance sequence must all name the same accepted batch.
+    ///
+    /// This is the whole of what survived the membership PROOF the sealed treap
+    /// used to carry (D-2: private state is not re-authenticated per lookup).
+    /// It is a binding check over records the caller already holds, not a
+    /// Merkle path, and it is cheap enough to run on every covered read.
     #[test]
-    fn persistent_map_upsert_is_order_independent_and_point_readable() {
-        let entries = [
-            (key16(0x10), digest(0xa0)),
-            (key16(0x20), digest(0xb0)),
-            (key16(0x30), digest(0xc0)),
-        ];
-        let expected = authenticated_map_root(&entries).unwrap();
-
-        for order in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
-            let mut store = MemoryStore::default();
-            let mut root = AuthenticatedMapRootV1::empty();
-            {
-                let mut writer = SealedAcceptedIndexWriter::new(&mut store);
-                for index in order {
-                    root = writer
-                        .upsert_map(root, entries[index].0, entries[index].1)
-                        .unwrap();
-                }
-            }
-            assert_eq!(root, expected);
-            let reader = SealedAcceptedIndexReader::new(&store);
-            for (key, value) in entries {
-                assert_eq!(reader.map_value(root, key).unwrap(), Some(value));
-            }
-            assert_eq!(reader.map_value(root, [0xff; 16]).unwrap(), None);
-        }
-    }
-
-    #[test]
-    fn persistent_map_removal_matches_canonical_rebuild_and_preserves_old_roots() {
-        let entries: Vec<_> = (0..97u128)
-            .map(|i| (AuthenticatedMapKey::from(i.to_be_bytes()), digest(i as u8)))
-            .collect();
-        for reverse in [false, true] {
-            let mut store = MemoryStore::default();
-            let mut root = AuthenticatedMapRootV1::empty();
-            for (key, value) in &entries {
-                root = SealedAcceptedIndexWriter::new(&mut store)
-                    .upsert_map(root, *key, *value)
-                    .unwrap();
-            }
-            let original = root;
-            let mut remaining = entries.clone();
-            for step in 0..entries.len() {
-                // Alternating ends and middle exercise leaf, one-child and
-                // two-child removal independently of priority/hash order.
-                let index = if reverse {
-                    remaining.len() / 2
-                } else {
-                    step % remaining.len()
-                };
-                let (key, _) = remaining.remove(index);
-                root = SealedAcceptedIndexWriter::new(&mut store)
-                    .remove_map(root, key)
-                    .unwrap();
-                assert_eq!(root, authenticated_map_root(&remaining).unwrap());
-                let reader = SealedAcceptedIndexReader::new(&store);
-                assert_eq!(reader.map_value(root, key).unwrap(), None);
-                assert_eq!(
-                    reader.map_value(original, key).unwrap(),
-                    entries
-                        .iter()
-                        .find(|(prior, _)| *prior == key)
-                        .map(|(_, value)| *value)
-                );
-            }
-            assert_eq!(root, AuthenticatedMapRootV1::empty());
-            let published = store.objects.len();
-            assert_eq!(
-                SealedAcceptedIndexWriter::new(&mut store)
-                    .remove_map(root, [0xff; 16])
-                    .unwrap(),
-                root
-            );
-            assert_eq!(store.objects.len(), published);
-        }
-    }
-
-    #[test]
-    fn persistent_map_mixed_churn_has_no_tombstones_or_absent_key_writes() {
-        let mut store = MemoryStore::default();
-        let mut root = AuthenticatedMapRootV1::empty();
-        let mut expected = std::collections::BTreeMap::new();
-        let mut random = 12345u64;
-        for step in 0..1024 {
-            random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let key = AuthenticatedMapKey::from(u128::from((random >> 16) % 128).to_be_bytes());
-            if step % 3 == 0 {
-                let absent = expected.remove(&key).is_none();
-                let writes_before = store.objects.len();
-                let prior = root;
-                root = SealedAcceptedIndexWriter::new(&mut store)
-                    .remove_map(root, key)
-                    .unwrap();
-                if absent {
-                    assert_eq!(root, prior);
-                    assert_eq!(store.objects.len(), writes_before);
-                }
-            } else {
-                let value = digest(step as u8);
-                expected.insert(key, value);
-                root = SealedAcceptedIndexWriter::new(&mut store)
-                    .upsert_map(root, key, value)
-                    .unwrap();
-            }
-            let entries: Vec<_> = expected.iter().map(|(key, value)| (*key, *value)).collect();
-            assert_eq!(root, authenticated_map_root(&entries).unwrap());
-        }
-    }
-
-    #[test]
-    fn persistent_map_removal_reads_paths_not_retained_history() {
-        let mut store = MemoryStore::default();
-        let mut root = AuthenticatedMapRootV1::empty();
-        for key in 0..1024u128 {
-            root = SealedAcceptedIndexWriter::new(&mut store)
-                .upsert_map(root, key.to_be_bytes(), digest(key as u8))
-                .unwrap();
-        }
-        // Retain many old roots' nodes. The operation may touch current paths,
-        // but must never enumerate the historical object store or live roster.
-        for key in 1024..1280u128 {
-            let transient = SealedAcceptedIndexWriter::new(&mut store)
-                .upsert_map(root, key.to_be_bytes(), digest(0xaa))
-                .unwrap();
-            assert_eq!(
-                SealedAcceptedIndexWriter::new(&mut store)
-                    .remove_map(transient, key.to_be_bytes())
-                    .unwrap(),
-                root
-            );
-        }
-        store.reads.set(0);
-        store.publications = 0;
-        let removed_key = root.root.unwrap().key; // exercises the subtree join
-        let next = SealedAcceptedIndexWriter::new(&mut store)
-            .remove_map(root, removed_key)
-            .unwrap();
-        assert_eq!(next.count, 1023);
-        assert!(store.reads.get() < 64, "{} point reads", store.reads.get());
-        assert!(
-            store.publications < 64,
-            "{} node writes",
-            store.publications
-        );
-        store.reads.set(0);
-        store.publications = 0;
-        assert_eq!(
-            SealedAcceptedIndexWriter::new(&mut store)
-                .remove_map(next, [0xff; 16])
-                .unwrap(),
-            next
-        );
-        assert!(store.reads.get() < 64);
-        assert_eq!(store.publications, 0);
-    }
-
-    #[test]
-    fn persistent_map_removal_publication_failure_keeps_the_old_root_retryable() {
-        let mut store = MemoryStore::default();
-        let entries: Vec<_> = (0..128u128)
-            .map(|key| (key.to_be_bytes(), digest(key as u8)))
-            .collect();
-        let mut root = AuthenticatedMapRootV1::empty();
-        for (key, value) in &entries {
-            root = SealedAcceptedIndexWriter::new(&mut store)
-                .upsert_map(root, *key, *value)
-                .unwrap();
-        }
-        let key = root.root.unwrap().key;
-        let mut successful = store.clone();
-        successful.publications = 0;
-        let expected = SealedAcceptedIndexWriter::new(&mut successful)
-            .remove_map(root, key)
-            .unwrap();
-        assert!(successful.publications > 1);
-        for failure in 1..=successful.publications {
-            let mut interrupted = store.clone();
-            interrupted.publications = 0;
-            interrupted.fail_publication = Some(failure);
-            assert!(SealedAcceptedIndexWriter::new(&mut interrupted)
-                .remove_map(root, key)
-                .is_err());
-            for (old_key, value) in &entries {
-                assert_eq!(
-                    SealedAcceptedIndexReader::new(&interrupted)
-                        .map_value(root, *old_key)
-                        .unwrap(),
-                    Some(*value)
-                );
-            }
-            interrupted.fail_publication = None;
-            assert_eq!(
-                SealedAcceptedIndexWriter::new(&mut interrupted)
-                    .remove_map(root, key)
-                    .unwrap(),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn persistent_map_removal_rejects_missing_or_corrupt_search_nodes() {
-        let mut store = MemoryStore::default();
-        let root = SealedAcceptedIndexWriter::new(&mut store)
-            .upsert_map(AuthenticatedMapRootV1::empty(), [1; 16], digest(1))
-            .unwrap();
-        let mut missing = MemoryStore::default();
-        assert!(matches!(
-            SealedAcceptedIndexWriter::new(&mut missing).remove_map(root, [1; 16]),
-            Err(SealedAcceptedIndexError::Missing { .. })
-        ));
-        store.objects[0].2[0] ^= 1;
-        assert!(SealedAcceptedIndexWriter::new(&mut store)
-            .remove_map(root, [1; 16])
-            .is_err());
-    }
-
-    #[test]
-    fn sequence_append_crosses_fanout_and_height_boundaries() {
-        let mut store = MemoryStore::default();
-        let mut root = AcceptedSequenceRootV2::empty();
-        {
-            let mut writer = SealedAcceptedIndexWriter::new(&mut store);
-            for sequence in 1..=1025_u64 {
-                root = writer
-                    .append_sequence(
-                        root,
-                        AcceptedSequenceEntryV2 {
-                            sequence,
-                            batch_id: [(sequence % 251) as u8; 16],
-                            accepted_status_value_digest: digest((sequence % 253) as u8),
-                        },
-                    )
-                    .unwrap();
-                let expected_height = match root.len {
-                    0 | 1 => 0,
-                    2..=32 => 1,
-                    33..=1024 => 2,
-                    _ => 3,
-                };
-                assert_eq!(root.height, expected_height);
-            }
-        }
-        assert_eq!(root.len, 1025);
-        let reader = SealedAcceptedIndexReader::new(&store);
-        for sequence in [1, 2, 32, 33, 34, 1024, 1025] {
-            let entry = reader.sequence_entry(root, sequence).unwrap().unwrap();
-            assert_eq!(entry.sequence, sequence);
-            assert_eq!(entry.batch_id, [(sequence % 251) as u8; 16]);
-        }
-        assert_eq!(reader.sequence_entry(root, 0).unwrap(), None);
-        assert_eq!(reader.sequence_entry(root, 1026).unwrap(), None);
-    }
-
-    #[test]
-    fn one_based_sequence_roots_are_frozen_at_growth_boundaries() {
-        let mut store = MemoryStore::default();
-        let mut root = AcceptedSequenceRootV2::empty();
-        let mut roots = Vec::new();
-        {
-            let mut writer = SealedAcceptedIndexWriter::new(&mut store);
-            for sequence in 1..=1025_u64 {
-                root = writer
-                    .append_sequence(
-                        root,
-                        AcceptedSequenceEntryV2 {
-                            sequence,
-                            batch_id: [(sequence % 251) as u8; 16],
-                            accepted_status_value_digest: digest((sequence % 253) as u8),
-                        },
-                    )
-                    .unwrap();
-                if matches!(sequence, 1 | 32 | 33 | 1024 | 1025) {
-                    roots.push((sequence, root.height, root.root_digest.unwrap().to_string()));
-                }
-            }
-        }
-        assert_eq!(
-            roots,
-            vec![
-                (
-                    1,
-                    0,
-                    "26a54cac813394adfb132def56ba1054f46ce1314e4bd1a57d003de08c07bdb1".into()
-                ),
-                (
-                    32,
-                    1,
-                    "2fe1c7e764443227a6acc0641e8d5a6de6b17a8450d145874aa1ae1f85dfdd6c".into()
-                ),
-                (
-                    33,
-                    2,
-                    "c15156bcb38c1317cb34eac5ef1f8033b6c63f82777ca933190e9d93bd563cf4".into()
-                ),
-                (
-                    1024,
-                    2,
-                    "bc937691a47d2ef02488b65437b094632a4e5fb5816f1790e200018a02663250".into()
-                ),
-                (
-                    1025,
-                    3,
-                    "3d6bc3cb03eef88484a27a64dbf134c795843c7b0ab162de69facba4ca079d67".into()
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn full_membership_proof_cross_checks_sequence_status_batch_map_and_causal_record() {
-        let batch = [0x51; 16];
-        let causal = causal(batch);
-        let mut store = MemoryStore::default();
-        let (causal_address, status_record, status_address, batch_root, status_root, sequence_root);
-        {
-            let mut writer = SealedAcceptedIndexWriter::new(&mut store);
-            causal_address = writer.publish_causal(&causal).unwrap();
-            status_record = status(batch, causal_address);
-            status_address = writer.publish_status(&status_record).unwrap();
-            batch_root = writer
-                .upsert_map(AuthenticatedMapRootV1::empty(), batch, causal_address)
-                .unwrap();
-            status_root = writer
-                .upsert_map(AuthenticatedMapRootV1::empty(), batch, status_address)
-                .unwrap();
-            sequence_root = writer
-                .append_sequence(
-                    AcceptedSequenceRootV2::empty(),
-                    AcceptedSequenceEntryV2 {
-                        sequence: 1,
-                        batch_id: batch,
-                        accepted_status_value_digest: status_address,
-                    },
-                )
-                .unwrap();
-        }
-        let proof = SealedAcceptedIndexReader::new(&store)
-            .prove_membership(
-                SealedAcceptedIndexRootsV2 {
-                    batch_map: batch_root,
-                    status_map: status_root,
-                    sequence: sequence_root,
-                },
-                1,
-                batch,
-                &TestEvidenceDecoder,
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(proof.status, status_record);
-        assert_eq!(proof.causal, causal);
-
-        let wrong_status_root = {
-            let mut writer = SealedAcceptedIndexWriter::new(&mut store);
-            writer.upsert_map(status_root, batch, digest(0xfe)).unwrap()
+    fn sealed_batch_records_cross_check_their_evidence_and_sequence() {
+        let batch_id = [0x51; 16];
+        let causal = causal(batch_id);
+        let records = SealedBatchRecords {
+            status: status(batch_id, causal.address().unwrap()),
+            causal: causal.clone(),
         };
-        assert!(SealedAcceptedIndexReader::new(&store)
-            .prove_membership(
-                SealedAcceptedIndexRootsV2 {
-                    batch_map: batch_root,
-                    status_map: wrong_status_root,
-                    sequence: sequence_root,
-                },
-                1,
-                batch,
-                &TestEvidenceDecoder,
-            )
+        records.verify(1, batch_id, &TestEvidenceDecoder).unwrap();
+
+        // Another id, the wrong sequence, a status pointing at a different
+        // causal record, and evidence for a different batch all refuse.
+        assert!(records.verify(1, [0x52; 16], &TestEvidenceDecoder).is_err());
+        assert!(records.verify(2, batch_id, &TestEvidenceDecoder).is_err());
+
+        let mut misbound = records.clone();
+        misbound.status.accepted_causal_record_digest = digest(0x99);
+        assert!(misbound.verify(1, batch_id, &TestEvidenceDecoder).is_err());
+
+        let mut foreign_evidence = records.clone();
+        foreign_evidence.status = status([0x52; 16], causal.address().unwrap());
+        foreign_evidence.status.batch_id = batch_id;
+        assert!(foreign_evidence
+            .verify(1, batch_id, &TestEvidenceDecoder)
             .is_err());
 
-        let evidence_variants = [
-            vec![1, 2, 3],
-            canonical_encode(&TestEvidenceWire {
-                schema: 3,
-                batch_id: batch,
-                manifest_fingerprint: [0x22; 32],
-                event_binding_digest: [0x33; 32],
-                acceptance_sequence: 1,
-            })
-            .unwrap(),
-            canonical_encode(&TestEvidenceWire {
-                schema: 1,
-                batch_id: [0x52; 16],
-                manifest_fingerprint: [0x22; 32],
-                event_binding_digest: [0x33; 32],
-                acceptance_sequence: 1,
-            })
-            .unwrap(),
-            canonical_encode(&TestEvidenceWire {
-                schema: 1,
-                batch_id: batch,
-                manifest_fingerprint: [0x23; 32],
-                event_binding_digest: [0x33; 32],
-                acceptance_sequence: 1,
-            })
-            .unwrap(),
-            canonical_encode(&TestEvidenceWire {
-                schema: 1,
-                batch_id: batch,
-                manifest_fingerprint: [0x22; 32],
-                event_binding_digest: [0x34; 32],
-                acceptance_sequence: 1,
-            })
-            .unwrap(),
-            canonical_encode(&TestEvidenceWire {
-                schema: 1,
-                batch_id: batch,
-                manifest_fingerprint: [0x22; 32],
-                event_binding_digest: [0x33; 32],
-                acceptance_sequence: 2,
-            })
-            .unwrap(),
-        ];
-        for (index, exact_evidence_bytes) in evidence_variants.into_iter().enumerate() {
-            let mut bad = status_record.clone();
-            bad.exact_evidence_bytes = exact_evidence_bytes;
-            if index == 1 {
-                bad.evidence_schema = 3;
-            }
-            let (bad_status_root, bad_sequence_root) = {
-                let mut writer = SealedAcceptedIndexWriter::new(&mut store);
-                let address = writer.publish_status(&bad).unwrap();
-                let status_root = writer
-                    .upsert_map(AuthenticatedMapRootV1::empty(), batch, address)
-                    .unwrap();
-                let sequence_root = writer
-                    .append_sequence(
-                        AcceptedSequenceRootV2::empty(),
-                        AcceptedSequenceEntryV2 {
-                            sequence: 1,
-                            batch_id: batch,
-                            accepted_status_value_digest: address,
-                        },
-                    )
-                    .unwrap();
-                (status_root, sequence_root)
-            };
-            assert!(SealedAcceptedIndexReader::new(&store)
-                .prove_membership(
-                    SealedAcceptedIndexRootsV2 {
-                        batch_map: batch_root,
-                        status_map: bad_status_root,
-                        sequence: bad_sequence_root,
-                    },
-                    1,
-                    batch,
-                    &TestEvidenceDecoder,
-                )
-                .is_err());
-        }
-
-        let sequence_status_mismatch = {
-            let mut writer = SealedAcceptedIndexWriter::new(&mut store);
-            writer
-                .append_sequence(
-                    AcceptedSequenceRootV2::empty(),
-                    AcceptedSequenceEntryV2 {
-                        sequence: 1,
-                        batch_id: batch,
-                        accepted_status_value_digest: digest(0xfd),
-                    },
-                )
-                .unwrap()
-        };
-        assert!(SealedAcceptedIndexReader::new(&store)
-            .prove_membership(
-                SealedAcceptedIndexRootsV2 {
-                    batch_map: batch_root,
-                    status_map: status_root,
-                    sequence: sequence_status_mismatch,
-                },
-                1,
-                batch,
-                &TestEvidenceDecoder,
-            )
-            .is_err());
-
-        let mut other_causal = causal.clone();
-        other_causal.event_binding_digest = digest(0x35);
-        let wrong_batch_root = {
-            let mut writer = SealedAcceptedIndexWriter::new(&mut store);
-            let address = writer.publish_causal(&other_causal).unwrap();
-            writer
-                .upsert_map(AuthenticatedMapRootV1::empty(), batch, address)
-                .unwrap()
-        };
-        assert!(SealedAcceptedIndexReader::new(&store)
-            .prove_membership(
-                SealedAcceptedIndexRootsV2 {
-                    batch_map: wrong_batch_root,
-                    status_map: status_root,
-                    sequence: sequence_root,
-                },
-                1,
-                batch,
-                &TestEvidenceDecoder,
-            )
+        let mut unknown_schema = records;
+        unknown_schema.status.evidence_schema = 7;
+        assert!(unknown_schema
+            .verify(1, batch_id, &TestEvidenceDecoder)
             .is_err());
     }
 
@@ -2426,12 +917,6 @@ mod tests {
         let mut later_dot = causal([0x64; 16]);
         later_dot.canonical_causal_clock[1].counter += 1;
         assert!(later_dot.encode().is_err());
-
-        assert!(ensure_index_depth(MAX_ACCEPTED_INDEX_DEPTH - 1).is_ok());
-        assert_eq!(
-            ensure_index_depth(MAX_ACCEPTED_INDEX_DEPTH),
-            Err(SealedAcceptedIndexError::Capacity)
-        );
     }
 
     fn hex(bytes: &[u8]) -> String {
@@ -2475,7 +960,6 @@ mod tests {
         entries.sort_unstable_by_key(|(key, _)| *key);
         entries
     }
-
     #[test]
     fn authenticated_map_key_validates_length_and_hides_its_padding() {
         assert!(AuthenticatedMapKey::new(&[]).is_err());
@@ -2570,34 +1054,9 @@ mod tests {
         oversized.extend_from_slice(&[0u8; MAX_AUTHENTICATED_MAP_KEY_BYTES + 1]);
         assert!(canonical_decode::<AuthenticatedMapKey>(&oversized, "key").is_err());
 
-        // The same refusal reaches a whole stored map node.
-        let node = SealedAuthenticatedMapNodeV2 {
-            key: tagged_entity_key(0x77),
-            value_digest: digest(0x33),
-            left: None,
-            right: None,
-        };
-        let encoded = node.encode().unwrap();
-        let link = AuthenticatedMapLinkV1 {
-            key: node.key,
-            digest: node.logical_digest(),
-        };
-        assert_eq!(
-            SealedAuthenticatedMapNodeV2::decode(link, &encoded).unwrap(),
-            node
-        );
-        let mut zero_length_key = encoded.clone();
-        let key_offset = zero_length_key
-            .windows(1 + node.key.len())
-            .position(|window| {
-                window[0] as usize == node.key.len() && &window[1..] == node.key.as_slice()
-            })
-            .expect("the encoded node carries its length-prefixed key");
-        zero_length_key[key_offset] = 0;
-        assert!(SealedAuthenticatedMapNodeV2::decode(link, &zero_length_key).is_err());
-        let mut trailing = encoded.clone();
-        trailing.push(0);
-        assert!(SealedAuthenticatedMapNodeV2::decode(link, &trailing).is_err());
+        // The stored map NODE this arm used to decode went with the sealed
+        // treap; the key-level refusals above are what survived it, and they
+        // are the ones the retained `AuthenticatedMapKey` codec owns.
     }
 
     /// The reason the shared node digest length-frames its keys.
@@ -2671,103 +1130,6 @@ mod tests {
     }
 
     #[test]
-    fn full_key_sealed_upserts_match_the_cartesian_root_in_every_insertion_order() {
-        let entries = mixed_width_entries();
-        let expected = authenticated_map_root(&entries).unwrap();
-        assert_eq!(expected.count, entries.len() as u64);
-
-        let orders: [Vec<usize>; 4] = [
-            (0..entries.len()).collect(),
-            (0..entries.len()).rev().collect(),
-            (0..entries.len())
-                .filter(|index| index % 2 == 0)
-                .chain((0..entries.len()).filter(|index| index % 2 == 1))
-                .collect(),
-            vec![4, 0, 8, 2, 6, 1, 7, 3, 5],
-        ];
-        for order in orders {
-            assert_eq!(order.len(), entries.len());
-            let mut store = MemoryStore::default();
-            let mut root = AuthenticatedMapRootV1::empty();
-            for index in &order {
-                root = SealedAcceptedIndexWriter::new(&mut store)
-                    .upsert_map(root, entries[*index].0, entries[*index].1)
-                    .unwrap();
-            }
-            assert_eq!(root, expected, "insertion order {order:?} changed the root");
-
-            // Point lookups resolve every key, including the same-UUID entity
-            // and membership pair and the strict-prefix pair.
-            let reader = SealedAcceptedIndexReader::new(&store);
-            for (key, value) in &entries {
-                assert_eq!(reader.map_value(root, *key).unwrap(), Some(*value));
-            }
-            assert_eq!(
-                reader.map_value(root, tagged_entity_key(0x99)).unwrap(),
-                None
-            );
-        }
-    }
-
-    #[test]
-    fn full_key_removal_reaches_the_shared_empty_root_including_the_last_entry() {
-        let entries = mixed_width_entries();
-        let mut store = MemoryStore::default();
-        let mut root = AuthenticatedMapRootV1::empty();
-        for (key, value) in &entries {
-            root = SealedAcceptedIndexWriter::new(&mut store)
-                .upsert_map(root, *key, *value)
-                .unwrap();
-        }
-
-        let mut remaining = entries.clone();
-        while !remaining.is_empty() {
-            let (key, _) = remaining.remove(remaining.len() / 2);
-            root = SealedAcceptedIndexWriter::new(&mut store)
-                .remove_map(root, key)
-                .unwrap();
-            assert_eq!(root, authenticated_map_root(&remaining).unwrap());
-            assert_eq!(
-                SealedAcceptedIndexReader::new(&store)
-                    .map_value(root, key)
-                    .unwrap(),
-                None
-            );
-        }
-
-        // Removing the last entry lands on the canonical empty root, which is
-        // the pairing the SQLite frontier's empty-shape check accepts.
-        assert_eq!(root, AuthenticatedMapRootV1::empty());
-        assert_eq!(root.count, 0);
-        assert!(root.root.is_none());
-        assert_eq!(root.root_digest(), authenticated_map_empty_digest());
-    }
-
-    #[test]
-    fn sixteen_byte_identity_maps_stay_consistent_across_writer_reader_and_cartesian() {
-        let entries: Vec<_> = (0..64u128)
-            .map(|i| (AuthenticatedMapKey::from(i.to_be_bytes()), digest(i as u8)))
-            .collect();
-        let mut store = MemoryStore::default();
-        let mut root = AuthenticatedMapRootV1::empty();
-        for (key, value) in entries.iter().rev() {
-            root = SealedAcceptedIndexWriter::new(&mut store)
-                .upsert_map(root, *key, *value)
-                .unwrap();
-        }
-        assert_eq!(root, authenticated_map_root(&entries).unwrap());
-
-        // The UUID-typed status seam still reaches the same entries by raw
-        // `[u8; 16]`, with no key type at the call site.
-        let reader = SealedAcceptedIndexReader::new(&store);
-        for (index, (_, value)) in entries.iter().enumerate() {
-            let id = (index as u128).to_be_bytes();
-            assert_eq!(reader.map_value(root, id).unwrap(), Some(*value));
-        }
-        assert_eq!(reader.map_value(root, [0xff; 16]).unwrap(), None);
-    }
-
-    #[test]
     fn v1_and_v2_golden_vectors_are_frozen() {
         let key = key16(0x11);
         let priority = authenticated_map_priority(key).to_string();
@@ -2787,25 +1149,6 @@ mod tests {
         let status = status([0x51; 16], causal.address().unwrap());
         let status_bytes = hex(&status.encode().unwrap());
         let status_digest = status.value_digest().to_string();
-        let leaf = AcceptedSequenceEntryV2 {
-            sequence: 0x0102_0304_0506_0708,
-            batch_id: [0x51; 16],
-            accepted_status_value_digest: status.value_digest(),
-        };
-        let leaf_bytes = hex(&leaf.encode_leaf().unwrap());
-        let leaf_digest = leaf.leaf_digest().unwrap().to_string();
-        let node_bytes = hex(&AcceptedSequenceNodeV2 {
-            height: 1,
-            first_leaf: 1,
-            children: vec![AcceptedSequenceChildV2 {
-                first: 1,
-                last: 1,
-                digest: leaf.leaf_digest().unwrap(),
-            }],
-        }
-        .encode()
-        .unwrap());
-
         assert_eq!(
             priority,
             "b04c72e061f87a6d015f69242d917fc0cddc0699b320805e33e92dabe097e7ad"
@@ -2836,11 +1179,8 @@ mod tests {
             status_digest,
             "5b90c90985efd08eab2a6d661130d320ff6013d996dff26e7f9af03e2916fa66"
         );
-        assert_eq!(leaf_bytes, "020102030405060708515151515151515151515151515151515b90c90985efd08eab2a6d661130d320ff6013d996dff26e7f9af03e2916fa66");
-        assert_eq!(
-            leaf_digest,
-            "5a1261cf99c25091749f7ecf0095f0a9872bb6c3bf57cd69506d613a4a667701"
-        );
-        assert_eq!(node_bytes, "0201000000000000000101000000000000000100000000000000015a1261cf99c25091749f7ecf0095f0a9872bb6c3bf57cd69506d613a4a667701");
+        // The sequence-tree leaf and node vectors went with the tree. The
+        // sealed sequence index is a sorted table now, and its frozen bytes are
+        // `sealed_tables_impl`'s golden vector.
     }
 }

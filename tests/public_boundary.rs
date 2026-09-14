@@ -16,9 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 use tine_storage::formats::{self, FormatKind, FormatValue};
-use tine_storage::sealed_accepted_index::{
-    authenticated_map_empty_digest, AcceptedSequenceRootV2, AcceptedStatusRecordV2,
-};
+use tine_storage::sealed_accepted_index::{authenticated_map_empty_digest, AcceptedStatusRecordV2};
 use tine_storage::sqlite::{
     MaterializationError, PhysicalBlockStructureRow, PhysicalCheckpointFrontierRoot,
     PhysicalCheckpointGenerationBinding, PhysicalFrontierRoot, PhysicalGraphProjectionChange,
@@ -138,9 +136,25 @@ fn immutable_package_protocol_is_usable_from_the_public_api() {
 
 #[test]
 fn sealed_accepted_index_codecs_are_usable_from_outside_the_crate() {
-    let empty = AcceptedSequenceRootV2::empty();
+    use tine_storage::sealed_tables::{
+        SealedTableRoot, TableBuilder, TableView, SEALED_SEQUENCE_DOMAIN,
+    };
+
+    // The sealed sequence index is a sorted table, and a consumer outside the
+    // crate can build one, read it back, and address it by its root.
+    let mut builder = TableBuilder::new(SEALED_SEQUENCE_DOMAIN);
+    builder.insert(&7u64.to_be_bytes(), &[3; 16]).unwrap();
+    let bytes = builder.finish().unwrap();
+    let table = TableView::decode(SEALED_SEQUENCE_DOMAIN, &bytes).unwrap();
+    assert_eq!(table.len(), 1);
+    assert_eq!(table.get(&7u64.to_be_bytes()), Some(&[3; 16][..]));
+    assert_eq!(table.get(&8u64.to_be_bytes()), None);
+
+    let empty = SealedTableRoot {
+        domains: Vec::new(),
+    };
     assert_eq!(
-        AcceptedSequenceRootV2::decode(&empty.encode().unwrap()).unwrap(),
+        SealedTableRoot::decode(&empty.encode().unwrap()).unwrap(),
         empty
     );
 
@@ -165,6 +179,8 @@ fn sealed_accepted_index_codecs_are_usable_from_outside_the_crate() {
 
 #[test]
 fn live_and_checkpoint_frontiers_are_explicit_and_publicly_typed() {
+    use tine_storage::sealed_tables::sealed_empty_root_digest;
+
     let empty = ContentDigest::of(b"empty");
     let live = PhysicalFrontierRoot {
         canonical_bytes: vec![1],
@@ -174,6 +190,7 @@ fn live_and_checkpoint_frontiers_are_explicit_and_publicly_typed() {
         document_map_root_digest: empty,
         batch_map_root_key: None,
         batch_map_root_digest: empty,
+        anchor: None,
         state_digest: empty,
     };
     assert_eq!(live.digest(), ContentDigest::of(&[1]));
@@ -187,14 +204,7 @@ fn live_and_checkpoint_frontiers_are_explicit_and_publicly_typed() {
         covered_block_count: 0,
         covered_retained_bytes_total: 0,
         covered_semantic_capsules_root_digest: empty,
-        covered_batch_root_key: None,
-        covered_batch_root_digest: empty,
-        covered_status_root_key: None,
-        covered_status_root_digest: empty,
-        covered_sequence_root_digest: None,
-        covered_sequence_height: 0,
-        covered_causal_tip_root_key: None,
-        covered_causal_tip_root_digest: empty,
+        sealed_root_digest: sealed_empty_root_digest(),
         covered_head_facts_root_digest: empty,
         current_projection_payload_pins_root_digest: empty,
         nonlinear_state_root_digest: empty,
@@ -210,13 +220,6 @@ fn live_and_checkpoint_frontiers_are_explicit_and_publicly_typed() {
         document_map_root_digest: empty,
         batch_map_root_key: None,
         batch_map_root_digest: empty,
-        batch_map_count: 0,
-        status_map_root_key: None,
-        status_map_root_digest: empty,
-        status_map_count: 0,
-        sequence_root_digest: None,
-        sequence_height: 0,
-        sequence_count: 0,
         generation,
         state_digest: empty,
     };
@@ -318,7 +321,7 @@ fn a_receipt_can_be_generated_from_the_public_manifest() {
 #[test]
 fn format_constants_are_reachable_through_formats() {
     assert!(formats::MAX_OBJECT_BYTES > 0);
-    assert_eq!(formats::SQLITE_SCHEMA_VERSION, 28);
+    assert_eq!(formats::SQLITE_SCHEMA_VERSION, 29);
     assert_eq!(formats::MAX_AUTHENTICATED_MAP_KEY_BYTES, 48);
     assert_eq!(formats::LOCAL_JOURNAL_SEGMENT_PROTOCOL_VERSION, 2);
     assert_eq!(formats::LOCAL_JOURNAL_SEGMENT_HEADER_BYTES, 136);
@@ -450,56 +453,72 @@ fn the_api_surface_is_enumerable_by_a_consumer() {
     );
 }
 
+/// A consumer can build and read a sealed sorted table without `test-support`,
+/// supplying its own byte provider: the crate names tables by opaque locator
+/// and never touches a file, so the container stays the consumer's business.
 #[test]
-fn persistent_map_removal_is_available_without_test_support() {
+fn sealed_sorted_tables_are_usable_without_test_support() {
+    use std::borrow::Cow;
     use std::collections::BTreeMap;
-    use tine_storage::sealed_accepted_index::{
-        AuthenticatedMapRootV1, SealedAcceptedIndexError, SealedAcceptedIndexObjectStore,
-        SealedAcceptedIndexReader, SealedAcceptedIndexWriter, SealedAcceptedObjectKind,
+    use tine_storage::sealed_accepted_index::SealedAcceptedIndexError;
+    use tine_storage::sealed_tables::{
+        merge_tables, TableBuilder, TableBytes, TableLocator, TableRef, TableSetReader, TableView,
+        SEALED_BATCH_DOMAIN,
     };
+
     #[derive(Default)]
-    struct MapObjects(BTreeMap<ContentDigest, Vec<u8>>);
-    impl SealedAcceptedIndexObjectStore for MapObjects {
-        fn read_sealed_accepted_object(
-            &self,
-            kind: SealedAcceptedObjectKind,
-            address: ContentDigest,
-        ) -> Result<Option<Vec<u8>>, SealedAcceptedIndexError> {
-            assert_eq!(kind, SealedAcceptedObjectKind::MapNode);
-            Ok(self.0.get(&address).cloned())
-        }
-        fn publish_sealed_accepted_object(
-            &mut self,
-            kind: SealedAcceptedObjectKind,
-            address: ContentDigest,
-            bytes: &[u8],
-        ) -> Result<(), SealedAcceptedIndexError> {
-            assert_eq!(kind, SealedAcceptedObjectKind::MapNode);
-            self.0.insert(address, bytes.to_vec());
-            Ok(())
+    struct TableStore(BTreeMap<[u8; 32], Vec<u8>>);
+    impl TableBytes for TableStore {
+        fn read_table<'a>(
+            &'a self,
+            locator: &TableLocator,
+        ) -> Result<Cow<'a, [u8]>, SealedAcceptedIndexError> {
+            Ok(Cow::Borrowed(
+                self.0
+                    .get(&locator.0)
+                    .expect("the table is present")
+                    .as_slice(),
+            ))
         }
     }
-    let mut store = MapObjects::default();
-    let value = ContentDigest::of(b"retained logical record");
-    let root = SealedAcceptedIndexWriter::new(&mut store)
-        .upsert_map(AuthenticatedMapRootV1::empty(), [1; 16], value)
-        .unwrap();
-    let removed = SealedAcceptedIndexWriter::new(&mut store)
-        .remove_map(root, [1; 16])
-        .unwrap();
-    assert_eq!(removed, AuthenticatedMapRootV1::empty());
-    assert_eq!(
-        SealedAcceptedIndexReader::new(&store)
-            .map_value(root, [1; 16])
-            .unwrap(),
-        Some(value)
-    );
-    assert_eq!(
-        SealedAcceptedIndexReader::new(&store)
-            .map_value(removed, [1; 16])
-            .unwrap(),
-        None
-    );
+
+    let mut store = TableStore::default();
+    let mut tables = Vec::new();
+    for (level, (key, value)) in [([1u8; 16], [0xaa_u8; 64]), ([2u8; 16], [0xbb_u8; 64])]
+        .into_iter()
+        .enumerate()
+    {
+        let mut builder = TableBuilder::new(SEALED_BATCH_DOMAIN);
+        builder.insert(&key, &value).unwrap();
+        let bytes = builder.finish().unwrap();
+        let locator = TableLocator(*ContentDigest::of(&bytes).as_bytes());
+        store.0.insert(locator.0, bytes);
+        tables.push(TableRef {
+            locator,
+            level: level as u8,
+            count: 1,
+        });
+    }
+
+    let reader = TableSetReader::new(&store, SEALED_BATCH_DOMAIN, tables.clone()).unwrap();
+    assert_eq!(reader.get(&[1u8; 16]).unwrap(), Some(vec![0xaa; 64]));
+    assert_eq!(reader.get(&[2u8; 16]).unwrap(), Some(vec![0xbb; 64]));
+    assert_eq!(reader.get(&[3u8; 16]).unwrap(), None);
+
+    // And the same two tables compact into one, without the crate naming a file.
+    let first = store.0.get(&tables[0].locator.0).unwrap().clone();
+    let second = store.0.get(&tables[1].locator.0).unwrap().clone();
+    let merged = merge_tables(
+        SEALED_BATCH_DOMAIN,
+        &[
+            TableView::decode(SEALED_BATCH_DOMAIN, &first).unwrap(),
+            TableView::decode(SEALED_BATCH_DOMAIN, &second).unwrap(),
+        ],
+    )
+    .unwrap();
+    let merged = TableView::decode(SEALED_BATCH_DOMAIN, &merged).unwrap();
+    assert_eq!(merged.len(), 2);
+    assert_eq!(merged.get(&[2u8; 16]), Some(&[0xbb_u8; 64][..]));
 }
 
 /// The authenticated map is domain-blind at the public boundary: a consumer
@@ -507,34 +526,8 @@ fn persistent_map_removal_is_available_without_test_support() {
 /// crate's own callers get, with no key type of the crate's invention.
 #[test]
 fn a_consumer_can_key_the_shared_map_by_its_own_tagged_document_keys() {
-    use std::collections::BTreeMap;
     use tine_storage::formats::MAX_AUTHENTICATED_MAP_KEY_BYTES;
-    use tine_storage::sealed_accepted_index::{
-        authenticated_map_root, AuthenticatedMapKey, AuthenticatedMapRootV1,
-        SealedAcceptedIndexError, SealedAcceptedIndexObjectStore, SealedAcceptedIndexReader,
-        SealedAcceptedIndexWriter, SealedAcceptedObjectKind,
-    };
-
-    #[derive(Default)]
-    struct MapObjects(BTreeMap<ContentDigest, Vec<u8>>);
-    impl SealedAcceptedIndexObjectStore for MapObjects {
-        fn read_sealed_accepted_object(
-            &self,
-            _kind: SealedAcceptedObjectKind,
-            address: ContentDigest,
-        ) -> Result<Option<Vec<u8>>, SealedAcceptedIndexError> {
-            Ok(self.0.get(&address).cloned())
-        }
-        fn publish_sealed_accepted_object(
-            &mut self,
-            _kind: SealedAcceptedObjectKind,
-            address: ContentDigest,
-            bytes: &[u8],
-        ) -> Result<(), SealedAcceptedIndexError> {
-            self.0.insert(address, bytes.to_vec());
-            Ok(())
-        }
-    }
+    use tine_storage::sealed_accepted_index::{authenticated_map_root, AuthenticatedMapKey};
 
     // The consumer's own key space: a 17-byte entity key and a 33-byte
     // membership key that share the same leading UUID.
@@ -558,26 +551,14 @@ fn a_consumer_can_key_the_shared_map_by_its_own_tagged_document_keys() {
     assert!(AuthenticatedMapKey::new(&[]).is_err());
     assert!(AuthenticatedMapKey::new(&[0; MAX_AUTHENTICATED_MAP_KEY_BYTES + 1]).is_err());
 
+    // The root is order-independent and keyed by the consumer's own bytes.
     let entity_value = ContentDigest::of(b"entity dependencies");
     let membership_value = ContentDigest::of(b"membership dependencies");
-    let mut store = MapObjects::default();
-    let mut root = AuthenticatedMapRootV1::empty();
-    for (key, value) in [(membership, membership_value), (entity, entity_value)] {
-        root = SealedAcceptedIndexWriter::new(&mut store)
-            .upsert_map(root, key, value)
-            .unwrap();
-    }
-    assert_eq!(
-        root,
-        authenticated_map_root(&[(entity, entity_value), (membership, membership_value)]).unwrap()
-    );
-
-    let reader = SealedAcceptedIndexReader::new(&store);
-    assert_eq!(reader.map_value(root, entity).unwrap(), Some(entity_value));
-    assert_eq!(
-        reader.map_value(root, membership).unwrap(),
-        Some(membership_value)
-    );
+    let root =
+        authenticated_map_root(&[(entity, entity_value), (membership, membership_value)]).unwrap();
+    assert_eq!(root.count, 2);
+    assert_eq!(root.root.map(|link| link.key).is_some(), true);
+    assert_ne!(root.root_digest(), authenticated_map_empty_digest());
 }
 
 #[test]

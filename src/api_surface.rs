@@ -212,9 +212,13 @@ pub fn exported_names() -> Vec<ExportedName> {
 
     let sqlite_body = inline_module_body(LIB_RS, "sqlite");
     let sealed_body = inline_module_body(LIB_RS, "sealed_accepted_index");
-    // The root region is lib.rs with both public facade bodies removed, so an
-    // export inside either module is not counted twice.
-    let root_region = LIB_RS.replace(sqlite_body, "").replace(sealed_body, "");
+    let tables_body = inline_module_body(LIB_RS, "sealed_tables");
+    // The root region is lib.rs with every public facade body removed, so an
+    // export inside one of them is not counted twice.
+    let root_region = LIB_RS
+        .replace(sqlite_body, "")
+        .replace(sealed_body, "")
+        .replace(tables_body, "");
 
     let mut names = Vec::new();
     names.extend(parse_exports(ExportPath::Root, &root_region));
@@ -231,7 +235,13 @@ pub fn exported_names() -> Vec<ExportedName> {
     ));
 
     // The public modules are themselves public paths.
-    for module in ["api_surface", "formats", "sealed_accepted_index", "sqlite"] {
+    for module in [
+        "api_surface",
+        "formats",
+        "sealed_accepted_index",
+        "sealed_tables",
+        "sqlite",
+    ] {
         names.push(ExportedName {
             path: ExportPath::Root,
             name: module.to_string(),
@@ -249,6 +259,7 @@ pub fn render() -> String {
     let names = exported_names();
     const LIB_RS: &str = include_str!("lib.rs");
     let sealed_body = inline_module_body(LIB_RS, "sealed_accepted_index");
+    let tables_body = inline_module_body(LIB_RS, "sealed_tables");
 
     // `ExportPath` predates nested facades and is a public exhaustive enum.
     // Extending it would turn every new facade into a breaking API change.
@@ -267,9 +278,19 @@ pub fn render() -> String {
             name.test_support_only,
         )
     }));
+    let mut table_names = parse_exports(ExportPath::Root, tables_body);
+    table_names.sort();
+    table_names.dedup();
+    rows.extend(table_names.into_iter().map(|name| {
+        (
+            format!("tine_storage::sealed_tables::{}", name.name),
+            name.test_support_only,
+        )
+    }));
     // `exported_names` is already in the historical ExportPath order. Append
-    // the new nested facade as its own final group, matching that established
-    // inventory layout without changing the public enum that defines it.
+    // the new nested facades as their own final groups, matching that
+    // established inventory layout without changing the public enum that
+    // defines it.
 
     let production = rows.iter().filter(|(_, gated)| !gated).count();
     let gated = rows.len() - production;

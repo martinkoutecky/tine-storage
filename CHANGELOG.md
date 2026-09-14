@@ -5,6 +5,94 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.23.0] - 2026-09-14
+
+### Added
+
+- `tine_storage::sealed_tables`: immutable sorted tables as the sealed
+  accepted-history index. A table is a 24-byte header (`TINETBL1`, schema,
+  domain, key/value widths, count), fixed-width sorted entries, a fence array
+  holding every 64th key as a block boundary, and a trailing SHA-256 of
+  everything before it. `TableBuilder` writes one, `TableView` decodes and
+  digest-verifies it exactly once, `TableSetReader` answers `get`, `contains`
+  and `predecessor` (a floor, inclusive of the key) over a levelled list,
+  `merge_tables`/`compact_tables` combine tables, and `TierPlan` plans
+  size-tiered compaction at fanout 8. Tables are named by opaque
+  `TableLocator` and their bytes arrive through the caller-implemented
+  `TableBytes` trait: the crate never names a file, directory or marker.
+- `SealedTableRoot` (`TINEROT1`, schema 1) records a domain's table list and
+  digests it; `sealed_empty_root_digest()` is the distinguished "nothing is
+  covered" value the checkpoint anchor shape-checks against.
+- `PhysicalSealedAnchor` and `PhysicalFrontierRoot::anchor` make the two-tier
+  split explicit, with `covered_sequence()`, `tail_count()` and
+  `accepted_history_digest()`.
+- `sqlite::sequence_batch_id`: the sequence-to-batch reverse lookup, hot treap
+  first and sealed tables below the covered floor.
+
+  Unit cost: 104.40 B per accepted batch at 50,000 batches (80.26 B in the
+  batch domain, 24.14 B in the sequence domain), against 105.62 B at 1,000 and
+  216 B at 1 -- the fixed per-table header and digest amortizing away, with no
+  term that grows with history. One block edit writes one 136-byte level-0
+  table plus, on the cuts that compact, one merged table; 50,000 cuts write
+  25.76 MB in total against 4.01 MB retained (6.42x), where the retired treaps
+  wrote about 0.9 MB per single-block edit. Measured by
+  `sealed_tables_impl::tests::one_batch_costs_a_bounded_number_of_sealed_bytes`
+  and `fifty_thousand_cuts_stay_inside_the_tier_bound`.
+
+### Changed
+
+- `SealedAcceptedIndexRead` is a POINT-LOOKUP seam, not a node seam:
+  `batch(batch_id) -> Option<SealedBatchRecords>` and
+  `sequence(sequence) -> Option<[u8; 16]>` replace `sealed_map_node` and
+  `sealed_causal_record`. One covered lookup costs exactly one consult,
+  whatever the history size, and a hot lookup costs none.
+- `PhysicalCheckpointGenerationBinding` replaces the eight fields
+  `covered_batch_root_key`, `covered_batch_root_digest`,
+  `covered_status_root_key`, `covered_status_root_digest`,
+  `covered_sequence_root_digest`, `covered_sequence_height`,
+  `covered_causal_tip_root_key` and `covered_causal_tip_root_digest` with a
+  single `sealed_root_digest`.
+- `PhysicalCheckpointFrontierRoot` replaces `batch_map_count`,
+  `status_map_root_key`, `status_map_root_digest`, `status_map_count`,
+  `sequence_root_digest`, `sequence_height` and `sequence_count` with nothing:
+  the checkpoint root now carries only `batch_map_root_key` and
+  `batch_map_root_digest`, and the sealed half is named by the generation's
+  `sealed_root_digest`.
+- The `checkpoint_generation_anchor` table drops its eight `covered_*` root
+  columns for one `sealed_root_digest BLOB NOT NULL`; SQLite schema 28 -> 29.
+- `validate_root_shape` compares the batch treap's root link with
+  `tail_count()` rather than `acceptance_sequence`: on an anchored root the
+  covered prefix is not a treap node.
+- `upsert_batch_map`, `rotate_batch_right` and `rotate_batch_left` no longer
+  take a sealed reader. Insertion is hot-only; covered batches are never treap
+  nodes.
+- An anchored frontier offered to the live (readerless) apply path is refused
+  with `InvalidInput("an anchored frontier needs its sealed accepted index to
+  resolve covered batches")`, naming its in-scope scenario, instead of being
+  reported as corruption (I-8).
+
+### Removed
+
+- The sealed authenticated treap and the fanout-32 sequence tree, with
+  `SealedAcceptedIndexWriter`, `SealedAcceptedIndexReader`,
+  `SealedAcceptedIndexObjectStore`, `SealedAcceptedIndexRootsV2`,
+  `SealedAuthenticatedMapNodeV2`, `SealedAcceptedMembershipProofV2`,
+  `AcceptedSequenceRootV2`, `AcceptedSequenceNodeV2`, `AcceptedSequenceChildV2`,
+  `AcceptedSequenceEntryV2`, `MAX_ACCEPTED_INDEX_DEPTH`, and the
+  `SealedAcceptedObjectKind::{MapNode, SequenceLeaf, SequenceNode}` variants
+  (replaced by `Table`).
+- The `formats` constants `SEALED_ACCEPTED_INDEX_SCHEMA_VERSION`,
+  `SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION`,
+  `SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION`, `SEALED_ACCEPTED_SEQUENCE_FANOUT`
+  and `SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY`, replaced by
+  `SEALED_TABLE_SCHEMA_VERSION`, `SEALED_TABLE_FENCE_INTERVAL`,
+  `SEALED_TABLE_TIER_FANOUT` and `SEALED_ROOT_SCHEMA_VERSION`.
+
+  Managed Storage is blank slate until 0.7 (D-1): there is no reader for the
+  retired encoding, no dual-read path and no migration. Unrecognized pre-0.23.0
+  sealed state is preserved as a backup and the store is rebuilt from the
+  untouched Markdown/Org tree.
+
 ## [0.22.0] - 2026-09-12
 
 ### Fixed

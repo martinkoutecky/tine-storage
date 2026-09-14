@@ -46,10 +46,7 @@ pub use crate::local_journal_v2::{
     LOCAL_JOURNAL_SEGMENT_V2_MAGIC,
 };
 pub use crate::sealed_accepted_index_impl::{
-    SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION, SEALED_ACCEPTED_INDEX_SCHEMA_VERSION,
-    SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION, SEALED_ACCEPTED_SEQUENCE_FANOUT,
-    SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY, SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION,
-    SEALED_ACCEPTED_STATUS_SCHEMA_VERSION,
+    SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION, SEALED_ACCEPTED_STATUS_SCHEMA_VERSION,
 };
 pub use crate::sqlite_frontier::{SQLITE_APPLICATION_ID, SQLITE_SCHEMA_VERSION};
 
@@ -153,6 +150,33 @@ const fn name_of(
     }
 }
 
+/// The sealed sorted-table codec generation.
+///
+/// A table is `{magic "TINETBL1", schema, domain, key_len, value_len, reserved,
+/// count}` then fixed-width sorted entries, then a fence key every
+/// [`SEALED_TABLE_FENCE_INTERVAL`] entries, then `sha256` of everything before
+/// it. This replaces the retired sealed treap/sequence-tree codecs; under D-1
+/// there is no reader for those bytes any more.
+pub const SEALED_TABLE_SCHEMA_VERSION: u32 = 1;
+
+/// How many entries one fence key spans.
+///
+/// Fence `i` is the first key of block `i+1`, so a table of at most one block
+/// carries no fence array at all -- which is what keeps a one-entry level-0
+/// delta at 136 bytes, and level-0 deltas are the per-edit index cost.
+pub const SEALED_TABLE_FENCE_INTERVAL: usize = 64;
+
+/// Size-tiered compaction fanout: a level holding this many tables merges into
+/// the next level.
+///
+/// A format constant rather than a tuning knob: it fixes how many tables a
+/// reader may have to consult per level, which is part of what a root means.
+pub const SEALED_TABLE_TIER_FANOUT: usize = 8;
+
+/// The sealed root record generation: `{magic "TINEROT1", schema, domains}`,
+/// each domain an ordered list of `(level, count, 32-byte locator)`.
+pub const SEALED_ROOT_SCHEMA_VERSION: u32 = 1;
+
 /// Every persistent-format constant this crate commits to, for mechanical
 /// inclusion in a storage release receipt or a Tine storage pin receipt.
 ///
@@ -216,34 +240,28 @@ pub const FORMAT_MANIFEST: &[FormatConstant] = &[
         SQLITE_SCHEMA_VERSION as u64,
     ),
     num(
-        "SEALED_ACCEPTED_INDEX_SCHEMA_VERSION",
-        "sealed accepted-index family",
-        FormatKind::Identity,
-        SEALED_ACCEPTED_INDEX_SCHEMA_VERSION as u64,
-    ),
-    num(
-        "SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION",
-        "sealed accepted-map node",
-        FormatKind::Identity,
-        SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION as u64,
-    ),
-    num(
         "SEALED_ACCEPTED_STATUS_SCHEMA_VERSION",
         "sealed accepted-status record",
         FormatKind::Identity,
         SEALED_ACCEPTED_STATUS_SCHEMA_VERSION as u64,
     ),
     num(
-        "SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION",
-        "sealed accepted-sequence tree",
-        FormatKind::Identity,
-        SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION as u64,
-    ),
-    num(
         "SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION",
         "sealed accepted-causal record",
         FormatKind::Identity,
         SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION as u64,
+    ),
+    num(
+        "SEALED_TABLE_SCHEMA_VERSION",
+        "sealed sorted table",
+        FormatKind::Identity,
+        SEALED_TABLE_SCHEMA_VERSION as u64,
+    ),
+    num(
+        "SEALED_ROOT_SCHEMA_VERSION",
+        "sealed table root record",
+        FormatKind::Identity,
+        SEALED_ROOT_SCHEMA_VERSION as u64,
     ),
     // layout
     num(
@@ -265,16 +283,16 @@ pub const FORMAT_MANIFEST: &[FormatConstant] = &[
         LOCAL_JOURNAL_FRONTIER_SUFFIX,
     ),
     num(
-        "SEALED_ACCEPTED_SEQUENCE_FANOUT",
-        "sealed accepted-sequence tree",
+        "SEALED_TABLE_FENCE_INTERVAL",
+        "sealed sorted table",
         FormatKind::Layout,
-        SEALED_ACCEPTED_SEQUENCE_FANOUT as u64,
+        SEALED_TABLE_FENCE_INTERVAL as u64,
     ),
     num(
-        "SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY",
-        "sealed accepted-sequence tree",
+        "SEALED_TABLE_TIER_FANOUT",
+        "sealed sorted table",
         FormatKind::Layout,
-        SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY as u64,
+        SEALED_TABLE_TIER_FANOUT as u64,
     ),
     // Managed-storage path grammar. These rows are an ownership/certification
     // migration only: every value is frozen to the preceding Tine-owned
@@ -721,18 +739,17 @@ mod tests {
         assert_eq!(LOCAL_JOURNAL_SEGMENT_V2_MAGIC, "TINEJNL2");
         assert_eq!(LOCAL_JOURNAL_FRONTIER_V2_MAGIC, "TINEFRT2");
         assert_eq!(SQLITE_APPLICATION_ID, 0x5449_4e45);
-        assert_eq!(SQLITE_SCHEMA_VERSION, 28);
-        assert_eq!(SEALED_ACCEPTED_INDEX_SCHEMA_VERSION, 3);
-        assert_eq!(SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION, 3);
+        assert_eq!(SQLITE_SCHEMA_VERSION, 29);
         assert_eq!(SEALED_ACCEPTED_STATUS_SCHEMA_VERSION, 2);
-        assert_eq!(SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION, 2);
         assert_eq!(SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION, 2);
+        assert_eq!(SEALED_TABLE_SCHEMA_VERSION, 1);
+        assert_eq!(SEALED_ROOT_SCHEMA_VERSION, 1);
 
         assert_eq!(LOCAL_JOURNAL_SEGMENT_HEADER_BYTES, 136);
         assert_eq!(LOCAL_JOURNAL_FRONTIER_BYTES, 240);
         assert_eq!(LOCAL_JOURNAL_FRONTIER_SUFFIX, ".frontier-v2");
-        assert_eq!(SEALED_ACCEPTED_SEQUENCE_FANOUT, 32);
-        assert_eq!(SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY, 1);
+        assert_eq!(SEALED_TABLE_FENCE_INTERVAL, 64);
+        assert_eq!(SEALED_TABLE_TIER_FANOUT, 8);
 
         assert_eq!(MAX_AUTHENTICATED_MAP_KEY_BYTES, 48);
         assert_eq!(MAX_MANIFEST_BYTES, 1024 * 1024);
@@ -790,24 +807,20 @@ mod tests {
                 FormatValue::Number(SQLITE_SCHEMA_VERSION as u64),
             ),
             (
-                "SEALED_ACCEPTED_INDEX_SCHEMA_VERSION",
-                FormatValue::Number(SEALED_ACCEPTED_INDEX_SCHEMA_VERSION as u64),
-            ),
-            (
-                "SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION",
-                FormatValue::Number(SEALED_ACCEPTED_MAP_NODE_SCHEMA_VERSION as u64),
-            ),
-            (
                 "SEALED_ACCEPTED_STATUS_SCHEMA_VERSION",
                 FormatValue::Number(SEALED_ACCEPTED_STATUS_SCHEMA_VERSION as u64),
             ),
             (
-                "SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION",
-                FormatValue::Number(SEALED_ACCEPTED_SEQUENCE_SCHEMA_VERSION as u64),
-            ),
-            (
                 "SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION",
                 FormatValue::Number(SEALED_ACCEPTED_CAUSAL_RECORD_SCHEMA_VERSION as u64),
+            ),
+            (
+                "SEALED_TABLE_SCHEMA_VERSION",
+                FormatValue::Number(SEALED_TABLE_SCHEMA_VERSION as u64),
+            ),
+            (
+                "SEALED_ROOT_SCHEMA_VERSION",
+                FormatValue::Number(SEALED_ROOT_SCHEMA_VERSION as u64),
             ),
             (
                 "LOCAL_JOURNAL_SEGMENT_HEADER_BYTES",
@@ -822,12 +835,12 @@ mod tests {
                 FormatValue::Name(LOCAL_JOURNAL_FRONTIER_SUFFIX),
             ),
             (
-                "SEALED_ACCEPTED_SEQUENCE_FANOUT",
-                FormatValue::Number(SEALED_ACCEPTED_SEQUENCE_FANOUT as u64),
+                "SEALED_TABLE_FENCE_INTERVAL",
+                FormatValue::Number(SEALED_TABLE_FENCE_INTERVAL as u64),
             ),
             (
-                "SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY",
-                FormatValue::Number(SEALED_ACCEPTED_SEQUENCE_LEAF_CAPACITY as u64),
+                "SEALED_TABLE_TIER_FANOUT",
+                FormatValue::Number(SEALED_TABLE_TIER_FANOUT as u64),
             ),
             (
                 "MAX_AUTHENTICATED_MAP_KEY_BYTES",
@@ -912,7 +925,7 @@ mod tests {
         assert_eq!(actual, expected, "managed-storage path vocabulary drifted");
         assert_eq!(
             FORMAT_MANIFEST.len(),
-            29 + expected.len(),
+            28 + expected.len(),
             "a format row was added outside the pinned base or managed-layout inventories",
         );
     }

@@ -15,15 +15,17 @@ use crate::sealed_accepted_index_impl::{
     accepted_causal_record_digest, authenticated_map_empty_digest, authenticated_map_node_digest,
     authenticated_map_priority_order, causal_clock_counter_digest, AuthenticatedMapKey,
     AuthenticatedMapLinkV1, SealedAcceptedCausalClockEntryV2, SealedAcceptedCausalRecordV2,
-    SealedAcceptedIndexError, SealedAcceptedIndexRead, MAX_AUTHENTICATED_MAP_KEY_BYTES,
+    SealedAcceptedIndexError, SealedAcceptedIndexRead, SealedBatchRecords,
+    MAX_AUTHENTICATED_MAP_KEY_BYTES,
 };
+use crate::sealed_tables_impl::sealed_empty_root_digest;
 use crate::sqlite_materialization::{
     self, ApplyChangeInstrumentation, MaterializationError, PhysicalMaterializationChange,
 };
 use crate::ContentDigest;
 
 pub const SQLITE_APPLICATION_ID: u32 = 0x5449_4e45;
-pub const SQLITE_SCHEMA_VERSION: u32 = 28;
+pub const SQLITE_SCHEMA_VERSION: u32 = 29;
 const MAX_AUTHENTICATED_MAP_DEPTH: usize = 256;
 
 pub const META_DDL: &str = "CREATE TABLE meta (
@@ -124,16 +126,7 @@ pub const CHECKPOINT_GENERATION_ANCHOR_DDL: &str = "CREATE TABLE checkpoint_gene
     covered_retained_bytes_total INTEGER NOT NULL CHECK (covered_retained_bytes_total >= 0),
     covered_semantic_capsules_root_digest BLOB NOT NULL
         CHECK (length(covered_semantic_capsules_root_digest) = 32),
-    covered_batch_root_key BLOB,
-    covered_batch_root_digest BLOB NOT NULL CHECK (length(covered_batch_root_digest) = 32),
-    covered_status_root_key BLOB,
-    covered_status_root_digest BLOB NOT NULL CHECK (length(covered_status_root_digest) = 32),
-    covered_sequence_root_digest BLOB,
-    covered_sequence_height INTEGER NOT NULL
-        CHECK (covered_sequence_height >= 0 AND covered_sequence_height <= 255),
-    covered_causal_tip_root_key BLOB,
-    covered_causal_tip_root_digest BLOB NOT NULL
-        CHECK (length(covered_causal_tip_root_digest) = 32),
+    sealed_root_digest BLOB NOT NULL CHECK (length(sealed_root_digest) = 32),
     covered_head_facts_root_digest BLOB NOT NULL
         CHECK (length(covered_head_facts_root_digest) = 32),
     current_projection_payload_pins_root_digest BLOB NOT NULL
@@ -148,14 +141,6 @@ pub const CHECKPOINT_GENERATION_ANCHOR_DDL: &str = "CREATE TABLE checkpoint_gene
     materialization_frontier_root_digest BLOB NOT NULL
         CHECK (length(materialization_frontier_root_digest) = 32),
     CHECK (predecessor_generation_id IS NULL OR length(predecessor_generation_id) = 16),
-    CHECK ((covered_batch_root_key IS NULL AND covered_count = 0)
-        OR length(covered_batch_root_key) = 16),
-    CHECK ((covered_status_root_key IS NULL AND covered_count = 0)
-        OR length(covered_status_root_key) = 16),
-    CHECK ((covered_sequence_root_digest IS NULL AND covered_count = 0)
-        OR length(covered_sequence_root_digest) = 32),
-    CHECK ((covered_causal_tip_root_key IS NULL AND covered_count = 0)
-        OR length(covered_causal_tip_root_key) = 16),
     CHECK ((terminal_batch_id IS NULL AND terminal_evidence_digest IS NULL AND covered_count = 0)
         OR (length(terminal_batch_id) = 16 AND length(terminal_evidence_digest) = 32))
 ) STRICT";
@@ -331,14 +316,7 @@ const CHECKPOINT_GENERATION_ANCHOR_COLUMNS: &[&str] = &[
     "covered_block_count",
     "covered_retained_bytes_total",
     "covered_semantic_capsules_root_digest",
-    "covered_batch_root_key",
-    "covered_batch_root_digest",
-    "covered_status_root_key",
-    "covered_status_root_digest",
-    "covered_sequence_root_digest",
-    "covered_sequence_height",
-    "covered_causal_tip_root_key",
-    "covered_causal_tip_root_digest",
+    "sealed_root_digest",
     "covered_head_facts_root_digest",
     "current_projection_payload_pins_root_digest",
     "nonlinear_state_root_digest",
@@ -361,6 +339,18 @@ pub struct PhysicalClaim {
     pub managed_entity_set_version: u32,
 }
 
+/// What an anchored database's accepted history keeps outside SQLite.
+///
+/// `covered_sequence` is C: acceptance sequences `1..=C` live only in the
+/// sealed sorted tables, and `C+1..=N` are hot rows. It is the ONE definition
+/// of "covered" on this path -- the covered-redelivery tripwire, the two-tier
+/// lookups and the tail-treap shape all read it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalSealedAnchor {
+    pub sealed_root_digest: ContentDigest,
+    pub covered_sequence: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalFrontierRoot {
     pub canonical_bytes: Vec<u8>,
@@ -370,14 +360,51 @@ pub struct PhysicalFrontierRoot {
     /// variable-width; batch identity below stays a fixed 16-byte UUID.
     pub document_map_root_key: Option<AuthenticatedMapKey>,
     pub document_map_root_digest: ContentDigest,
+    /// The TAIL treap's root. On an anchored database it spans only
+    /// `C+1..=N`; covered batches are not in it and never were.
     pub batch_map_root_key: Option<[u8; 16]>,
     pub batch_map_root_digest: ContentDigest,
+    /// `None` on a live database, `Some` on an anchored one.
+    pub anchor: Option<PhysicalSealedAnchor>,
     pub state_digest: ContentDigest,
 }
 
 impl PhysicalFrontierRoot {
     pub fn digest(&self) -> ContentDigest {
         ContentDigest::of(&self.canonical_bytes)
+    }
+
+    /// How many accepted batches are covered by sealed history.
+    pub fn covered_sequence(&self) -> u64 {
+        self.anchor.map_or(0, |anchor| anchor.covered_sequence)
+    }
+
+    /// How many accepted batches are hot rows.
+    pub fn tail_count(&self) -> u64 {
+        self.acceptance_sequence
+            .saturating_sub(self.covered_sequence())
+    }
+
+    /// One value naming this root's WHOLE accepted history.
+    ///
+    /// On a live database the tail treap spans everything, so its root digest
+    /// already is that value. On an anchored one the treap spans only the tail,
+    /// so the two halves are folded: `sha256(sealed_root_digest ||
+    /// tail_treap_root_digest)`. Folding rather than comparing the two
+    /// separately is what keeps a single quantity comparable -- and note what
+    /// is NOT compared: a covered node's `row_digest` from another generation
+    /// means nothing here, because that node is not in this treap at all.
+    pub fn accepted_history_digest(&self) -> ContentDigest {
+        let tail = self.batch_map_root_digest;
+        match self.anchor {
+            None => tail,
+            Some(anchor) => {
+                let mut bytes = Vec::with_capacity(64);
+                bytes.extend_from_slice(anchor.sealed_root_digest.as_bytes());
+                bytes.extend_from_slice(tail.as_bytes());
+                ContentDigest::of(&bytes)
+            }
+        }
     }
 }
 
@@ -391,14 +418,15 @@ pub struct PhysicalCheckpointGenerationBinding {
     pub covered_block_count: u64,
     pub covered_retained_bytes_total: u64,
     pub covered_semantic_capsules_root_digest: ContentDigest,
-    pub covered_batch_root_key: Option<[u8; 16]>,
-    pub covered_batch_root_digest: ContentDigest,
-    pub covered_status_root_key: Option<[u8; 16]>,
-    pub covered_status_root_digest: ContentDigest,
-    pub covered_sequence_root_digest: Option<ContentDigest>,
-    pub covered_sequence_height: u8,
-    pub covered_causal_tip_root_key: Option<[u8; 16]>,
-    pub covered_causal_tip_root_digest: ContentDigest,
+    /// `sha256` of the sealed table root record covering `1..=covered_count`.
+    ///
+    /// This one field replaces the eight that named the retired treap and
+    /// sequence-tree roots (`covered_{batch,status}_root_{key,digest}`,
+    /// `covered_sequence_root_digest`, `covered_sequence_height`,
+    /// `covered_causal_tip_root_{key,digest}`). They named node addresses
+    /// inside data structures that no longer exist; the sealed root names the
+    /// table list that replaced all of them.
+    pub sealed_root_digest: ContentDigest,
     pub covered_head_facts_root_digest: ContentDigest,
     pub current_projection_payload_pins_root_digest: ContentDigest,
     pub nonlinear_state_root_digest: ContentDigest,
@@ -423,15 +451,10 @@ pub struct PhysicalCheckpointFrontierRoot {
     pub retained_bytes_total: u64,
     pub document_map_root_key: Option<AuthenticatedMapKey>,
     pub document_map_root_digest: ContentDigest,
+    /// The TAIL treap's root. A checkpoint root installed at its cutover has
+    /// an EMPTY tail: everything it covers is sealed.
     pub batch_map_root_key: Option<[u8; 16]>,
     pub batch_map_root_digest: ContentDigest,
-    pub batch_map_count: u64,
-    pub status_map_root_key: Option<[u8; 16]>,
-    pub status_map_root_digest: ContentDigest,
-    pub status_map_count: u64,
-    pub sequence_root_digest: Option<ContentDigest>,
-    pub sequence_height: u8,
-    pub sequence_count: u64,
     pub generation: PhysicalCheckpointGenerationBinding,
     pub state_digest: ContentDigest,
 }
@@ -770,11 +793,8 @@ pub fn initialize_checkpoint_candidate_schema(
              singleton, generation_id, predecessor_generation_id,
              full_anchor_generation_id, covered_count, covered_document_count,
              covered_block_count, covered_retained_bytes_total,
-             covered_semantic_capsules_root_digest, covered_batch_root_key,
-             covered_batch_root_digest, covered_status_root_key,
-             covered_status_root_digest, covered_sequence_root_digest,
-             covered_sequence_height, covered_causal_tip_root_key,
-             covered_causal_tip_root_digest, covered_head_facts_root_digest,
+             covered_semantic_capsules_root_digest, sealed_root_digest,
+             covered_head_facts_root_digest,
              current_projection_payload_pins_root_digest,
              nonlinear_state_root_digest, retention_pins_root_digest,
              checkpoint_frontier_root, checkpoint_frontier_root_digest,
@@ -782,7 +802,7 @@ pub fn initialize_checkpoint_candidate_schema(
              materialization_frontier_root_digest
          ) VALUES (
              1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-             ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
+             ?13, ?14, ?15, ?16, ?17, ?18
          )",
         params![
             generation.generation_id.as_slice(),
@@ -802,29 +822,7 @@ pub fn initialize_checkpoint_candidate_schema(
                 .covered_semantic_capsules_root_digest
                 .as_bytes()
                 .as_slice(),
-            generation
-                .covered_batch_root_key
-                .as_ref()
-                .map(|value| value.as_slice()),
-            generation.covered_batch_root_digest.as_bytes().as_slice(),
-            generation
-                .covered_status_root_key
-                .as_ref()
-                .map(|value| value.as_slice()),
-            generation.covered_status_root_digest.as_bytes().as_slice(),
-            generation
-                .covered_sequence_root_digest
-                .as_ref()
-                .map(|value| value.as_bytes().as_slice()),
-            i64::from(generation.covered_sequence_height),
-            generation
-                .covered_causal_tip_root_key
-                .as_ref()
-                .map(|value| value.as_slice()),
-            generation
-                .covered_causal_tip_root_digest
-                .as_bytes()
-                .as_slice(),
+            generation.sealed_root_digest.as_bytes().as_slice(),
             generation
                 .covered_head_facts_root_digest
                 .as_bytes()
@@ -884,15 +882,12 @@ fn validate_checkpoint_anchor_input(
         || root.document_count != generation.covered_document_count
         || root.document_overlay_count != 0
         || root.retained_bytes_total != generation.covered_retained_bytes_total
-        || root.batch_map_root_key != generation.covered_batch_root_key
-        || root.batch_map_root_digest != generation.covered_batch_root_digest
-        || root.batch_map_count != count
-        || root.status_map_root_key != generation.covered_status_root_key
-        || root.status_map_root_digest != generation.covered_status_root_digest
-        || root.status_map_count != count
-        || root.sequence_root_digest != generation.covered_sequence_root_digest
-        || root.sequence_height != generation.covered_sequence_height
-        || root.sequence_count != count
+        // At the cutover the tail is empty by construction: every accepted
+        // batch is covered, so nothing is a hot row yet.
+        || root.batch_map_root_key.is_some()
+        || root.batch_map_root_digest != authenticated_map_empty_digest()
+        // Covering nothing has exactly one spelling.
+        || (count == 0) != (generation.sealed_root_digest == sealed_empty_root_digest())
         || anchor.checkpoint_frontier_root != root.canonical_bytes
         || anchor.materialization_frontier_root_digest != root.digest()
         || !terminal_pair_is_valid
@@ -1064,13 +1059,13 @@ fn validate_checkpoint_generation_anchor(connection: &Connection) -> Result<(), 
         Vec<u8>,
         Option<Vec<u8>>,
         Option<Vec<u8>>,
-        i64,
+        Vec<u8>,
         Vec<u8>,
     ) = connection
         .query_row(
             "SELECT covered_count, checkpoint_frontier_root,
                     checkpoint_frontier_root_digest, terminal_batch_id,
-                    terminal_evidence_digest, covered_sequence_height,
+                    terminal_evidence_digest, sealed_root_digest,
                     materialization_frontier_root_digest
              FROM checkpoint_generation_anchor WHERE singleton = 1",
             [],
@@ -1104,48 +1099,33 @@ fn validate_checkpoint_generation_anchor(connection: &Connection) -> Result<(), 
         stored.3.as_ref().is_some_and(|value| value.len() == 16)
             && stored.4.as_ref().is_some_and(|value| value.len() == 32)
     };
-    if !terminal_pair_is_valid || !(0..=255).contains(&stored.5) {
+    if !terminal_pair_is_valid {
         return Err(FrontierError::Corrupt(
             "checkpoint-generation anchor terminal evidence is invalid".into(),
         ));
     }
-    // The covered batch root must be present exactly when covered history is.
-    // The table has a CHECK for this, but a CHECK is a WRITE-time rule and this
-    // is the READ path: a page that arrives already violating it is not
-    // re-examined, and the damaged shape is not inert. `is_covered_batch` reads
-    // a NULL root as "the covered map is empty", so a nonzero-count anchor with
-    // a NULL root turns every genuine covered re-delivery into a corruption
-    // report -- the misclassification the by-name refusal exists to prevent,
-    // reintroduced from the other direction.
-    let (covered_root_key, covered_root_digest): (Option<Vec<u8>>, Vec<u8>) = connection
-        .query_row(
-            "SELECT covered_batch_root_key, covered_batch_root_digest
-             FROM checkpoint_generation_anchor WHERE singleton = 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
+    // The sealed root must be present exactly when covered history is.
+    //
+    // The table has a CHECK for its WIDTH, but a CHECK is a write-time rule and
+    // this is the READ path: a page that arrives already violating it is not
+    // re-examined, and the damaged shape is not inert. A covered_count of zero
+    // with a non-empty sealed root would name sealed history that does not
+    // exist; a nonzero count with the empty-root digest would hide history that
+    // does.
+    //
     // SHAPE, and deliberately only shape. A 32-byte digest that is simply the
-    // WRONG 32 bytes passes here, and verification confirmed it: the database
-    // opens, a new tail commits over it, and it reopens clean. That is not
-    // closable on this path. Authenticating the link needs either a sealed
-    // reader -- which reopen validation does not have, by construction -- or a
-    // decode of `checkpoint_frontier_root`, whose bytes this layer treats as
-    // opaque (the fixtures pass literal blobs, which is the layer boundary
-    // showing through). It fails safe when it is USED: `is_covered_batch`
-    // descends from this root and a wrong digest resolves to nothing. So the
-    // exposure is a delayed, loud failure rather than a silent wrong answer,
-    // and under D-3 that routes to a rebuild. Recorded as follow-up E3.
-    let covered_root_shape_is_valid = if covered_count == 0 {
-        covered_root_key.is_none()
-            && covered_root_digest.as_slice() == authenticated_map_empty_digest().as_bytes()
-    } else {
-        covered_root_key.as_ref().is_some_and(|key| key.len() == 16)
-            && covered_root_digest.len() == 32
-    };
-    if !covered_root_shape_is_valid {
+    // WRONG 32 bytes passes here, and verification confirmed it on the retired
+    // treap version of this check: the database opens, a new tail commits over
+    // it, and it reopens clean. That is not closable on this path. Verifying
+    // the root needs a sealed reader, which reopen validation does not have by
+    // construction. It fails safe when it is USED: a two-tier lookup against a
+    // root the reader cannot resolve raises `Corrupt` naming a torn write, disk
+    // error or partially delivered archive, and under D-3 that routes to a
+    // rebuild rather than to a wrong answer. Recorded as follow-up E3.
+    let sealed_root_is_empty = stored.5.as_slice() == sealed_empty_root_digest().as_bytes();
+    if stored.5.len() != 32 || (covered_count == 0) != sealed_root_is_empty {
         return Err(FrontierError::Corrupt(
-            "checkpoint-generation anchor covered batch root does not match its covered count"
-                .into(),
+            "checkpoint-generation anchor sealed root does not match its covered count".into(),
         ));
     }
     let (frontier_bytes, frontier_digest, applied_count): (Vec<u8>, Vec<u8>, i64) = connection
@@ -1833,28 +1813,35 @@ fn load_hot_batch_map_node(
     Ok(Some(node))
 }
 
-fn batch_map_value(
+/// Descend the HOT tail treap only.
+///
+/// On a live database that treap spans the whole accepted history and this is
+/// exactly the read it has always been. On an anchored one it spans `C+1..=N`,
+/// and a miss here is not an answer: it is the question the sealed half
+/// answers.
+fn hot_batch_map_value_at(
     connection: &Connection,
-    sealed: Option<&dyn SealedAcceptedIndexRead>,
-    root: &PhysicalFrontierRoot,
+    root_key: Option<[u8; 16]>,
+    root_digest: ContentDigest,
+    tail_count: u64,
     batch_id: [u8; 16],
 ) -> Result<Option<ContentDigest>, FrontierError> {
-    let Some(key) = root.batch_map_root_key else {
-        if root.acceptance_sequence == 0 {
+    let Some(key) = root_key else {
+        if tail_count == 0 {
             return Ok(None);
         }
         return Err(FrontierError::Corrupt(
-            "nonempty frontier has no authenticated batch-map root".into(),
+            "nonempty frontier tail has no authenticated batch-map root".into(),
         ));
     };
     let mut current = Some(MapLink {
         key: key.into(),
-        digest: root.batch_map_root_digest,
+        digest: root_digest,
     });
     let mut depth = 0;
     while let Some(link) = current {
         ensure_depth(depth, "accepted batch lookup")?;
-        let node = load_batch_map_node_for_apply(connection, sealed, &link)?;
+        let node = load_batch_map_node(connection, &link)?;
         match batch_id.cmp(&node.batch_id) {
             Ordering::Equal => return Ok(Some(node.value_digest)),
             Ordering::Less => current = node.left,
@@ -1863,6 +1850,111 @@ fn batch_map_value(
         depth += 1;
     }
     Ok(None)
+}
+
+fn hot_batch_map_value(
+    connection: &Connection,
+    root: &PhysicalFrontierRoot,
+    batch_id: [u8; 16],
+) -> Result<Option<ContentDigest>, FrontierError> {
+    hot_batch_map_value_at(
+        connection,
+        root.batch_map_root_key,
+        root.batch_map_root_digest,
+        root.tail_count(),
+        batch_id,
+    )
+}
+
+/// The sealed half of a two-tier lookup.
+///
+/// Consulted ONLY after the hot treap misses, and only on an anchored root: a
+/// live database has no covered history, so there is nothing to ask. That
+/// ordering is the whole cost argument -- a tail lookup never touches the
+/// sealed reader, so the live apply path is untouched by this seam existing.
+fn sealed_batch_records(
+    sealed: Option<&dyn SealedAcceptedIndexRead>,
+    root: &PhysicalFrontierRoot,
+    batch_id: [u8; 16],
+) -> Result<Option<SealedBatchRecords>, FrontierError> {
+    // A live database has no covered history, so there is nothing to ask.
+    if root.anchor.is_none() {
+        return Ok(None);
+    }
+    // Refusal scenario (I-8): an ANCHORED frontier reached through a live entry
+    // point that carries no reader. Answering `None` here would be worse than
+    // refusing -- a covered batch would read as absent, and a re-delivery of it
+    // would be applied a second time over the accepted history that already
+    // contains it. The caller's remedy is the `*_checkpoint` entry point, which
+    // is what the injected reader is for.
+    let Some(sealed) = sealed else {
+        return Err(FrontierError::InvalidInput(
+            "an anchored frontier needs its sealed accepted index to resolve covered batches"
+                .into(),
+        ));
+    };
+    sealed
+        .batch(batch_id)
+        .map_err(FrontierError::SealedAcceptedIndex)
+}
+
+fn batch_map_value(
+    connection: &Connection,
+    sealed: Option<&dyn SealedAcceptedIndexRead>,
+    root: &PhysicalFrontierRoot,
+    batch_id: [u8; 16],
+) -> Result<Option<ContentDigest>, FrontierError> {
+    if let Some(value) = hot_batch_map_value(connection, root, batch_id)? {
+        return Ok(Some(value));
+    }
+    match sealed_batch_records(sealed, root, batch_id)? {
+        Some(records) => Ok(Some(
+            records
+                .causal
+                .address()
+                .map_err(FrontierError::SealedAcceptedIndex)?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// The batch accepted at `sequence`, hot or covered.
+///
+/// Hot rows first, then the sealed table for `sequence <= C`. A sequence above
+/// the covered floor is never asked of the sealed reader: it cannot be there,
+/// and asking would make a missing hot row look like ordinary absence.
+pub fn sequence_batch_id(
+    connection: &Connection,
+    sealed: Option<&dyn SealedAcceptedIndexRead>,
+    root: &PhysicalFrontierRoot,
+    sequence: u64,
+) -> Result<Option<[u8; 16]>, FrontierError> {
+    if sequence == 0 || sequence > root.acceptance_sequence {
+        return Ok(None);
+    }
+    let stored: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT batch_id FROM applied_batches WHERE acceptance_sequence = ?1",
+            params![sqlite_i64(sequence, "acceptance sequence")?],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(bytes) = stored {
+        return Ok(Some(decode_id(&bytes, "accepted batch ID")?));
+    }
+    let (Some(sealed), Some(anchor)) = (sealed, root.anchor) else {
+        return Err(FrontierError::Corrupt(format!(
+            "accepted sequence {sequence} has no exact record"
+        )));
+    };
+    if sequence > anchor.covered_sequence {
+        return Err(FrontierError::Corrupt(format!(
+            "accepted sequence {sequence} is above the covered floor and has no exact record"
+        )));
+    }
+    sealed
+        .sequence(sequence)
+        .map_err(FrontierError::SealedAcceptedIndex)
 }
 
 /// Rebuild a covered batch's causal clock as hot `causal_clock_nodes` rows and
@@ -1954,17 +2046,12 @@ fn validate_checkpoint_root_shape(
     root: &PhysicalCheckpointFrontierRoot,
 ) -> Result<(), FrontierError> {
     let count = root.acceptance_sequence;
-    let roots_match_count = |key: Option<[u8; 16]>, digest: ContentDigest| {
-        if count == 0 {
-            key.is_none() && digest == authenticated_map_empty_digest()
-        } else {
-            key.is_some()
-        }
-    };
-    if root.batch_map_count != count
-        || root.status_map_count != count
-        || root.sequence_count != count
-        || root.generation.covered_count > count
+    let tail_count = count.saturating_sub(root.generation.covered_count);
+    if root.generation.covered_count > count
+        // The tail treap is empty exactly when it has no root.
+        || (tail_count == 0)
+            != (root.batch_map_root_key.is_none()
+                && root.batch_map_root_digest == authenticated_map_empty_digest())
         || root.document_overlay_count > root.document_count
         // The generation-relative document overlay is empty exactly when it has
         // no root. The anchor separately requires the overlay to be empty AT
@@ -1978,9 +2065,6 @@ fn validate_checkpoint_root_shape(
         || (root.document_overlay_count == 0)
             != (root.document_map_root_key.is_none()
                 && root.document_map_root_digest == authenticated_map_empty_digest())
-        || !roots_match_count(root.batch_map_root_key, root.batch_map_root_digest)
-        || !roots_match_count(root.status_map_root_key, root.status_map_root_digest)
-        || (count == 0) != root.sequence_root_digest.is_none()
     {
         return Err(FrontierError::Corrupt(
             "checkpoint frontier root/count shape is inconsistent".into(),
@@ -1989,81 +2073,43 @@ fn validate_checkpoint_root_shape(
     Ok(())
 }
 
-fn load_composite_batch_map_node(
-    connection: &Connection,
-    sealed: &dyn SealedAcceptedIndexRead,
-    expected: &MapLink,
-) -> Result<BatchMapNode, FrontierError> {
-    if let Some(node) = load_hot_batch_map_node(connection, expected)? {
-        return Ok(node);
-    }
-    let sealed = sealed.sealed_map_node(AuthenticatedMapLinkV1 {
-        key: expected.key,
-        digest: expected.digest,
-    })?;
-    Ok(BatchMapNode {
-        batch_id: key_as_id(sealed.key, "sealed accepted-batch key")?,
-        value_digest: sealed.value_digest,
-        left: sealed.left.map(|child| MapLink {
-            key: child.key,
-            digest: child.digest,
-        }),
-        right: sealed.right.map(|child| MapLink {
-            key: child.key,
-            digest: child.digest,
-        }),
-    })
-}
-
-/// Resolve one accepted-batch node for a path that may or may not be anchored.
+/// The same two tiers, for a checkpoint frontier root.
 ///
-/// `None` is the LIVE database: every node is a row, and this is exactly the hot
-/// read it has always been, so the live apply path keeps its current cost and
-/// behaviour. `Some` is an anchored candidate, whose covered nodes left SQLite at
-/// the generation cutover and survive only as sealed accepted-index objects.
-///
-/// Falling back is sound rather than merely convenient: SQLite and sealed map
-/// nodes are the SAME tree, not two encodings that happen to agree.
-/// `sqlite_frontier` and the sealed writer both call
-/// `authenticated_map_node_digest` and `authenticated_map_priority` from
-/// `sealed_accepted_index_impl`, so a node has one identity on both sides.
-fn load_batch_map_node_for_apply(
-    connection: &Connection,
-    sealed: Option<&dyn SealedAcceptedIndexRead>,
-    expected: &MapLink,
-) -> Result<BatchMapNode, FrontierError> {
-    match sealed {
-        Some(sealed) => load_composite_batch_map_node(connection, sealed, expected),
-        None => load_batch_map_node(connection, expected),
-    }
-}
-
-fn batch_map_value_checkpoint(
+/// A checkpoint root installed at its cutover has an empty tail by
+/// construction, so in practice this is the sealed lookup -- but it is written
+/// as the two-tier read rather than as a sealed-only shortcut, because the
+/// shortcut would be a second answer to "does this root contain that batch"
+/// that could drift from the first.
+fn checkpoint_batch_records(
     connection: &Connection,
     root: &PhysicalCheckpointFrontierRoot,
     sealed: &dyn SealedAcceptedIndexRead,
     batch_id: [u8; 16],
-) -> Result<Option<ContentDigest>, FrontierError> {
+) -> Result<Option<(ContentDigest, Option<SealedBatchRecords>)>, FrontierError> {
     validate_checkpoint_root_shape(root)?;
-    let Some(key) = root.batch_map_root_key else {
+    let tail_count = root
+        .acceptance_sequence
+        .saturating_sub(root.generation.covered_count);
+    if let Some(value) = hot_batch_map_value_at(
+        connection,
+        root.batch_map_root_key,
+        root.batch_map_root_digest,
+        tail_count,
+        batch_id,
+    )? {
+        return Ok(Some((value, None)));
+    }
+    let Some(records) = sealed
+        .batch(batch_id)
+        .map_err(FrontierError::SealedAcceptedIndex)?
+    else {
         return Ok(None);
     };
-    let mut current = Some(MapLink {
-        key: key.into(),
-        digest: root.batch_map_root_digest,
-    });
-    let mut depth = 0;
-    while let Some(link) = current {
-        ensure_depth(depth, "checkpoint accepted batch lookup")?;
-        let node = load_composite_batch_map_node(connection, sealed, &link)?;
-        match batch_id.cmp(&node.batch_id) {
-            Ordering::Equal => return Ok(Some(node.value_digest)),
-            Ordering::Less => current = node.left,
-            Ordering::Greater => current = node.right,
-        }
-        depth += 1;
-    }
-    Ok(None)
+    let value = records
+        .causal
+        .address()
+        .map_err(FrontierError::SealedAcceptedIndex)?;
+    Ok(Some((value, Some(records))))
 }
 
 fn validate_stored_batch_physical(record: &StoredBatch) -> Result<(), FrontierError> {
@@ -2135,16 +2181,22 @@ fn authenticated_batch_record(
     batch_id: [u8; 16],
     expected_value: Option<ContentDigest>,
 ) -> Result<Option<CheckpointAuthenticatedBatchRecord>, FrontierError> {
-    let Some(value) = batch_map_value(connection, sealed, root, batch_id)? else {
-        return Ok(None);
-    };
-    if expected_value.is_some_and(|expected| expected != value) {
-        return Err(FrontierError::Corrupt(format!(
-            "accepted batch {} differs from its authenticated causal record",
-            HexId(&batch_id)
-        )));
-    }
-    if let Some(record) = load_batch(connection, batch_id)? {
+    // Hot tier first, and the sealed reader is consulted AT MOST ONCE: the
+    // covered branch takes both the map value and the causal record from the
+    // same `batch()` result rather than asking twice.
+    if let Some(value) = hot_batch_map_value(connection, root, batch_id)? {
+        if expected_value.is_some_and(|expected| expected != value) {
+            return Err(FrontierError::Corrupt(format!(
+                "accepted batch {} differs from its authenticated causal record",
+                HexId(&batch_id)
+            )));
+        }
+        let Some(record) = load_batch(connection, batch_id)? else {
+            return Err(FrontierError::Corrupt(format!(
+                "authenticated accepted batch {} is missing its exact record",
+                HexId(&batch_id)
+            )));
+        };
         validate_stored_batch_physical(&record)?;
         let authenticated = CheckpointAuthenticatedBatchRecord::Hot(record);
         let (peer, counter) = authenticated.causal_dot()?;
@@ -2156,14 +2208,21 @@ fn authenticated_batch_record(
         }
         return Ok(Some(authenticated));
     }
-    let Some(sealed) = sealed else {
+    let Some(records) = sealed_batch_records(sealed, root, batch_id)? else {
+        return Ok(None);
+    };
+    let value = records
+        .causal
+        .address()
+        .map_err(FrontierError::SealedAcceptedIndex)?;
+    if expected_value.is_some_and(|expected| expected != value) {
         return Err(FrontierError::Corrupt(format!(
-            "authenticated accepted batch {} is missing its exact record",
+            "accepted batch {} differs from its authenticated causal record",
             HexId(&batch_id)
         )));
-    };
+    }
     Ok(Some(CheckpointAuthenticatedBatchRecord::Covered(
-        sealed.sealed_causal_record(batch_id, value)?,
+        records.causal,
     )))
 }
 
@@ -2269,7 +2328,8 @@ fn authenticated_checkpoint_batch_record(
     batch_id: [u8; 16],
     expected_value: Option<ContentDigest>,
 ) -> Result<Option<CheckpointAuthenticatedBatchRecord>, FrontierError> {
-    let Some(value) = batch_map_value_checkpoint(connection, root, sealed, batch_id)? else {
+    let Some((value, records)) = checkpoint_batch_records(connection, root, sealed, batch_id)?
+    else {
         return Ok(None);
     };
     if expected_value.is_some_and(|expected| expected != value) {
@@ -2278,7 +2338,13 @@ fn authenticated_checkpoint_batch_record(
             HexId(&batch_id)
         )));
     }
-    if let Some(record) = load_batch(connection, batch_id)? {
+    let Some(records) = records else {
+        let Some(record) = load_batch(connection, batch_id)? else {
+            return Err(FrontierError::Corrupt(format!(
+                "authenticated accepted batch {} is missing its exact record",
+                HexId(&batch_id)
+            )));
+        };
         validate_stored_batch_physical(&record)?;
         let authenticated = CheckpointAuthenticatedBatchRecord::Hot(record);
         let (peer, counter) = authenticated.causal_dot()?;
@@ -2289,9 +2355,10 @@ fn authenticated_checkpoint_batch_record(
             )));
         }
         return Ok(Some(authenticated));
-    }
-    let record = sealed.sealed_causal_record(batch_id, value)?;
-    Ok(Some(CheckpointAuthenticatedBatchRecord::Covered(record)))
+    };
+    Ok(Some(CheckpointAuthenticatedBatchRecord::Covered(
+        records.causal,
+    )))
 }
 
 pub fn contains_checkpoint_batch(
@@ -3243,9 +3310,14 @@ fn write_batch_map_node(
     Ok(link)
 }
 
+/// Insert into the HOT tail treap.
+///
+/// No sealed reader: an anchored database's tail treap holds `C+1..=N` and
+/// nothing else, so every node on the insertion descent is a row. This is what
+/// replaced the composite descent -- the write path no longer needs to know
+/// that sealed history exists.
 fn upsert_batch_map(
     connection: &Connection,
-    sealed: Option<&dyn SealedAcceptedIndexRead>,
     root: Option<MapLink>,
     batch_id: [u8; 16],
     value_digest: ContentDigest,
@@ -3263,7 +3335,7 @@ fn upsert_batch_map(
             },
         );
     };
-    let mut node = load_batch_map_node_for_apply(connection, sealed, &root)?;
+    let mut node = load_batch_map_node(connection, &root)?;
     match batch_id.cmp(&node.batch_id) {
         // An INSERT that finds the key already present is never legal here. Every
         // batch id enters this map exactly once; a re-delivery returns Duplicate
@@ -3285,7 +3357,6 @@ fn upsert_batch_map(
         Ordering::Less => {
             node.left = Some(upsert_batch_map(
                 connection,
-                sealed,
                 node.left.take(),
                 batch_id,
                 value_digest,
@@ -3294,7 +3365,7 @@ fn upsert_batch_map(
             if node.left.as_ref().is_some_and(|left| {
                 authenticated_map_priority_order(left.key, node.batch_id.into()).is_lt()
             }) {
-                rotate_batch_right(connection, sealed, node)
+                rotate_batch_right(connection, node)
             } else {
                 write_batch_map_node(connection, &node)
             }
@@ -3302,7 +3373,6 @@ fn upsert_batch_map(
         Ordering::Greater => {
             node.right = Some(upsert_batch_map(
                 connection,
-                sealed,
                 node.right.take(),
                 batch_id,
                 value_digest,
@@ -3311,7 +3381,7 @@ fn upsert_batch_map(
             if node.right.as_ref().is_some_and(|right| {
                 authenticated_map_priority_order(right.key, node.batch_id.into()).is_lt()
             }) {
-                rotate_batch_left(connection, sealed, node)
+                rotate_batch_left(connection, node)
             } else {
                 write_batch_map_node(connection, &node)
             }
@@ -3321,13 +3391,12 @@ fn upsert_batch_map(
 
 fn rotate_batch_right(
     connection: &Connection,
-    sealed: Option<&dyn SealedAcceptedIndexRead>,
     mut node: BatchMapNode,
 ) -> Result<MapLink, FrontierError> {
     let left = node.left.take().ok_or_else(|| {
         FrontierError::Corrupt("accepted batch-map rotation has no left child".into())
     })?;
-    let mut left_node = load_batch_map_node_for_apply(connection, sealed, &left)?;
+    let mut left_node = load_batch_map_node(connection, &left)?;
     node.left = left_node.right.take();
     left_node.right = Some(write_batch_map_node(connection, &node)?);
     write_batch_map_node(connection, &left_node)
@@ -3335,13 +3404,12 @@ fn rotate_batch_right(
 
 fn rotate_batch_left(
     connection: &Connection,
-    sealed: Option<&dyn SealedAcceptedIndexRead>,
     mut node: BatchMapNode,
 ) -> Result<MapLink, FrontierError> {
     let right = node.right.take().ok_or_else(|| {
         FrontierError::Corrupt("accepted batch-map rotation has no right child".into())
     })?;
-    let mut right_node = load_batch_map_node_for_apply(connection, sealed, &right)?;
+    let mut right_node = load_batch_map_node(connection, &right)?;
     node.right = right_node.left.take();
     right_node.left = Some(write_batch_map_node(connection, &node)?);
     write_batch_map_node(connection, &right_node)
@@ -3420,8 +3488,12 @@ fn insert_event(
 
 fn validate_root_shape(root: &PhysicalFrontierRoot) -> Result<(), FrontierError> {
     let empty_digest = authenticated_map_empty_digest();
+    // The batch treap holds the TAIL, not the history: on an anchored root the
+    // covered prefix lives in the sealed tables and is not a treap node, so the
+    // count that must agree with the root link is `tail_count`, not the
+    // acceptance sequence. Before the anchor existed the two were the same.
     if (root.document_map_root_key.is_none() && root.document_map_root_digest != empty_digest)
-        || (root.acceptance_sequence == 0) != root.batch_map_root_key.is_none()
+        || (root.tail_count() == 0) != root.batch_map_root_key.is_none()
         || (root.batch_map_root_key.is_none() && root.batch_map_root_digest != empty_digest)
     {
         return Err(FrontierError::InvalidInput(
@@ -3470,77 +3542,6 @@ fn validate_request_shape(request: &PhysicalApplyRequest) -> Result<(), Frontier
     Ok(())
 }
 
-/// The part of an installed `checkpoint_generation_anchor` that the apply path
-/// needs: the root of the SEALED covered batch map, which is what separates a
-/// covered re-delivery from a lost hot row. Reading it is one row; an ordinary
-/// live database has no such row and gets `None`.
-///
-/// Reopen validation reads the anchor row itself -- it needs every column, and
-/// it needs them as stored bytes rather than as a decoded link -- so it does
-/// not go through here. Deliberately only one field: an unused field on this
-/// struct would be a second, silently divergent reading of the same row.
-struct CheckpointAnchorFacts {
-    covered_batch_root: Option<MapLink>,
-}
-
-fn load_checkpoint_anchor_facts(
-    connection: &Connection,
-) -> Result<Option<CheckpointAnchorFacts>, FrontierError> {
-    let row = connection
-        .query_row(
-            "SELECT covered_batch_root_key, covered_batch_root_digest
-             FROM checkpoint_generation_anchor WHERE singleton = 1",
-            [],
-            |row| Ok((row.get::<_, Option<Vec<u8>>>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )
-        .optional()?;
-    let Some((root_key, root_digest)) = row else {
-        return Ok(None);
-    };
-    let covered_batch_root_digest = decode_digest(&root_digest)?;
-    let covered_batch_root = match root_key {
-        Some(key) => Some(MapLink {
-            key: decode_id(&key, "covered batch root key")?.into(),
-            digest: covered_batch_root_digest,
-        }),
-        None => None,
-    };
-    Ok(Some(CheckpointAnchorFacts { covered_batch_root }))
-}
-
-/// Is `batch_id` in the SEALED covered map -- as opposed to merely in the active
-/// map, which also holds the hot tail?
-///
-/// The distinction is the whole point. An id that is in the active map but has
-/// no `applied_batches` row is EITHER a covered batch whose row left SQLite at
-/// the cutover, OR a hot batch whose row was lost. The first is an ordinary
-/// re-delivery; the second is corruption, and reporting it as a re-delivery
-/// would hide it. Only a descent of the anchor's covered root can tell them
-/// apart.
-fn is_covered_batch(
-    connection: &Connection,
-    sealed: &dyn SealedAcceptedIndexRead,
-    anchor: &CheckpointAnchorFacts,
-    batch_id: [u8; 16],
-) -> Result<bool, FrontierError> {
-    let Some(root) = anchor.covered_batch_root.clone() else {
-        return Ok(false);
-    };
-    let mut current = Some(root);
-    let mut depth = 0;
-    while let Some(link) = current {
-        ensure_depth(depth, "covered accepted batch lookup")?;
-        let node = load_composite_batch_map_node(connection, sealed, &link)?;
-        match batch_id.cmp(&node.batch_id) {
-            Ordering::Equal => return Ok(true),
-            Ordering::Less => current = node.left,
-            Ordering::Greater => current = node.right,
-        }
-        depth += 1;
-    }
-    Ok(false)
-}
-
 /// Refuse a batch whose id the frontier ALREADY CONTAINS but whose exact record
 /// is not in SQLite.
 ///
@@ -3549,40 +3550,36 @@ fn is_covered_batch(
 /// sequence was already wrong. That earlier placement was free on the healthy
 /// path and wrong: a covered id offered at exactly `current + 1` skipped the
 /// probe entirely, `upsert_batch_map` took its `Ordering::Equal` arm, and the
-/// covered key's value was REPLACED. The batch that had been accepted was erased
-/// from the authenticated map while the sequence advanced, which is precisely
-/// the state the sealed three-root count check would later reject -- after
-/// SQLite had committed. Verified by probe before this guard existed.
+/// covered key's value was REPLACED. The batch that had been accepted was
+/// erased from the authenticated map while the sequence advanced, discovered
+/// only after SQLite had committed. Verified by probe before this guard existed.
+///
+/// The two tiers are what tell the two failures apart, and the distinction is
+/// the whole point. An id in the HOT TAIL treap with no `applied_batches` row
+/// is a lost hot row -- real damage, reported as corruption. An id the hot
+/// treap does not hold but the SEALED index does is an ordinary covered
+/// re-delivery (`seq <= C`), reported as such. Under the retired node seam this
+/// took a descent of a separate "covered root"; with tables the sealed side
+/// simply answers the question.
 fn guard_batch_already_accepted(
     connection: &Connection,
     sealed: Option<&dyn SealedAcceptedIndexRead>,
     current_root: &PhysicalFrontierRoot,
     batch_id: [u8; 16],
 ) -> Result<(), FrontierError> {
-    if batch_map_value(connection, sealed, current_root, batch_id)?.is_none() {
-        return Ok(());
+    if hot_batch_map_value(connection, current_root, batch_id)?.is_some() {
+        // The caller already found no exact row for this id -- the duplicate
+        // and collision branches both returned above -- so a hot-treap hit here
+        // means the row is gone. Never a state to apply over.
+        return Err(FrontierError::Corrupt(format!(
+            "authenticated accepted batch {} is missing its exact record",
+            HexId(&batch_id)
+        )));
     }
-    // Reaching here means the frontier's authenticated map already contains this
-    // id and the caller found no exact `applied_batches` row for it -- the
-    // duplicate and collision branches both returned above. That is never a
-    // state to apply over, whatever we can or cannot say about WHY.
-    //
-    // The refusal therefore does not depend on having a reader or an anchor.
-    // Only the CLASSIFICATION does: it takes a descent of the anchor's covered
-    // root to tell an ordinary covered re-delivery from a lost hot row, and
-    // reporting the second as the first would hide real damage. Making the
-    // refusal conditional on that descent is what left ordinary `apply` --
-    // public, shipped, `sealed = None` -- able to replace a covered key on a
-    // promoted anchored database and commit.
-    if let (Some(sealed), Some(anchor)) = (sealed, load_checkpoint_anchor_facts(connection)?) {
-        if is_covered_batch(connection, sealed, &anchor, batch_id)? {
-            return Err(FrontierError::CoveredBatchRedelivery(batch_id));
-        }
+    if sealed_batch_records(sealed, current_root, batch_id)?.is_some() {
+        return Err(FrontierError::CoveredBatchRedelivery(batch_id));
     }
-    Err(FrontierError::Corrupt(format!(
-        "authenticated accepted batch {} is missing its exact record",
-        HexId(&batch_id)
-    )))
+    Ok(())
 }
 
 pub fn preflight(
@@ -4004,7 +4001,6 @@ fn apply_in_open_transaction(
     let causal_record_digest = accepted_batch_causal_record_digest(batch, &clock_root);
     let post_batch_root = upsert_batch_map(
         connection,
-        sealed,
         current_root.batch_map_root_key.map(|key| MapLink {
             key: key.into(),
             digest: current_root.batch_map_root_digest,
@@ -4099,10 +4095,17 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+    use std::borrow::Cow;
+    use std::cell::Cell;
+    use std::collections::HashMap;
+
     use crate::sealed_accepted_index::{
-        authenticated_map_root, AuthenticatedMapRootV1, SealedAcceptedCausalClockEntryV2,
-        SealedAcceptedIndexObjectStore, SealedAcceptedIndexReader, SealedAcceptedIndexWriter,
-        SealedAcceptedObjectKind,
+        authenticated_map_root, AcceptedStatusRecordV2, AuthenticatedMapRootV1,
+        SealedAcceptedCausalClockEntryV2, SealedAcceptedObjectKind,
+    };
+    use crate::sealed_tables::{
+        sealed_empty_root_digest, SealedTableDomainRoot, SealedTableRoot, TableBuilder, TableBytes,
+        TableLocator, TableRef, TableSetReader, SEALED_BATCH_DOMAIN, SEALED_SEQUENCE_DOMAIN,
     };
     use crate::sqlite::{
         PhysicalEntityId, PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalSqliteDatabase,
@@ -4113,46 +4116,181 @@ mod tests {
 
     static NEXT_DATABASE: AtomicU64 = AtomicU64::new(1);
 
-    #[derive(Default)]
-    struct TestSealedStore {
-        objects: Vec<(SealedAcceptedObjectKind, ContentDigest, Vec<u8>)>,
+    /// One accepted batch as the sealed index holds it.
+    #[derive(Clone)]
+    struct SealedEntry {
+        sequence: u64,
+        causal: SealedAcceptedCausalRecordV2,
     }
 
-    impl SealedAcceptedIndexObjectStore for TestSealedStore {
-        fn read_sealed_accepted_object(
-            &self,
-            kind: SealedAcceptedObjectKind,
-            address: ContentDigest,
-        ) -> Result<Option<Vec<u8>>, SealedAcceptedIndexError> {
-            Ok(self
-                .objects
-                .iter()
-                .find(|(found_kind, found_address, _)| {
-                    *found_kind == kind && *found_address == address
+    /// A sealed accepted index built out of REAL sorted tables.
+    ///
+    /// Deliberately not a hand-written stub that answers from a `HashMap`: the
+    /// SQLite seam's contract is "the sealed half answers a point lookup", and
+    /// a stub would prove that against a fiction. This encodes the two typed
+    /// domains, decodes them through `TableSetReader`, and counts how often the
+    /// seam consults it.
+    struct TestSealedIndex {
+        tables: HashMap<[u8; 32], Vec<u8>>,
+        root: SealedTableRoot,
+        causal: HashMap<[u8; 32], SealedAcceptedCausalRecordV2>,
+        status: HashMap<[u8; 32], AcceptedStatusRecordV2>,
+        consults: Cell<u64>,
+        drop_causal_records: Cell<bool>,
+    }
+
+    impl TableBytes for TestSealedIndex {
+        fn read_table<'a>(
+            &'a self,
+            locator: &TableLocator,
+        ) -> Result<Cow<'a, [u8]>, SealedAcceptedIndexError> {
+            self.tables
+                .get(&locator.0)
+                .map(|bytes| Cow::Borrowed(bytes.as_slice()))
+                .ok_or(SealedAcceptedIndexError::Missing {
+                    kind: SealedAcceptedObjectKind::Table,
+                    address: ContentDigest::from_bytes(locator.0),
                 })
-                .map(|(_, _, bytes)| bytes.clone()))
+        }
+    }
+
+    fn status_for(causal: &SealedAcceptedCausalRecordV2) -> AcceptedStatusRecordV2 {
+        AcceptedStatusRecordV2 {
+            batch_id: causal.batch_id,
+            no_op: false,
+            evidence_schema: 1,
+            exact_evidence_bytes: causal.batch_id.to_vec(),
+            accepted_causal_record_digest: causal.address().unwrap(),
+        }
+    }
+
+    impl TestSealedIndex {
+        fn empty() -> Self {
+            Self::build(&[])
         }
 
-        fn publish_sealed_accepted_object(
-            &mut self,
-            kind: SealedAcceptedObjectKind,
-            address: ContentDigest,
-            bytes: &[u8],
-        ) -> Result<(), SealedAcceptedIndexError> {
-            if let Some((_, _, existing)) =
-                self.objects.iter().find(|(found_kind, found_address, _)| {
-                    *found_kind == kind && *found_address == address
-                })
-            {
-                if existing.as_slice() != bytes {
-                    return Err(SealedAcceptedIndexError::Store(
-                        "test object collision".into(),
-                    ));
-                }
-                return Ok(());
+        fn build(entries: &[SealedEntry]) -> Self {
+            let mut tables = HashMap::new();
+            let mut causal_records = HashMap::new();
+            let mut status_records = HashMap::new();
+            let mut batch = TableBuilder::new(SEALED_BATCH_DOMAIN);
+            let mut sequence = TableBuilder::new(SEALED_SEQUENCE_DOMAIN);
+            let mut sorted = entries.to_vec();
+            sorted.sort_by_key(|entry| entry.causal.batch_id);
+            for entry in &sorted {
+                let causal_locator = *entry.causal.address().unwrap().as_bytes();
+                let status = status_for(&entry.causal);
+                let status_locator = *status.value_digest().as_bytes();
+                let mut value = Vec::with_capacity(64);
+                value.extend_from_slice(&causal_locator);
+                value.extend_from_slice(&status_locator);
+                batch.insert(&entry.causal.batch_id, &value).unwrap();
+                causal_records.insert(causal_locator, entry.causal.clone());
+                status_records.insert(status_locator, status);
             }
-            self.objects.push((kind, address, bytes.to_vec()));
-            Ok(())
+            let mut by_sequence = entries.to_vec();
+            by_sequence.sort_by_key(|entry| entry.sequence);
+            for entry in &by_sequence {
+                sequence
+                    .insert(&entry.sequence.to_be_bytes(), &entry.causal.batch_id)
+                    .unwrap();
+            }
+            let mut domains = Vec::new();
+            for (domain, builder) in [
+                (SEALED_BATCH_DOMAIN, batch),
+                (SEALED_SEQUENCE_DOMAIN, sequence),
+            ] {
+                if builder.is_empty() {
+                    continue;
+                }
+                let count = builder.len() as u64;
+                let bytes = builder.finish().unwrap();
+                let locator = *ContentDigest::of(&bytes).as_bytes();
+                tables.insert(locator, bytes);
+                domains.push(SealedTableDomainRoot {
+                    domain_id: domain.id,
+                    tables: vec![TableRef {
+                        locator: TableLocator(locator),
+                        level: 0,
+                        count,
+                    }],
+                });
+            }
+            Self {
+                tables,
+                root: SealedTableRoot { domains },
+                causal: causal_records,
+                status: status_records,
+                consults: Cell::new(0),
+                drop_causal_records: Cell::new(false),
+            }
+        }
+
+        fn root_digest(&self) -> ContentDigest {
+            self.root.root_digest().unwrap()
+        }
+
+        fn consults(&self) -> u64 {
+            self.consults.get()
+        }
+
+        fn reset_consults(&self) {
+            self.consults.set(0);
+        }
+    }
+
+    impl SealedAcceptedIndexRead for TestSealedIndex {
+        fn batch(
+            &self,
+            batch_id: [u8; 16],
+        ) -> Result<Option<SealedBatchRecords>, SealedAcceptedIndexError> {
+            self.consults.set(self.consults.get() + 1);
+            let reader = TableSetReader::new(
+                self,
+                SEALED_BATCH_DOMAIN,
+                self.root.tables_for(SEALED_BATCH_DOMAIN),
+            )?;
+            let Some(value) = reader.get(&batch_id)? else {
+                return Ok(None);
+            };
+            let mut causal_locator = [0u8; 32];
+            causal_locator.copy_from_slice(&value[..32]);
+            let mut status_locator = [0u8; 32];
+            status_locator.copy_from_slice(&value[32..]);
+            if self.drop_causal_records.get() {
+                return Err(SealedAcceptedIndexError::Missing {
+                    kind: SealedAcceptedObjectKind::CausalRecord,
+                    address: ContentDigest::from_bytes(causal_locator),
+                });
+            }
+            let causal = self.causal.get(&causal_locator).cloned().ok_or(
+                SealedAcceptedIndexError::Missing {
+                    kind: SealedAcceptedObjectKind::CausalRecord,
+                    address: ContentDigest::from_bytes(causal_locator),
+                },
+            )?;
+            let status = self.status.get(&status_locator).cloned().ok_or(
+                SealedAcceptedIndexError::Missing {
+                    kind: SealedAcceptedObjectKind::StatusRecord,
+                    address: ContentDigest::from_bytes(status_locator),
+                },
+            )?;
+            Ok(Some(SealedBatchRecords { causal, status }))
+        }
+
+        fn sequence(&self, sequence: u64) -> Result<Option<[u8; 16]>, SealedAcceptedIndexError> {
+            self.consults.set(self.consults.get() + 1);
+            let reader = TableSetReader::new(
+                self,
+                SEALED_SEQUENCE_DOMAIN,
+                self.root.tables_for(SEALED_SEQUENCE_DOMAIN),
+            )?;
+            let Some(value) = reader.get(&sequence.to_be_bytes())? else {
+                return Ok(None);
+            };
+            let mut batch_id = [0u8; 16];
+            batch_id.copy_from_slice(&value);
+            Ok(Some(batch_id))
         }
     }
 
@@ -4296,8 +4434,32 @@ mod tests {
             document_map_root_digest,
             batch_map_root_key,
             batch_map_root_digest,
+            anchor: None,
             state_digest: ContentDigest::of(&sequence.to_be_bytes()),
         }
+    }
+
+    /// The same synthetic root, for a database anchored at `covered`.
+    ///
+    /// `batches` is the TAIL only: covered batches are in the sealed index and
+    /// are deliberately not expressible in the treap.
+    fn anchored_root(
+        sequence: u64,
+        documents: &[PhysicalFrontierDocument],
+        batches: &[([u8; 16], ContentDigest)],
+        sealed_root_digest: ContentDigest,
+        covered: u64,
+    ) -> PhysicalFrontierRoot {
+        let mut root = root(sequence, documents, batches);
+        root.anchor = Some(PhysicalSealedAnchor {
+            sealed_root_digest,
+            covered_sequence: covered,
+        });
+        root.canonical_bytes
+            .extend_from_slice(sealed_root_digest.as_bytes());
+        root.canonical_bytes
+            .extend_from_slice(&covered.to_be_bytes());
+        root
     }
 
     fn empty_checkpoint_root_and_anchor() -> (
@@ -4314,14 +4476,7 @@ mod tests {
             covered_block_count: 0,
             covered_retained_bytes_total: 0,
             covered_semantic_capsules_root_digest: ContentDigest::of(b"capsules"),
-            covered_batch_root_key: None,
-            covered_batch_root_digest: empty,
-            covered_status_root_key: None,
-            covered_status_root_digest: empty,
-            covered_sequence_root_digest: None,
-            covered_sequence_height: 0,
-            covered_causal_tip_root_key: None,
-            covered_causal_tip_root_digest: empty,
+            sealed_root_digest: sealed_empty_root_digest(),
             covered_head_facts_root_digest: ContentDigest::of(b"heads"),
             current_projection_payload_pins_root_digest: ContentDigest::of(b"payloads"),
             nonlinear_state_root_digest: ContentDigest::of(b"nonlinear"),
@@ -4338,14 +4493,7 @@ mod tests {
             document_map_root_key: None,
             document_map_root_digest: empty,
             batch_map_root_key: None,
-            batch_map_root_digest: empty,
-            batch_map_count: 0,
-            status_map_root_key: None,
-            status_map_root_digest: empty,
-            status_map_count: 0,
-            sequence_root_digest: None,
-            sequence_height: 0,
-            sequence_count: 0,
+            batch_map_root_digest: authenticated_map_empty_digest(),
             generation: generation.clone(),
             state_digest: ContentDigest::of(b"checkpoint-state"),
         };
@@ -4517,7 +4665,7 @@ mod tests {
 
     #[test]
     fn prior_sqlite_schema_is_refused_instead_of_migrated_or_dually_read() {
-        for unsupported in [21u32, 26, 27, 29] {
+        for unsupported in [21u32, 26, 27, 28, 30] {
             let (_path, connection, _) = initialized();
             connection
                 .pragma_update(None, "user_version", unsupported)
@@ -4567,10 +4715,8 @@ mod tests {
         drop(live);
         let live_bytes = std::fs::read(&live_path.path).unwrap();
 
-        let (covered_batch_root_key, covered_batch_root_digest) =
-            batch_map_root(&scenario.batch_entries);
         let covered_count = scenario.final_root.acceptance_sequence;
-        let sequence_digest = ContentDigest::of(b"checkpoint-sequence");
+        let sealed_root = ContentDigest::of(b"checkpoint-sealed-root");
         let generation = PhysicalCheckpointGenerationBinding {
             generation_id: id(2),
             predecessor_generation_id: Some(id(1)),
@@ -4580,14 +4726,7 @@ mod tests {
             covered_block_count: 0,
             covered_retained_bytes_total: 30,
             covered_semantic_capsules_root_digest: ContentDigest::of(b"capsules"),
-            covered_batch_root_key,
-            covered_batch_root_digest,
-            covered_status_root_key: covered_batch_root_key,
-            covered_status_root_digest: covered_batch_root_digest,
-            covered_sequence_root_digest: Some(sequence_digest),
-            covered_sequence_height: 1,
-            covered_causal_tip_root_key: Some(id(900)),
-            covered_causal_tip_root_digest: ContentDigest::of(b"tip"),
+            sealed_root_digest: sealed_root,
             covered_head_facts_root_digest: ContentDigest::of(b"heads"),
             current_projection_payload_pins_root_digest: ContentDigest::of(b"payloads"),
             nonlinear_state_root_digest: ContentDigest::of(b"nonlinear"),
@@ -4602,15 +4741,8 @@ mod tests {
             retained_bytes_total: 30,
             document_map_root_key: None,
             document_map_root_digest: authenticated_map_empty_digest(),
-            batch_map_root_key: covered_batch_root_key,
-            batch_map_root_digest: covered_batch_root_digest,
-            batch_map_count: covered_count,
-            status_map_root_key: covered_batch_root_key,
-            status_map_root_digest: covered_batch_root_digest,
-            status_map_count: covered_count,
-            sequence_root_digest: Some(sequence_digest),
-            sequence_height: 1,
-            sequence_count: covered_count,
+            batch_map_root_key: None,
+            batch_map_root_digest: authenticated_map_empty_digest(),
             generation: generation.clone(),
             state_digest: ContentDigest::of(b"state"),
         };
@@ -4656,13 +4788,11 @@ mod tests {
                 counter: 1,
             }],
         };
-        let mut store = TestSealedStore::default();
-        let mut writer = SealedAcceptedIndexWriter::new(&mut store);
-        let causal_address = writer.publish_causal(&causal).unwrap();
-        let batch_root = writer
-            .upsert_map(AuthenticatedMapRootV1::empty(), batch_id, causal_address)
-            .unwrap();
-        drop(writer);
+        let causal_address = causal.address().unwrap();
+        let sealed = TestSealedIndex::build(&[SealedEntry {
+            sequence: 1,
+            causal: causal.clone(),
+        }]);
 
         let empty = authenticated_map_empty_digest();
         let generation = PhysicalCheckpointGenerationBinding {
@@ -4674,18 +4804,7 @@ mod tests {
             covered_block_count: 0,
             covered_retained_bytes_total: 10,
             covered_semantic_capsules_root_digest: ContentDigest::of(b"capsules"),
-            covered_batch_root_key: batch_root
-                .root
-                .map(|link| key_as_id(link.key, "test batch ID").unwrap()),
-            covered_batch_root_digest: batch_root.root_digest(),
-            covered_status_root_key: batch_root
-                .root
-                .map(|link| key_as_id(link.key, "test batch ID").unwrap()),
-            covered_status_root_digest: batch_root.root_digest(),
-            covered_sequence_root_digest: Some(ContentDigest::of(b"sequence")),
-            covered_sequence_height: 0,
-            covered_causal_tip_root_key: Some(peer_id),
-            covered_causal_tip_root_digest: ContentDigest::of(b"tip"),
+            sealed_root_digest: sealed.root_digest(),
             covered_head_facts_root_digest: ContentDigest::of(b"heads"),
             current_projection_payload_pins_root_digest: ContentDigest::of(b"payloads"),
             nonlinear_state_root_digest: ContentDigest::of(b"nonlinear"),
@@ -4700,19 +4819,8 @@ mod tests {
             retained_bytes_total: 10,
             document_map_root_key: None,
             document_map_root_digest: empty,
-            batch_map_root_key: batch_root
-                .root
-                .map(|link| key_as_id(link.key, "test batch ID").unwrap()),
-            batch_map_root_digest: batch_root.root_digest(),
-            batch_map_count: 1,
-            status_map_root_key: batch_root
-                .root
-                .map(|link| key_as_id(link.key, "test batch ID").unwrap()),
-            status_map_root_digest: batch_root.root_digest(),
-            status_map_count: 1,
-            sequence_root_digest: Some(ContentDigest::of(b"sequence")),
-            sequence_height: 0,
-            sequence_count: 1,
+            batch_map_root_key: None,
+            batch_map_root_digest: authenticated_map_empty_digest(),
             generation: generation.clone(),
             state_digest: ContentDigest::of(b"state"),
         };
@@ -4735,25 +4843,22 @@ mod tests {
             .unwrap();
         assert!(database.load_all_batches().unwrap().is_empty());
 
-        {
-            let reader = SealedAcceptedIndexReader::new(&store);
-            assert!(database
-                .contains_checkpoint_batch(&root, &reader, batch_id)
-                .unwrap());
-            assert!(database
-                .authenticate_checkpoint_batch(&root, &reader, batch_id, causal_address)
-                .unwrap());
-            assert!(database
-                .checkpoint_batch_descends_from(&root, &reader, batch_id, batch_id)
-                .unwrap());
-        }
+        assert!(database
+            .contains_checkpoint_batch(&root, &sealed, batch_id)
+            .unwrap());
+        assert!(database
+            .authenticate_checkpoint_batch(&root, &sealed, batch_id, causal_address)
+            .unwrap());
+        assert!(database
+            .checkpoint_batch_descends_from(&root, &sealed, batch_id, batch_id)
+            .unwrap());
 
-        store
-            .objects
-            .retain(|(kind, _, _)| *kind != SealedAcceptedObjectKind::CausalRecord);
-        let reader = SealedAcceptedIndexReader::new(&store);
+        // The sealed index answering with a missing record is a SEALED error,
+        // not a "this batch is absent": a covered batch whose record has gone
+        // is damage that must reach the caller as damage.
+        sealed.drop_causal_records.set(true);
         assert!(matches!(
-            database.contains_checkpoint_batch(&root, &reader, batch_id),
+            database.contains_checkpoint_batch(&root, &sealed, batch_id),
             Err(FrontierError::SealedAcceptedIndex(
                 SealedAcceptedIndexError::Missing {
                     kind: SealedAcceptedObjectKind::CausalRecord,
@@ -4769,7 +4874,7 @@ mod tests {
     fn anchored_candidate_with_covered_history() -> (
         TestDatabase,
         PhysicalSqliteDatabase,
-        TestSealedStore,
+        TestSealedIndex,
         PhysicalFrontierRoot,
         PhysicalApplyRequest,
         Vec<([u8; 16], ContentDigest)>,
@@ -4788,21 +4893,10 @@ mod tests {
                 counter: 1,
             }],
         };
-        let mut store = TestSealedStore::default();
-        let mut writer = SealedAcceptedIndexWriter::new(&mut store);
-        let causal_address = writer.publish_causal(&causal).unwrap();
-        let batch_root = writer
-            .upsert_map(
-                AuthenticatedMapRootV1::empty(),
-                covered_batch_id,
-                causal_address,
-            )
-            .unwrap();
-        drop(writer);
-
-        let covered_root_key = batch_root
-            .root
-            .map(|link| key_as_id(link.key, "test batch ID").unwrap());
+        let sealed = TestSealedIndex::build(&[SealedEntry {
+            sequence: 1,
+            causal: causal.clone(),
+        }]);
         let empty = authenticated_map_empty_digest();
         let generation = PhysicalCheckpointGenerationBinding {
             generation_id: id(2),
@@ -4813,14 +4907,7 @@ mod tests {
             covered_block_count: 0,
             covered_retained_bytes_total: 10,
             covered_semantic_capsules_root_digest: ContentDigest::of(b"capsules"),
-            covered_batch_root_key: covered_root_key,
-            covered_batch_root_digest: batch_root.root_digest(),
-            covered_status_root_key: covered_root_key,
-            covered_status_root_digest: batch_root.root_digest(),
-            covered_sequence_root_digest: Some(ContentDigest::of(b"sequence")),
-            covered_sequence_height: 0,
-            covered_causal_tip_root_key: Some(peer_id),
-            covered_causal_tip_root_digest: ContentDigest::of(b"tip"),
+            sealed_root_digest: sealed.root_digest(),
             covered_head_facts_root_digest: ContentDigest::of(b"heads"),
             current_projection_payload_pins_root_digest: ContentDigest::of(b"payloads"),
             nonlinear_state_root_digest: ContentDigest::of(b"nonlinear"),
@@ -4835,15 +4922,8 @@ mod tests {
             retained_bytes_total: 10,
             document_map_root_key: None,
             document_map_root_digest: empty,
-            batch_map_root_key: covered_root_key,
-            batch_map_root_digest: batch_root.root_digest(),
-            batch_map_count: 1,
-            status_map_root_key: covered_root_key,
-            status_map_root_digest: batch_root.root_digest(),
-            status_map_count: 1,
-            sequence_root_digest: Some(ContentDigest::of(b"sequence")),
-            sequence_height: 0,
-            sequence_count: 1,
+            batch_map_root_key: None,
+            batch_map_root_digest: authenticated_map_empty_digest(),
             generation: generation.clone(),
             state_digest: ContentDigest::of(b"state"),
         };
@@ -4869,16 +4949,22 @@ mod tests {
         // assertion below stops meaning anything.
         assert!(database.load_all_batches().unwrap().is_empty());
 
-        // The installed live root, as apply sees it. It names the COVERED batch
-        // map root, because the anchor validation requires exactly that.
+        // The installed live root, as apply sees it. Its treap is EMPTY: every
+        // accepted batch so far is covered, and covered batches are not treap
+        // nodes any more -- they are sealed table entries. The anchor is what
+        // carries them.
         let installed = PhysicalFrontierRoot {
             canonical_bytes,
             acceptance_sequence: 1,
             document_count: 0,
             document_map_root_key: None,
             document_map_root_digest: empty,
-            batch_map_root_key: covered_root_key,
-            batch_map_root_digest: batch_root.root_digest(),
+            batch_map_root_key: None,
+            batch_map_root_digest: empty,
+            anchor: Some(PhysicalSealedAnchor {
+                sealed_root_digest: sealed.root_digest(),
+                covered_sequence: 1,
+            }),
             state_digest: ContentDigest::of(b"state"),
         };
 
@@ -4909,8 +4995,8 @@ mod tests {
             digest: authenticated_map_node_digest(peer_id.into(), clock_value, None, None),
         };
         let record_digest = accepted_batch_causal_record_digest(&tail, &clock_root);
-        let mut entries = vec![(covered_batch_id, causal_address), (tail_id, record_digest)];
-        entries.sort_unstable_by_key(|entry| entry.0);
+        // The post-apply TAIL treap holds the tail batch alone.
+        let entries = vec![(tail_id, record_digest)];
         let (post_key, post_digest) = batch_map_root(&entries);
         let mut post = installed.clone();
         post.acceptance_sequence = 2;
@@ -4926,7 +5012,7 @@ mod tests {
             materialization_input_digest: None,
             fault: ApplyFault::None,
         };
-        (path, database, store, installed, request, entries)
+        (path, database, sealed, installed, request, entries)
     }
 
     /// One more ordinary tail batch on top of `prior`, so a test can prove what
@@ -5016,43 +5102,46 @@ mod tests {
     /// After a generation cutover the covered history leaves SQLite and survives
     /// only as sealed accepted-index objects.
     /// `initialize_checkpoint_candidate_schema` creates EMPTY
-    /// `accepted_batch_nodes` / `causal_clock_nodes` / `applied_batches`, while
-    /// `validate_checkpoint_anchor_input` REQUIRES the installed frontier root to
-    /// name the covered batch-map root — so the walk starts covered by
-    /// construction and there is no empty-tree option.
+    /// `accepted_batch_nodes` / `causal_clock_nodes` / `applied_batches`, and
+    /// the installed root carries a sealed ANCHOR -- so a covered batch is not a
+    /// treap node at all and the only way to resolve it is the sealed reader.
     ///
     /// This is the NECESSITY GATE for `apply_checkpoint_candidate`. It must keep
     /// failing here, because the ordinary live apply must not silently acquire a
-    /// fallback: on a live database a missing accepted-batch node IS corruption,
-    /// and answering it from elsewhere would hide real damage.
+    /// fallback: answering a covered id from nowhere would report a re-delivery
+    /// as new work.
+    ///
+    /// I-8: the refusal names its in-scope scenario (an anchored root offered to
+    /// the live path, which has no sealed half) rather than reporting corruption.
     #[test]
     fn a_tail_batch_over_covered_history_needs_the_sealed_reader() {
-        let (_path, mut database, _store, installed, request, _entries) =
+        let (_path, mut database, _sealed, installed, request, _entries) =
             anchored_candidate_with_covered_history();
         database.begin_candidate_build().unwrap();
         let error = database
             .apply_candidate(&installed, &request)
-            .expect_err("the live apply has no way to resolve a covered node");
-        let FrontierError::Corrupt(detail) = &error else {
-            panic!("expected a Corrupt failure naming the missing covered node, got {error:?}");
+            .expect_err("the live apply has no way to resolve a covered batch");
+        let FrontierError::InvalidInput(detail) = &error else {
+            panic!("expected the anchored-frontier refusal, got {error:?}");
         };
         assert!(
-            detail.contains("accepted-batch node") && detail.contains("missing"),
-            "expected the covered accepted-batch node walk to fail, got {detail:?}"
+            detail.contains("anchored frontier") && detail.contains("sealed accepted index"),
+            "expected the refusal to name the missing sealed half, got {detail:?}"
         );
     }
 
-    /// F6-1: the fail-before proves the DEPENDENCY walk, by fixture.
+    /// F6-1, restated for tables: the refusal does not depend on the batch
+    /// carrying a covered dependency head.
     ///
-    /// The message is the same from both covered-read sites, so the assertion
-    /// text cannot distinguish them: remove dependency validation and insertion
-    /// would fail identically, leaving the test green while proving nothing
-    /// about the site it names. Strip the covered dependency head instead. The
-    /// apply still fails -- later, inside `upsert_batch_map` -- which is what
-    /// shows the first failure in the ordinary fixture was the earlier site.
+    /// With the sealed treap gone, insertion is HOT-ONLY -- `upsert_batch_map`
+    /// no longer takes a sealed reader -- so the "later site" this test was
+    /// named for is the re-delivery guard, not the insertion descent. Strip the
+    /// covered dependency head and the live apply still refuses, which is what
+    /// says the refusal is a property of the anchored ROOT rather than of this
+    /// fixture's dependency shape.
     #[test]
     fn a_tail_with_no_covered_dependency_still_fails_but_at_the_later_site() {
-        let (_path, mut database, _store, installed, request, _entries) =
+        let (_path, mut database, _sealed, installed, request, _entries) =
             anchored_candidate_with_covered_history();
         let mut undepended = request.clone();
         undepended.batch.causal_dependency_heads = Vec::new();
@@ -5061,11 +5150,12 @@ mod tests {
         database.begin_candidate_build().unwrap();
         let error = database
             .apply_candidate(&installed, &undepended)
-            .expect_err("insertion must still meet the covered node");
+            .expect_err("the guard must still meet the covered half");
         assert!(
-            matches!(&error, FrontierError::Corrupt(detail)
-                if detail.contains("accepted-batch node") && detail.contains("missing")),
-            "expected the insertion descent to fail, got {error:?}"
+            matches!(&error, FrontierError::InvalidInput(detail)
+                if detail.contains("anchored frontier")
+                    && detail.contains("sealed accepted index")),
+            "expected the anchored-frontier refusal, got {error:?}"
         );
     }
 
@@ -5093,17 +5183,16 @@ mod tests {
     fn checkpoint_apply_equals_live_apply_on_wholly_hot_history() {
         struct RefusingReader;
         impl SealedAcceptedIndexRead for RefusingReader {
-            fn sealed_map_node(
-                &self,
-                _link: AuthenticatedMapLinkV1,
-            ) -> Result<SealedAuthenticatedMapNodeV2, SealedAcceptedIndexError> {
-                panic!("hot history must not consult the sealed index");
-            }
-            fn sealed_causal_record(
+            fn batch(
                 &self,
                 _batch_id: [u8; 16],
-                _address: ContentDigest,
-            ) -> Result<SealedAcceptedCausalRecordV2, SealedAcceptedIndexError> {
+            ) -> Result<Option<SealedBatchRecords>, SealedAcceptedIndexError> {
+                panic!("hot history must not consult the sealed index");
+            }
+            fn sequence(
+                &self,
+                _sequence: u64,
+            ) -> Result<Option<[u8; 16]>, SealedAcceptedIndexError> {
                 panic!("hot history must not consult the sealed index");
             }
         }
@@ -5167,12 +5256,11 @@ mod tests {
     /// Verified by this test before the fix; the anchor is now a floor.
     #[test]
     fn an_anchored_database_reopens_after_accepting_a_tail_batch() {
-        let (path, mut database, store, installed, request, _entries) =
+        let (path, mut database, sealed, installed, request, _entries) =
             anchored_candidate_with_covered_history();
         database.begin_candidate_build().unwrap();
-        let reader = SealedAcceptedIndexReader::new(&store);
         database
-            .apply_checkpoint_candidate(&reader, &installed, &request)
+            .apply_checkpoint_candidate(&sealed, &installed, &request)
             .unwrap();
         database.finish_candidate_build().unwrap();
         drop(database);
@@ -5197,17 +5285,16 @@ mod tests {
     /// once as the retried batch arriving at a frontier that never moved.
     #[test]
     fn an_anchored_apply_rolls_back_reopens_and_retries_after_a_failure() {
-        let (path, database, store, installed, request, _entries) =
+        let (path, database, sealed, installed, request, _entries) =
             anchored_candidate_with_covered_history();
         drop(database);
-        let reader = SealedAcceptedIndexReader::new(&store);
 
         let mut faulted = request.clone();
         faulted.fault = ApplyFault::ReturnAfterInsert;
         {
             let mut connection = reopen_connection(&path);
             assert_eq!(
-                apply_checkpoint(&mut connection, &reader, &installed, &faulted),
+                apply_checkpoint(&mut connection, &sealed, &installed, &faulted),
                 Err(FrontierError::InjectedFailure)
             );
             // The fault fires AFTER the event insert, so a missing rollback would
@@ -5223,7 +5310,7 @@ mod tests {
 
         {
             let mut connection = reopen_connection(&path);
-            let result = apply_checkpoint(&mut connection, &reader, &installed, &request)
+            let result = apply_checkpoint(&mut connection, &sealed, &installed, &request)
                 .expect("the retried batch is ordinary new work, not a duplicate");
             assert_eq!(result.disposition, ApplyDisposition::Applied);
             assert_eq!(read_frontier(&connection).unwrap().applied_batch_count, 2);
@@ -5245,16 +5332,15 @@ mod tests {
     /// digest is the ACTIVE frontier's rather than the anchor's.
     #[test]
     fn an_anchored_materialized_tail_advances_the_stamp_and_still_reopens() {
-        let (path, mut database, store, installed, request, _entries) =
+        let (path, mut database, sealed, installed, request, _entries) =
             anchored_candidate_with_covered_history();
         let mut materialized = request.clone();
         materialized.materialization = Some(materialization(request.batch.batch_id));
         materialized.materialization_input_digest = Some(ContentDigest::of(b"anchored tail input"));
 
         database.begin_candidate_build().unwrap();
-        let reader = SealedAcceptedIndexReader::new(&store);
         database
-            .apply_checkpoint_candidate(&reader, &installed, &materialized)
+            .apply_checkpoint_candidate(&sealed, &installed, &materialized)
             .unwrap();
         database.finish_candidate_build().unwrap();
         drop(database);
@@ -5289,8 +5375,6 @@ mod tests {
     /// question on its own: it is blind to a read-only walk of the whole covered
     /// tree, and `INSERT OR IGNORE` hides rewrites of nodes already present.
     /// This counts the reads.
-    use crate::sealed_accepted_index::SealedAuthenticatedMapNodeV2;
-
     struct CountingSealedReader<'a> {
         inner: &'a dyn SealedAcceptedIndexRead,
         map_nodes: std::cell::Cell<usize>,
@@ -5308,21 +5392,17 @@ mod tests {
     }
 
     impl SealedAcceptedIndexRead for CountingSealedReader<'_> {
-        fn sealed_map_node(
-            &self,
-            link: AuthenticatedMapLinkV1,
-        ) -> Result<SealedAuthenticatedMapNodeV2, SealedAcceptedIndexError> {
-            self.map_nodes.set(self.map_nodes.get() + 1);
-            self.inner.sealed_map_node(link)
-        }
-
-        fn sealed_causal_record(
+        fn batch(
             &self,
             batch_id: [u8; 16],
-            address: ContentDigest,
-        ) -> Result<SealedAcceptedCausalRecordV2, SealedAcceptedIndexError> {
+        ) -> Result<Option<SealedBatchRecords>, SealedAcceptedIndexError> {
             self.causal_records.set(self.causal_records.get() + 1);
-            self.inner.sealed_causal_record(batch_id, address)
+            self.inner.batch(batch_id)
+        }
+
+        fn sequence(&self, sequence: u64) -> Result<Option<[u8; 16]>, SealedAcceptedIndexError> {
+            self.map_nodes.set(self.map_nodes.get() + 1);
+            self.inner.sequence(sequence)
         }
     }
 
@@ -5333,15 +5413,13 @@ mod tests {
     ) -> (
         TestDatabase,
         PhysicalSqliteDatabase,
-        TestSealedStore,
+        TestSealedIndex,
         PhysicalFrontierRoot,
         PhysicalApplyRequest,
         Vec<([u8; 16], ContentDigest)>,
     ) {
         assert!(covered >= 1);
-        let mut store = TestSealedStore::default();
-        let mut writer = SealedAcceptedIndexWriter::new(&mut store);
-        let mut batch_root = AuthenticatedMapRootV1::empty();
+        let mut sealed_entries: Vec<SealedEntry> = Vec::new();
         let mut entries = Vec::new();
         let mut clock: Vec<SealedAcceptedCausalClockEntryV2> = Vec::new();
         for index in 0..covered {
@@ -5364,17 +5442,17 @@ mod tests {
                 causal_counter: 1,
                 canonical_causal_clock: clock.clone(),
             };
-            let address = writer.publish_causal(&causal).unwrap();
-            batch_root = writer.upsert_map(batch_root, batch_id, address).unwrap();
+            let address = causal.address().unwrap();
+            sealed_entries.push(SealedEntry {
+                sequence: u64::try_from(index).unwrap() + 1,
+                causal,
+            });
             entries.push((batch_id, address));
         }
-        drop(writer);
+        let sealed = TestSealedIndex::build(&sealed_entries);
         entries.sort_unstable_by_key(|entry| entry.0);
 
         let covered_count = u64::try_from(covered).unwrap();
-        let covered_root_key = batch_root
-            .root
-            .map(|link| key_as_id(link.key, "test batch ID").unwrap());
         let empty = authenticated_map_empty_digest();
         let generation = PhysicalCheckpointGenerationBinding {
             generation_id: id(2),
@@ -5385,14 +5463,7 @@ mod tests {
             covered_block_count: 0,
             covered_retained_bytes_total: 10,
             covered_semantic_capsules_root_digest: ContentDigest::of(b"capsules"),
-            covered_batch_root_key: covered_root_key,
-            covered_batch_root_digest: batch_root.root_digest(),
-            covered_status_root_key: covered_root_key,
-            covered_status_root_digest: batch_root.root_digest(),
-            covered_sequence_root_digest: Some(ContentDigest::of(b"sequence")),
-            covered_sequence_height: 0,
-            covered_causal_tip_root_key: Some(id(1000)),
-            covered_causal_tip_root_digest: ContentDigest::of(b"tip"),
+            sealed_root_digest: sealed.root_digest(),
             covered_head_facts_root_digest: ContentDigest::of(b"heads"),
             current_projection_payload_pins_root_digest: ContentDigest::of(b"payloads"),
             nonlinear_state_root_digest: ContentDigest::of(b"nonlinear"),
@@ -5407,15 +5478,8 @@ mod tests {
             retained_bytes_total: 10,
             document_map_root_key: None,
             document_map_root_digest: empty,
-            batch_map_root_key: covered_root_key,
-            batch_map_root_digest: batch_root.root_digest(),
-            batch_map_count: covered_count,
-            status_map_root_key: covered_root_key,
-            status_map_root_digest: batch_root.root_digest(),
-            status_map_count: covered_count,
-            sequence_root_digest: Some(ContentDigest::of(b"sequence")),
-            sequence_height: 0,
-            sequence_count: covered_count,
+            batch_map_root_key: None,
+            batch_map_root_digest: authenticated_map_empty_digest(),
             generation: generation.clone(),
             state_digest: ContentDigest::of(b"state"),
         };
@@ -5444,8 +5508,12 @@ mod tests {
             document_count: 0,
             document_map_root_key: None,
             document_map_root_digest: empty,
-            batch_map_root_key: covered_root_key,
-            batch_map_root_digest: batch_root.root_digest(),
+            batch_map_root_key: None,
+            batch_map_root_digest: empty,
+            anchor: Some(PhysicalSealedAnchor {
+                sealed_root_digest: sealed.root_digest(),
+                covered_sequence: covered_count,
+            }),
             state_digest: ContentDigest::of(b"state"),
         };
 
@@ -5491,8 +5559,9 @@ mod tests {
             digest: clock_digest,
         };
         let record_digest = accepted_batch_causal_record_digest(&tail, &clock_root);
-        let mut post_entries = entries.clone();
-        post_entries.push((tail_id, record_digest));
+        // The treap holds the TAIL only: covered batches are sealed table
+        // entries, not treap nodes.
+        let mut post_entries = vec![(tail_id, record_digest)];
         post_entries.sort_unstable_by_key(|entry| entry.0);
         let (post_key, post_digest) = batch_map_root(&post_entries);
         let mut post = installed.clone();
@@ -5509,7 +5578,7 @@ mod tests {
             materialization_input_digest: None,
             fault: ApplyFault::None,
         };
-        (path, database, store, installed, request, post_entries)
+        (path, database, sealed, installed, request, post_entries)
     }
 
     fn clock_rows(path: &TestDatabase) -> i64 {
@@ -5587,21 +5656,24 @@ mod tests {
         }
     }
 
-    /// I-14: the cost of one anchored apply tracks the TREE, not the history.
+    /// I-14: the cost of one anchored apply does not track the history.
     ///
-    /// The claim the campaign rests on is not "O(log n)" as a hard fact -- treap
-    /// depth is expected-logarithmic under digest-derived priorities, with a
-    /// hard 256-node refusal ceiling (`MAX_AUTHENTICATED_MAP_DEPTH`). What must
-    /// be true is that a 256x larger covered history does not cost 256x more.
+    /// On the retired sealed treap this could only be stated as "expected
+    /// logarithmic": the seam was a NODE seam, so a covered lookup cost one
+    /// sealed read per level of a tree whose depth grew with history, and the
+    /// assertion had to be a generous ceiling (18 reads over 256 batches, with
+    /// 48 allowed). Sorted tables make the seam a POINT seam: one `batch()` per
+    /// covered id, whatever the history. So the assertion is now EQUALITY
+    /// between 1 covered batch and 256, and it fails on any term that grows.
+    ///
     /// Reads, not row growth, are what is counted: a read-only walk of the whole
-    /// covered tree would leave the row delta untouched.
+    /// covered set would leave the row delta untouched.
     #[test]
     fn an_anchored_apply_reads_the_path_not_the_covered_history() {
         fn sealed_reads(covered: u128) -> (usize, usize, i64) {
-            let (path, mut database, store, installed, request, _entries) =
+            let (path, mut database, sealed, installed, request, _entries) =
                 anchored_candidate_over(covered);
-            let inner = SealedAcceptedIndexReader::new(&store);
-            let counting = CountingSealedReader::new(&inner);
+            let counting = CountingSealedReader::new(&sealed);
             database
                 .apply_checkpoint(&counting, &installed, &request)
                 .expect("a tail batch applies over covered history");
@@ -5619,33 +5691,32 @@ mod tests {
             )
         }
 
-        let (small_nodes, small_records, small_clock) = sealed_reads(1);
-        let (large_nodes, large_records, large_clock) = sealed_reads(256);
+        let (small_sequences, small_batches, small_clock) = sealed_reads(1);
+        let (large_sequences, large_batches, large_clock) = sealed_reads(256);
         println!(
-            "1 covered  => {small_nodes} sealed map reads, {small_records} records, \
-             {small_clock} clock rows\n\
-             256 covered => {large_nodes} sealed map reads, {large_records} records, \
-             {large_clock} clock rows"
+            "1 covered  => {small_batches} sealed batch lookups, \
+             {small_sequences} sequence lookups, {small_clock} clock rows\n\
+             256 covered => {large_batches} sealed batch lookups, \
+             {large_sequences} sequence lookups, {large_clock} clock rows"
         );
 
-        // Causal-record reads track the dependency-head count, not the history
-        // size. Two per head, not one: the validation loop authenticates each
-        // head and `derive_causal_clock_root` then loads the same record again
-        // to union its clock. That is a constant factor on a one-element list,
-        // deliberately left alone rather than cached across the two phases.
-        assert_eq!(small_records, 2);
-        assert_eq!(large_records, 2);
-
-        // 256x the history. Measured: 3 reads over 1 covered batch, 18 over
-        // 256 -- two descents' worth of nodes, times a small constant. A walk
-        // would be at least 256. The ceiling is deliberately generous: this
-        // must fail on a walk, not on an extra probe.
-        assert!(
-            large_nodes <= 48,
-            "sealed map-node reads grew with history, not with depth: \
-             {small_nodes} over 1 batch, {large_nodes} over 256"
+        // Batch lookups track the dependency-head count plus the re-delivery
+        // guard, not the history size. Measured: 3 either way -- one guard, and
+        // two per head, because the validation loop authenticates each head and
+        // `derive_causal_clock_root` then loads the same record again to union
+        // its clock. That second read is a constant factor on a one-element
+        // list, deliberately left alone rather than cached across the phases.
+        assert_eq!(
+            small_batches, large_batches,
+            "a point seam must not cost more over a longer history: \
+             {small_batches} over 1 batch, {large_batches} over 256"
         );
-        assert!(large_nodes > small_nodes, "the deeper tree must cost more");
+        assert_eq!(large_batches, 3);
+
+        // Apply never asks the sequence index anything: it is a reverse lookup
+        // for readers, not a write-path term.
+        assert_eq!(small_sequences, 0);
+        assert_eq!(large_sequences, 0);
 
         // The clock term is real and is NOT bounded by the batch-map height:
         // 1498 hot clock rows for a 256-peer covered clock, against 3 for one
@@ -5658,17 +5729,16 @@ mod tests {
         // is `INSERT OR IGNORE`, so the walk writes only the handful of nodes on
         // the new dot's insertion path.
         assert!(large_clock > 100, "the fixture must exercise a wide clock");
-        let (path, mut database, store, installed, first, entries) = anchored_candidate_over(64);
-        let reader = SealedAcceptedIndexReader::new(&store);
+        let (path, mut database, sealed, installed, first, entries) = anchored_candidate_over(64);
         database
-            .apply_checkpoint(&reader, &installed, &first)
+            .apply_checkpoint(&sealed, &installed, &first)
             .unwrap();
         let after_first = first.batch.post_frontier_root.clone();
         let rows_after_first: i64 = clock_rows(&path);
 
         let second = second_tail_over_the_same_covered_parent(64, &after_first, &entries);
         database
-            .apply_checkpoint(&reader, &after_first, &second)
+            .apply_checkpoint(&sealed, &after_first, &second)
             .expect("a second tail may descend from the same covered parent");
         let rows_after_second = clock_rows(&path);
         let added = rows_after_second - rows_after_first;
@@ -5704,14 +5774,7 @@ mod tests {
             document_map_root_key: None,
             document_map_root_digest: empty,
             batch_map_root_key: None,
-            batch_map_root_digest: empty,
-            batch_map_count: 0,
-            status_map_root_key: None,
-            status_map_root_digest: empty,
-            status_map_count: 0,
-            sequence_root_digest: None,
-            sequence_height: 0,
-            sequence_count: 0,
+            batch_map_root_digest: authenticated_map_empty_digest(),
             generation: PhysicalCheckpointGenerationBinding {
                 generation_id: id(2),
                 predecessor_generation_id: None,
@@ -5721,14 +5784,7 @@ mod tests {
                 covered_block_count: 0,
                 covered_retained_bytes_total: 0,
                 covered_semantic_capsules_root_digest: ContentDigest::of(b"capsules"),
-                covered_batch_root_key: None,
-                covered_batch_root_digest: empty,
-                covered_status_root_key: None,
-                covered_status_root_digest: empty,
-                covered_sequence_root_digest: None,
-                covered_sequence_height: 0,
-                covered_causal_tip_root_key: None,
-                covered_causal_tip_root_digest: ContentDigest::of(b"tip"),
+                sealed_root_digest: sealed_empty_root_digest(),
                 covered_head_facts_root_digest: ContentDigest::of(b"heads"),
                 current_projection_payload_pins_root_digest: ContentDigest::of(b"payloads"),
                 nonlinear_state_root_digest: ContentDigest::of(b"nonlinear"),
@@ -5749,11 +5805,10 @@ mod tests {
     /// one, which descends through what the first wrote.
     #[test]
     fn a_second_anchored_apply_descends_through_the_overlay_the_first_wrote() {
-        let (_path, mut database, store, installed, first, entries) =
+        let (_path, mut database, sealed, installed, first, entries) =
             anchored_candidate_with_covered_history();
-        let reader = SealedAcceptedIndexReader::new(&store);
         database
-            .apply_checkpoint(&reader, &installed, &first)
+            .apply_checkpoint(&sealed, &installed, &first)
             .unwrap();
 
         let document = PhysicalFrontierDocument {
@@ -5769,7 +5824,7 @@ mod tests {
         );
         let after_second = second.batch.post_frontier_root.clone();
         database
-            .apply_checkpoint(&reader, &after_first, &second)
+            .apply_checkpoint(&sealed, &after_first, &second)
             .expect("a tail batch may introduce the first overlay document");
         assert!(after_second.document_map_root_key.is_some());
 
@@ -5786,7 +5841,7 @@ mod tests {
             std::slice::from_ref(&updated),
         );
         let result = database
-            .apply_checkpoint(&reader, &after_second, &third)
+            .apply_checkpoint(&sealed, &after_second, &third)
             .expect("the overlay node the previous apply wrote is hot and usable");
         assert_eq!(result.disposition, ApplyDisposition::Applied);
         assert_eq!(database.read_frontier().unwrap().applied_batch_count, 4);
@@ -5798,7 +5853,7 @@ mod tests {
     /// be satisfied by a root the candidate cannot walk.
     #[test]
     fn a_checkpoint_root_may_not_disagree_with_itself_about_the_overlay() {
-        let (_path, _database, _store, _installed, _request, _entries) =
+        let (_path, _database, _sealed, _installed, _request, _entries) =
             anchored_candidate_with_covered_history();
         let mut root = checkpoint_root_fixture();
         assert!(validate_checkpoint_root_shape(&root).is_ok());
@@ -5946,17 +6001,16 @@ mod tests {
     /// already have. See `FrontierError::CoveredBatchRedelivery`.
     #[test]
     fn a_covered_redelivery_is_named_rather_than_reported_as_an_ordering_fault() {
-        let (_path, mut database, store, installed, request, _entries) =
+        let (_path, mut database, sealed, installed, request, _entries) =
             anchored_candidate_with_covered_history();
         let covered_batch_id = id(101);
         let mut redelivery = request.clone();
         redelivery.batch.batch_id = covered_batch_id;
         redelivery.batch.acceptance_sequence = 1;
-        let reader = SealedAcceptedIndexReader::new(&store);
 
         assert!(
             matches!(
-                database.preflight_checkpoint(&reader, &installed, &redelivery),
+                database.preflight_checkpoint(&sealed, &installed, &redelivery),
                 Err(FrontierError::CoveredBatchRedelivery(id)) if id == covered_batch_id
             ),
             "preflight must name the covered re-delivery"
@@ -5964,7 +6018,7 @@ mod tests {
         database.begin_candidate_build().unwrap();
         assert!(
             matches!(
-                database.apply_checkpoint_candidate(&reader, &installed, &redelivery),
+                database.apply_checkpoint_candidate(&sealed, &installed, &redelivery),
                 Err(FrontierError::CoveredBatchRedelivery(id)) if id == covered_batch_id
             ),
             "apply must name the covered re-delivery"
@@ -5975,7 +6029,7 @@ mod tests {
         let mut out_of_order = request.clone();
         out_of_order.batch.acceptance_sequence = 7;
         assert!(matches!(
-            database.apply_checkpoint_candidate(&reader, &installed, &out_of_order),
+            database.apply_checkpoint_candidate(&sealed, &installed, &out_of_order),
             Err(FrontierError::AcceptanceOrder {
                 expected: 2,
                 found: 7
@@ -5996,11 +6050,10 @@ mod tests {
     /// already committed.
     #[test]
     fn a_covered_id_offered_at_the_expected_next_sequence_cannot_replace_its_map_value() {
-        let (_path, mut database, store, installed, request, _entries) =
+        let (_path, mut database, sealed, installed, request, _entries) =
             anchored_candidate_with_covered_history();
         let covered = id(101);
         let peer = id(900);
-        let reader = SealedAcceptedIndexReader::new(&store);
 
         let mut collide = request.clone();
         collide.batch.batch_id = covered;
@@ -6025,7 +6078,7 @@ mod tests {
 
         assert!(
             matches!(
-                database.apply_checkpoint(&reader, &installed, &collide),
+                database.apply_checkpoint(&sealed, &installed, &collide),
                 Err(FrontierError::CoveredBatchRedelivery(id)) if id == covered
             ),
             "a covered id at the expected next sequence must not be insertable"
@@ -6047,19 +6100,18 @@ mod tests {
     /// with the floor at 1 and the frontier at 3.
     #[test]
     fn a_stamp_between_the_floor_and_the_frontier_is_bound_to_its_own_sequence() {
-        let (path, mut database, store, installed, first, entries) =
+        let (path, mut database, sealed, installed, first, entries) =
             anchored_candidate_with_covered_history();
-        let reader = SealedAcceptedIndexReader::new(&store);
         let mut materialized = first.clone();
         materialized.materialization = Some(materialization(first.batch.batch_id));
         materialized.materialization_input_digest = Some(ContentDigest::of(b"first tail input"));
         database
-            .apply_checkpoint(&reader, &installed, &materialized)
+            .apply_checkpoint(&sealed, &installed, &materialized)
             .unwrap();
         let after_first = first.batch.post_frontier_root.clone();
         let (second, _) = anchored_tail(&after_first, &entries, first.batch.batch_id, &[]);
         database
-            .apply_checkpoint(&reader, &after_first, &second)
+            .apply_checkpoint(&sealed, &after_first, &second)
             .unwrap();
         drop(database);
 
@@ -6124,10 +6176,9 @@ mod tests {
     /// writes nothing, and an incomplete one is REPAIRED.
     #[test]
     fn a_clock_missing_a_descendant_is_repaired_rather_than_trusted() {
-        let (path, mut database, store, installed, first, entries) = anchored_candidate_over(64);
-        let reader = SealedAcceptedIndexReader::new(&store);
+        let (path, mut database, sealed, installed, first, entries) = anchored_candidate_over(64);
         database
-            .apply_checkpoint(&reader, &installed, &first)
+            .apply_checkpoint(&sealed, &installed, &first)
             .unwrap();
         let after_first = first.batch.post_frontier_root.clone();
         drop(database);
@@ -6166,7 +6217,7 @@ mod tests {
         let mut database = PhysicalSqliteDatabase::open_writable(&path.path).unwrap();
         let second = second_tail_over_the_same_covered_parent(64, &after_first, &entries);
         database
-            .apply_checkpoint(&reader, &after_first, &second)
+            .apply_checkpoint(&sealed, &after_first, &second)
             .expect("a second tail over the same covered parent still applies");
         drop(database);
 
@@ -6199,15 +6250,18 @@ mod tests {
     #[test]
     fn an_id_in_the_map_without_its_row_is_refused_with_no_reader_and_with_no_anchor() {
         // Arm 1: an anchored database, through ordinary `apply` (sealed = None).
-        // The first tail is applied through the checkpoint entry point first, so
-        // the covered node is HOT and a readerless descent finds it instead of
-        // failing on a sealed link.
-        let (path, mut database, store, installed, first_tail, entries) =
+        //
+        // With sorted tables a covered batch NEVER becomes a hot treap node, so
+        // the readerless descent can no longer find it and then misclassify it:
+        // ordinary `apply` refuses the anchored root outright, before any
+        // classification, naming the missing sealed half (I-8). That is a
+        // strictly earlier refusal than the guard this arm used to reach, and
+        // the committed-state assertions below are what keep it honest.
+        let (path, mut database, sealed, installed, first_tail, entries) =
             anchored_candidate_with_covered_history();
         let covered = id(101);
-        let reader = SealedAcceptedIndexReader::new(&store);
         database
-            .apply_checkpoint(&reader, &installed, &first_tail)
+            .apply_checkpoint(&sealed, &installed, &first_tail)
             .unwrap();
         let after_first = first_tail.batch.post_frontier_root.clone();
 
@@ -6252,15 +6306,11 @@ mod tests {
             "the EXPECTED next sequence"
         );
         let error = database.apply(&after_first, &replace).unwrap_err();
-        // The GUARD's message specifically, not "either refusal fired". Accepting
-        // the `Ordering::Equal` message here too would let each of D2's two
-        // defenses stand in for the other: verification neutered the guard, the
-        // upsert arm refused instead, and this test stayed green. It is supposed
-        // to fail when the guard is gone.
         assert!(
-            matches!(&error, FrontierError::Corrupt(message)
-                if message.contains("is missing its exact record")),
-            "ordinary apply must refuse at the GUARD, got {error:?}"
+            matches!(&error, FrontierError::InvalidInput(message)
+                if message.contains("anchored frontier")
+                    && message.contains("sealed accepted index")),
+            "ordinary apply over an anchored root must refuse, got {error:?}"
         );
         assert_eq!(database.read_frontier().unwrap().applied_batch_count, 2);
         drop(database);
@@ -6288,9 +6338,8 @@ mod tests {
         let _ = first_entries;
         let (mut second, _) = request(&after, 2, None, vec![document], &[], false);
         second.batch.batch_id = first.batch.batch_id;
-        let store = TestSealedStore::default();
-        let reader = SealedAcceptedIndexReader::new(&store);
-        let error = apply_checkpoint(&mut connection, &reader, &after, &second).unwrap_err();
+        let sealed = TestSealedIndex::empty();
+        let error = apply_checkpoint(&mut connection, &sealed, &after, &second).unwrap_err();
         assert!(
             matches!(&error, FrontierError::Corrupt(message)
                 if message.contains("is missing its exact record")),
@@ -6313,9 +6362,9 @@ mod tests {
 
         let batch_id = id(7);
         let first = ContentDigest::of(b"first value");
-        let link = upsert_batch_map(&connection, None, None, batch_id, first, 0).unwrap();
+        let link = upsert_batch_map(&connection, None, batch_id, first, 0).unwrap();
         assert_eq!(
-            load_batch_map_node_for_apply(&connection, None, &link)
+            load_batch_map_node(&connection, &link)
                 .unwrap()
                 .value_digest,
             first,
@@ -6324,7 +6373,6 @@ mod tests {
 
         let error = upsert_batch_map(
             &connection,
-            None,
             Some(link.clone()),
             batch_id,
             ContentDigest::of(b"replacement value"),
@@ -6337,7 +6385,7 @@ mod tests {
             "re-inserting a present key must refuse, got {error:?}"
         );
         assert_eq!(
-            load_batch_map_node_for_apply(&connection, None, &link)
+            load_batch_map_node(&connection, &link)
                 .unwrap()
                 .value_digest,
             first,
@@ -6353,12 +6401,11 @@ mod tests {
     /// re-delivery would hide real damage behind an ordinary-sounding refusal.
     #[test]
     fn a_lost_hot_row_is_corruption_not_a_covered_redelivery() {
-        let (path, mut database, store, installed, request, _entries) =
+        let (path, mut database, sealed, installed, request, _entries) =
             anchored_candidate_with_covered_history();
-        let reader = SealedAcceptedIndexReader::new(&store);
         let tail_id = request.batch.batch_id;
         database
-            .apply_checkpoint(&reader, &installed, &request)
+            .apply_checkpoint(&sealed, &installed, &request)
             .unwrap();
         let after = request.batch.post_frontier_root.clone();
         drop(database);
@@ -6377,7 +6424,7 @@ mod tests {
         let mut redelivery = request.clone();
         redelivery.batch.prior_frontier_root = after.clone();
         let error = database
-            .apply_checkpoint(&reader, &after, &redelivery)
+            .apply_checkpoint(&sealed, &after, &redelivery)
             .expect_err("a lost hot row must not be accepted");
         assert!(
             matches!(&error, FrontierError::Corrupt(message)
@@ -6391,18 +6438,19 @@ mod tests {
     /// needs the reader too.
     #[test]
     fn a_promoted_anchored_database_applies_a_tail_batch_through_ordinary_apply() {
-        let (_path, mut database, store, installed, request, _entries) =
+        let (_path, mut database, sealed, installed, request, _entries) =
             anchored_candidate_with_covered_history();
-        let reader = SealedAcceptedIndexReader::new(&store);
         assert!(
             matches!(
                 database.apply(&installed, &request),
-                Err(FrontierError::Corrupt(_))
+                Err(FrontierError::InvalidInput(message))
+                    if message.contains("anchored frontier")
+                        && message.contains("sealed accepted index")
             ),
             "the necessity gate: ordinary apply without the reader must still fail"
         );
         let result = database
-            .apply_checkpoint(&reader, &installed, &request)
+            .apply_checkpoint(&sealed, &installed, &request)
             .expect("ordinary anchored apply resolves covered history");
         assert_eq!(result.disposition, ApplyDisposition::Applied);
         assert_eq!(database.read_frontier().unwrap().applied_batch_count, 2);
@@ -6420,12 +6468,11 @@ mod tests {
     #[test]
     fn an_anchored_database_still_refuses_damage_below_and_beyond_its_floor() {
         fn advanced_anchored_database() -> TestDatabase {
-            let (path, mut database, store, installed, request, _entries) =
+            let (path, mut database, sealed, installed, request, _entries) =
                 anchored_candidate_with_covered_history();
             database.begin_candidate_build().unwrap();
-            let reader = SealedAcceptedIndexReader::new(&store);
             database
-                .apply_checkpoint_candidate(&reader, &installed, &request)
+                .apply_checkpoint_candidate(&sealed, &installed, &request)
                 .unwrap();
             database.finish_candidate_build().unwrap();
             drop(database);
@@ -6528,7 +6575,7 @@ mod tests {
         )
         .contains("materialization receipts are ahead of the materialization stamp"),);
 
-        // --- the anchor's own covered batch root ---
+        // --- the anchor's own sealed root ---
         //
         // The table has a CHECK tying the root to the covered count, but a CHECK
         // is a WRITE-time rule and reopen is the READ path -- so these cases need
@@ -6536,33 +6583,231 @@ mod tests {
         // argument for checking them again on read. A torn page does not consult
         // a CHECK either.
         //
-        // The NULL arm is not cosmetic: `is_covered_batch` reads a NULL root as
-        // "the covered map is empty", so without this refusal a nonzero-count
-        // anchor turns every genuine covered re-delivery into a corruption
-        // report about the wrong thing.
+        // The EMPTY-root arm is not cosmetic: a nonzero-count anchor naming the
+        // empty sealed root says "every covered batch is unreachable", so
+        // without this refusal a genuine covered re-delivery is reported as new
+        // work instead of being recognised.
+        assert!(refusal(&format!(
+            "PRAGMA ignore_check_constraints = ON;
+             UPDATE checkpoint_generation_anchor SET sealed_root_digest = x'{}'
+                 WHERE singleton = 1",
+            hex(sealed_empty_root_digest().as_bytes())
+        ))
+        .contains("sealed root does not match its covered count"),);
         assert!(refusal(
             "PRAGMA ignore_check_constraints = ON;
-             UPDATE checkpoint_generation_anchor SET covered_batch_root_key = NULL
+             UPDATE checkpoint_generation_anchor SET sealed_root_digest = x'00'
                  WHERE singleton = 1"
         )
-        .contains("covered batch root does not match its covered count"),);
-        assert!(refusal(
-            "PRAGMA ignore_check_constraints = ON;
-             UPDATE checkpoint_generation_anchor SET covered_batch_root_digest = x'00'
-                 WHERE singleton = 1"
-        )
-        .contains("covered batch root does not match its covered count"),);
+        .contains("sealed root does not match its covered count"),);
+    }
+
+    /// The anchor's own arithmetic: what a root says about its two halves.
+    ///
+    /// `accepted_history_digest` is the one value a peer compares to decide
+    /// whether two devices hold the same accepted history, and on an anchored
+    /// root it has to fold BOTH halves. Folding only the tail would make a
+    /// database that had just sealed its history look identical to an empty
+    /// one; folding only the sealed half would ignore every batch since.
+    #[test]
+    fn an_anchored_root_reports_its_covered_prefix_and_its_tail() {
+        let sealed_root = ContentDigest::of(b"a sealed table root");
+        let batches = [(id(5), ContentDigest::of(b"tail record"))];
+
+        let live = root(3, &[], &batches);
+        assert_eq!(live.covered_sequence(), 0);
+        assert_eq!(live.tail_count(), 3);
+        assert_eq!(
+            live.accepted_history_digest(),
+            live.batch_map_root_digest,
+            "a live root's accepted history IS its treap"
+        );
+
+        let anchored = anchored_root(3, &[], &batches, sealed_root, 2);
+        assert_eq!(anchored.covered_sequence(), 2);
+        assert_eq!(anchored.tail_count(), 1);
+        assert_ne!(
+            anchored.accepted_history_digest(),
+            anchored.batch_map_root_digest,
+            "an anchored root must not report its tail as its whole history"
+        );
+
+        // Both halves are load-bearing: move either and the digest moves.
+        let other_sealed = anchored_root(
+            3,
+            &[],
+            &batches,
+            ContentDigest::of(b"a different sealed root"),
+            2,
+        );
+        assert_ne!(
+            anchored.accepted_history_digest(),
+            other_sealed.accepted_history_digest()
+        );
+        let other_tail = anchored_root(
+            3,
+            &[],
+            &[(id(6), ContentDigest::of(b"another tail record"))],
+            sealed_root,
+            2,
+        );
+        assert_ne!(
+            anchored.accepted_history_digest(),
+            other_tail.accepted_history_digest()
+        );
+
+        // At the cutover the tail is empty and the whole history is sealed.
+        let cutover = anchored_root(2, &[], &[], sealed_root, 2);
+        assert_eq!(cutover.tail_count(), 0);
+        assert_eq!(cutover.batch_map_root_key, None);
+        assert_ne!(cutover.accepted_history_digest(), sealed_root);
+    }
+
+    /// GATE 5: the two-tier seam, both directions, with the consults counted.
+    ///
+    /// An anchored database answers `batch` and `sequence` for a covered id
+    /// from the SEALED half and for a tail id from the HOT treap -- and it must
+    /// do so with EXACTLY ONE sealed consult per covered lookup and ZERO for a
+    /// hot one. The count is the point: a seam that answers correctly but asks
+    /// twice, or asks at all for hot history, is the cost defect this release
+    /// exists to remove, and no correctness assertion can see it.
+    #[test]
+    fn an_anchored_seam_answers_covered_from_sealed_and_tail_from_sql() {
+        let (path, mut database, sealed, installed, request, _entries) =
+            anchored_candidate_with_covered_history();
+        let covered_id = id(101);
+        let tail_id = request.batch.batch_id;
+        database
+            .apply_checkpoint(&sealed, &installed, &request)
+            .unwrap();
+        let after = request.batch.post_frontier_root.clone();
+        assert_eq!(after.covered_sequence(), 1);
+        assert_eq!(after.tail_count(), 1);
+        drop(database);
+        let connection = Connection::open(&path.path).unwrap();
+
+        // The premise: covered history is absent as rows, so a hit for the
+        // covered id cannot be coming from SQL.
+        let hot_ids: Vec<Vec<u8>> = connection
+            .prepare("SELECT batch_id FROM applied_batches")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(hot_ids, vec![tail_id.to_vec()]);
+
+        // Sequence 1 is covered: one consult, answered by the sealed table.
+        sealed.reset_consults();
+        assert_eq!(
+            sequence_batch_id(&connection, Some(&sealed), &after, 1).unwrap(),
+            Some(covered_id)
+        );
+        assert_eq!(sealed.consults(), 1, "one covered lookup, one consult");
+
+        // Sequence 2 is the tail: answered by SQL, with no consult at all.
+        sealed.reset_consults();
+        assert_eq!(
+            sequence_batch_id(&connection, Some(&sealed), &after, 2).unwrap(),
+            Some(tail_id)
+        );
+        assert_eq!(sealed.consults(), 0, "a hot lookup must not touch sealed");
+
+        // Above the frontier and at zero: no answer, and still no consult.
+        sealed.reset_consults();
+        assert_eq!(
+            sequence_batch_id(&connection, Some(&sealed), &after, 3).unwrap(),
+            None
+        );
+        assert_eq!(
+            sequence_batch_id(&connection, Some(&sealed), &after, 0).unwrap(),
+            None
+        );
+        assert_eq!(sealed.consults(), 0);
+
+        // The same split on the batch axis: the covered answer costs one
+        // consult and the hot answer costs none.
+        sealed.reset_consults();
+        assert!(
+            batch_map_value(&connection, Some(&sealed), &after, covered_id)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(sealed.consults(), 1, "one covered lookup, one consult");
+
+        sealed.reset_consults();
+        assert!(batch_map_value(&connection, Some(&sealed), &after, tail_id)
+            .unwrap()
+            .is_some());
+        assert_eq!(sealed.consults(), 0, "a hot batch must not touch sealed");
+
+        // An id that is neither is answered once, negatively.
+        sealed.reset_consults();
+        assert!(batch_map_value(&connection, Some(&sealed), &after, id(999))
+            .unwrap()
+            .is_none());
+        assert_eq!(sealed.consults(), 1);
+    }
+
+    /// GATE 5, the live half: with no anchor, the seam never asks at all.
+    ///
+    /// This is the guard the "one audited write path" rule needs (D-7): a live
+    /// database's SQL is what it always was, and the sealed half is not merely
+    /// empty there but UNREACHED. A reader that panics on contact is the only
+    /// assertion that can say so.
+    #[test]
+    fn a_live_unanchored_frontier_never_reaches_the_sealed_half() {
+        struct Forbidden;
+        impl SealedAcceptedIndexRead for Forbidden {
+            fn batch(
+                &self,
+                _batch_id: [u8; 16],
+            ) -> Result<Option<SealedBatchRecords>, SealedAcceptedIndexError> {
+                panic!("an unanchored frontier must not consult the sealed index");
+            }
+            fn sequence(
+                &self,
+                _sequence: u64,
+            ) -> Result<Option<[u8; 16]>, SealedAcceptedIndexError> {
+                panic!("an unanchored frontier must not consult the sealed index");
+            }
+        }
+
+        let (path, mut connection, empty) = initialized();
+        assert!(empty.anchor.is_none());
+        let document = PhysicalFrontierDocument {
+            document_key: key(11),
+            canonical_bytes: b"live".to_vec(),
+        };
+        let (first, _) = request(&empty, 1, None, vec![document], &[], false);
+        let batch_id = first.batch.batch_id;
+        apply_checkpoint(&mut connection, &Forbidden, &empty, &first).unwrap();
+        let after = first.batch.post_frontier_root.clone();
+
+        assert_eq!(
+            sequence_batch_id(&connection, Some(&Forbidden), &after, 1).unwrap(),
+            Some(batch_id)
+        );
+        assert_eq!(
+            sequence_batch_id(&connection, Some(&Forbidden), &after, 2).unwrap(),
+            None
+        );
+        assert!(
+            batch_map_value(&connection, Some(&Forbidden), &after, batch_id)
+                .unwrap()
+                .is_some()
+        );
+        let _ = &path;
     }
 
     /// The fix: with the reader injected, the same tail batch applies.
     #[test]
     fn an_anchored_candidate_applies_a_tail_batch_over_covered_history() {
-        let (_path, mut database, store, installed, request, _entries) =
+        let (_path, mut database, sealed, installed, request, _entries) =
             anchored_candidate_with_covered_history();
         database.begin_candidate_build().unwrap();
-        let reader = SealedAcceptedIndexReader::new(&store);
         let result = database
-            .apply_checkpoint_candidate(&reader, &installed, &request)
+            .apply_checkpoint_candidate(&sealed, &installed, &request)
             .expect("a tail batch applies over covered history through the sealed reader");
         assert_eq!(result.disposition, ApplyDisposition::Applied);
     }
@@ -6847,26 +7092,11 @@ mod tests {
         entries
     }
 
-    /// The same `(key, value_digest)` set built by the sealed writer.
-    fn sealed_document_root(
-        documents: &[PhysicalFrontierDocument],
-        order: &[usize],
-    ) -> AuthenticatedMapRootV1 {
-        let entries = document_entries(documents);
-        let mut store = TestSealedStore::default();
-        let mut root = AuthenticatedMapRootV1::empty();
-        for index in order {
-            root = SealedAcceptedIndexWriter::new(&mut store)
-                .upsert_map(root, entries[*index].0, entries[*index].1)
-                .unwrap();
-        }
-        root
-    }
-
     /// The gate that would have caught a lossy document-map key: the live
-    /// SQLite treap, the sealed writer, and the Cartesian builder must produce
-    /// the same root key, digest and count over mixed 17/33-byte keys,
-    /// whatever order the entries arrive in.
+    /// SQLite treap and the Cartesian builder must produce the same root key,
+    /// digest and count over mixed 17/33-byte keys, whatever order the entries
+    /// arrive in. (The third arm, an incremental sealed writer, went with the
+    /// sealed treap: sorted tables have no incremental map upsert.)
     #[test]
     fn frontier_document_map_root_matches_sealed_and_cartesian_roots() {
         let documents = mixed_width_documents();
@@ -6874,15 +7104,6 @@ mod tests {
         let cartesian = authenticated_map_root(&entries).unwrap();
         let cartesian_key = cartesian.root.map(|link| link.key);
         assert_eq!(cartesian.count, documents.len() as u64);
-
-        // Three sealed insertion orders, all landing on the same root.
-        for order in [
-            (0..entries.len()).collect::<Vec<_>>(),
-            (0..entries.len()).rev().collect::<Vec<_>>(),
-            vec![4, 0, 8, 2, 6, 1, 7, 3, 5],
-        ] {
-            assert_eq!(sealed_document_root(&documents, &order), cartesian);
-        }
 
         // (a) live SQLite upserts, one batch carrying every document.
         let (_single_path, mut single, single_empty) = initialized_facade();
@@ -7265,7 +7486,7 @@ mod tests {
     /// `Contradiction("terminal construction requires an unstamped candidate")`.
     #[test]
     fn an_anchored_candidate_can_begin_and_finish_terminal_construction() {
-        let (_database, mut physical, _store, installed, _request, _covered) =
+        let (_database, mut physical, _sealed, installed, _request, _covered) =
             anchored_candidate_with_covered_history();
         // The premise, twice over: the cutoff is NONZERO, and covered history is
         // absent as rows. If either stops holding this proves nothing.
@@ -7340,7 +7561,7 @@ mod tests {
     /// disk error) and is refused by name.
     #[test]
     fn an_anchored_candidate_refuses_a_stamp_that_disagrees_with_its_anchor() {
-        let (database, physical, _store, _installed, _request, _covered) =
+        let (database, physical, _sealed, _installed, _request, _covered) =
             anchored_candidate_with_covered_history();
         drop(physical);
         let connection = reopen_connection(&database);

@@ -30,6 +30,7 @@ mod local_journal_v2;
 mod managed_layout;
 mod package_store;
 mod sealed_accepted_index_impl;
+mod sealed_tables_impl;
 mod sqlite_database;
 mod sqlite_fileset;
 mod sqlite_frontier;
@@ -120,14 +121,27 @@ pub mod sealed_accepted_index {
         accepted_causal_record_digest, authenticated_map_empty_digest,
         authenticated_map_node_digest, authenticated_map_priority,
         authenticated_map_priority_order, authenticated_map_root, causal_clock_counter_digest,
-        AcceptedEvidenceBindingV2, AcceptedSequenceChildV2, AcceptedSequenceEntryV2,
-        AcceptedSequenceNodeV2, AcceptedSequenceRootV2, AcceptedStatusRecordV2,
-        AuthenticatedMapKey, AuthenticatedMapLinkV1, AuthenticatedMapRootV1, CausalTipRecordV2,
+        AcceptedEvidenceBindingV2, AcceptedStatusRecordV2, AuthenticatedMapKey,
+        AuthenticatedMapLinkV1, AuthenticatedMapRootV1, CausalTipRecordV2,
         SealedAcceptedCausalClockEntryV2, SealedAcceptedCausalRecordV2,
-        SealedAcceptedEvidenceDecoder, SealedAcceptedIndexError, SealedAcceptedIndexObjectStore,
-        SealedAcceptedIndexRead, SealedAcceptedIndexReader, SealedAcceptedIndexRootsV2,
-        SealedAcceptedIndexWriter, SealedAcceptedMembershipProofV2, SealedAcceptedObjectKind,
-        SealedAuthenticatedMapNodeV2, MAX_ACCEPTED_INDEX_DEPTH,
+        SealedAcceptedEvidenceDecoder, SealedAcceptedIndexError, SealedAcceptedIndexRead,
+        SealedAcceptedObjectKind, SealedBatchRecords,
+    };
+}
+
+/// Immutable sorted tables: the physical shape of sealed accepted history.
+///
+/// The crate owns the table codec, lookup, k-way merge, tier planner and root
+/// record. It does **not** own the container: tables are addressed by an opaque
+/// [`sealed_tables::TableLocator`] and their bytes arrive through the caller's
+/// [`sealed_tables::TableBytes`] implementation, so nothing here names a file,
+/// a directory, or a marker.
+pub mod sealed_tables {
+    pub use crate::sealed_tables_impl::{
+        compact_tables, merge_tables, sealed_empty_root_digest, table_digest_verifications,
+        SealedTableDomainRoot, SealedTableRoot, TableBuilder, TableBytes, TableDomain,
+        TableLocator, TableRef, TableSetReader, TableView, TierCut, TierPlan, SEALED_BATCH_DOMAIN,
+        SEALED_ROOT_MAGIC, SEALED_SEQUENCE_DOMAIN, SEALED_TABLE_MAGIC, SEALED_TABLE_TOMBSTONE_BYTE,
     };
 }
 
