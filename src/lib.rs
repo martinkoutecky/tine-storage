@@ -56,7 +56,8 @@ pub mod sqlite {
         ApplyDisposition, ApplyFault, ApplyResult, FrontierError, PhysicalAcceptedBatch,
         PhysicalApplyRequest, PhysicalCheckpointFrontierRoot, PhysicalCheckpointGenerationAnchor,
         PhysicalCheckpointGenerationBinding, PhysicalClaim, PhysicalFrontierDocument,
-        PhysicalFrontierRoot, PreflightDisposition, StoredBatch, StoredFrontier,
+        PhysicalFrontierRoot, PhysicalSealedAnchor, PreflightDisposition, StoredBatch,
+        StoredFrontier,
     };
     pub use crate::sqlite_graph_projection::{
         PhysicalGraphProjectionDatabase, PhysicalGraphProjectionSourceDelta,

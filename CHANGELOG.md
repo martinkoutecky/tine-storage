@@ -5,6 +5,17 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.23.1] - 2026-09-14
+
+### Fixed
+
+- `sqlite::PhysicalSealedAnchor` is exported. 0.23.0 made it the type of the
+  public field `PhysicalFrontierRoot::anchor` without re-exporting it, so no
+  downstream crate could construct an anchored root: every apply over an
+  anchored database would have been lowered with `anchor: None`, reading
+  covered batches as absent. Caught by Tine's E1 core lane on the first
+  build against the pin.
+
 ## [0.23.0] - 2026-09-14
 
 ### Added
