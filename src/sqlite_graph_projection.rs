@@ -121,6 +121,37 @@ impl PhysicalGraphProjectionDatabase {
         Ok(())
     }
 
+    /// Relax (`true`) or restore (`false`) this writer's commit durability
+    /// for a bulk build: `PRAGMA synchronous = OFF` skips the fsync at each
+    /// commit and each WAL checkpoint; `NORMAL` is the ordinary setting
+    /// [`open_writable`](Self::open_writable) applies.
+    ///
+    /// The projection is a disposable cache rebuilt from the graph files, so
+    /// the only thing a missing fsync can cost is the build's own progress.
+    /// An application crash leaves WAL mode consistent either way; a power
+    /// loss can tear the file, which `quick_check` catches at the next open
+    /// and the caller rebuilds. A streaming build commits per batch, and at
+    /// GH tine#543's 10,000-page graph that is hundreds of commits and
+    /// checkpoints whose fsyncs are pure waiting on Windows. The caller
+    /// restores durability before the build's last commit is relied on.
+    pub fn set_build_durability(&self, relaxed: bool) -> Result<(), MaterializationError> {
+        self.connection.pragma_update(
+            None,
+            "synchronous",
+            if relaxed { "OFF" } else { "NORMAL" },
+        )?;
+        Ok(())
+    }
+
+    /// Whether commit durability is currently relaxed by
+    /// [`set_build_durability`](Self::set_build_durability).
+    pub fn build_durability_relaxed(&self) -> Result<bool, MaterializationError> {
+        let synchronous: i64 = self
+            .connection
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+        Ok(synchronous == 0)
+    }
+
     /// The page-cache ceiling currently in force, in bytes.
     pub fn page_cache_budget(&self) -> Result<u64, MaterializationError> {
         let cache_size: i64 = self
@@ -1140,6 +1171,33 @@ mod tests {
         );
         database.shrink_page_cache_budget(8 * 1024 * 1024).unwrap();
         assert_eq!(database.page_cache_budget().unwrap(), 8 * 1024 * 1024);
+        drop(database);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn build_durability_is_relaxed_and_restored_on_the_same_connection() {
+        let path = std::env::temp_dir().join(format!(
+            "tine-gh543-durability-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.initialize_schema().unwrap();
+        assert!(
+            !database.build_durability_relaxed().unwrap(),
+            "open_writable applies synchronous=NORMAL"
+        );
+        database.set_build_durability(true).unwrap();
+        assert!(database.build_durability_relaxed().unwrap());
+        // A write commits under the relaxed setting and reads back normally.
+        database.reset().unwrap();
+        database.set_build_durability(false).unwrap();
+        assert!(
+            !database.build_durability_relaxed().unwrap(),
+            "the ordinary per-edit durability is restored, not left at OFF"
+        );
         drop(database);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

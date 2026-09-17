@@ -5,6 +5,22 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.20.3] - 2026-09-17
+
+Patch line from v0.20.2, the revision Tine pins; the sealed-history work on
+`main` (0.21–0.23) is not included.
+
+### Added
+
+- `PhysicalGraphProjectionDatabase::set_build_durability(relaxed)` and
+  `build_durability_relaxed()`: a bulk build can run its per-batch commits
+  under `PRAGMA synchronous = OFF` and restore `NORMAL` before it closes.
+  The projection is a disposable cache; an application crash leaves WAL mode
+  consistent, and a torn file after power loss is what `quick_check` already
+  rebuilds. Tine's warm stream at 10,000 pages is hundreds of commits and
+  checkpoints whose fsyncs are pure waiting on Windows (GH tine#543).
+  Unit cost: none per edit; single-page deltas keep `NORMAL`.
+
 ## [0.20.2] - 2026-09-17
 
 Patch line from v0.20.1, the revision Tine pins; the sealed-history work on
