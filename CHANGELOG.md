@@ -5,6 +5,49 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.24.0] - 2026-09-17
+
+Continues the patch line Tine pins (v0.20.3). The sealed-history work on `main`
+already took 0.21–0.23, so those numbers are skipped rather than reused, and the
+change below is breaking — for a `0.x` crate `cargo semver-checks` requires the
+MINOR to move, which is why this is not v0.20.4.
+
+### Changed
+
+- **Breaking.** `navigation_reference_names_after` returns one row per distinct
+  spelling graph-wide instead of one per (page, spelling). Its cursor becomes
+  `Option<(&str, &str)>` — `(normalized_name, raw_name)` — and
+  `PhysicalNavigationReferenceNameRow` drops `source_page_id` and `owner_path`;
+  the one consumer folds the rows by name and read neither field. The statement
+  also drops its `pages` join. With the index below, draining every spelling on
+  a 10,000-page graph (1.2M postings) goes **1.276 s → 0.022 s**, 110,000 rows
+  in 215 batches → 10,010 in 20, and the plan is `SCAN`/`SEARCH … USING COVERING
+  INDEX` with no join and no temp B-tree for either the `DISTINCT` or the
+  `ORDER BY`. The returned name set is unchanged, verified by set comparison
+  rather than row counts (GH tine#543).
+
+### Added
+
+- `reference_postings_navigation_names_idx` on
+  `reference_postings(normalized_name, raw_name, reference_kind)
+  WHERE target_type = 0`, which covers that read entirely. Column order is
+  load-bearing: putting `reference_kind` first puts a range predicate ahead of
+  the sort keys, costs `USE TEMP B-TREE FOR ORDER BY`, and measures 1.765 s —
+  slower than no index at all.
+  Unit cost: 88.4 MB on a 1.64 GB projection (5.4%, measured with `dbstat`, not
+  by differencing a vacuumed file), ~1.8 s to build. Per edit, the
+  `reference_postings` replacement step of a save costs +0.007 ms on a
+  1-posting page and +0.057 ms on a 60-posting page (interleaved A/B/A/B, 60
+  cycles per arm).
+
+### Changed (schema)
+
+- `SQLITE_SCHEMA_VERSION` moves 28 → 29 for the index above, so every existing
+  projection is refused and rebuilt once on first open after the update.
+  Martin accepted that cost explicitly on 2026-09-17 while the projection
+  schema is still being tuned; it is not a precedent for adding an index
+  casually once it settles.
+
 ## [0.20.3] - 2026-09-17
 
 Patch line from v0.20.2, the revision Tine pins; the sealed-history work on

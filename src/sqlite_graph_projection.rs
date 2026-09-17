@@ -23,7 +23,7 @@ const SOURCE_REVISION_MAX_BYTES: usize = 4096;
 const SOURCE_REVISIONS_DDL: &str = "CREATE TABLE direct_source_revisions (
     page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16),
     revision TEXT NOT NULL CHECK (length(CAST(revision AS BLOB)) BETWEEN 1 AND 4096),
-    query_metadata_schema INTEGER NOT NULL DEFAULT 28 CHECK (query_metadata_schema = 28),
+    query_metadata_schema INTEGER NOT NULL DEFAULT 29 CHECK (query_metadata_schema = 29),
     FOREIGN KEY (page_id) REFERENCES pages(page_id) ON DELETE CASCADE
 ) STRICT";
 
@@ -1083,7 +1083,7 @@ mod tests {
             .unwrap()
     }
 
-    /// GH #543: an apply into an empty projection builds the 35 secondary
+    /// GH #543: an apply into an empty projection builds the 36 secondary
     /// indexes once after its rows; the committed schema is the fresh schema
     /// byte for byte, and the next apply into the populated projection keeps
     /// every index live. A rollback restores the indexes too.
@@ -1096,7 +1096,7 @@ mod tests {
         let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
         database.initialize_schema().unwrap();
         let fresh_indexes = secondary_index_count(&database.connection);
-        assert_eq!(fresh_indexes, 35);
+        assert_eq!(fresh_indexes, 36);
         let (change, revisions, order) = gh543_snapshot(3);
 
         database
@@ -2311,9 +2311,14 @@ mod tests {
             return Err(format!("expected `{expected}…` in plan {plan:?}"));
         }
         // An index-ordered scan streams and `LIMIT` ends it; a table scan or
-        // a sort of the whole result does not.
+        // a sort of the whole result does not. SQLite spells an index-driven
+        // scan two ways — `USING INDEX` and `USING COVERING INDEX` — and the
+        // covering form is the stronger one (it never touches the table), so
+        // accepting only the first would reject the better plan.
         if let Some(line) = plan.iter().find(|line| {
-            (line.starts_with("SCAN ") && !line.contains(" USING INDEX "))
+            (line.starts_with("SCAN ")
+                && !line.contains(" USING INDEX ")
+                && !line.contains(" USING COVERING INDEX "))
                 || line.as_str() == "USE TEMP B-TREE FOR ORDER BY"
         }) {
             return Err(format!(
@@ -2342,12 +2347,12 @@ mod tests {
             (
                 NAVIGATION_REFERENCE_NAMES_FIRST_SQL,
                 &[limit.clone()],
-                "SCAN r USING INDEX reference_postings_normalized_name_idx",
+                "SCAN r USING COVERING INDEX reference_postings_navigation_names_idx",
             ),
             (
                 NAVIGATION_REFERENCE_NAMES_AFTER_SQL,
-                &[text("topic"), blob.clone(), text("Topic"), limit.clone()],
-                "SEARCH r USING INDEX reference_postings_normalized_name_idx",
+                &[text("topic"), text("Topic"), limit.clone()],
+                "SEARCH r USING COVERING INDEX reference_postings_navigation_names_idx",
             ),
             (
                 NAVIGATION_ALIASES_FIRST_SQL,
@@ -2436,7 +2441,17 @@ mod tests {
             .unwrap();
         let read = database.read();
         let all = read.navigation_reference_names_after(None, 100).unwrap();
-        assert_eq!(all.len(), 6, "{all:?}");
+        // One row per distinct spelling GRAPH-WIDE, not per source page: the
+        // seven postings above carry five distinct (normalized_name, raw_name)
+        // pairs. "Zeta" is posted from pages 1 and 2 and appears once.
+        assert_eq!(all.len(), 5, "{all:?}");
+        assert_eq!(
+            all.iter()
+                .filter(|row| row.raw_name == "Zeta" && row.normalized_name == "zeta")
+                .count(),
+            1,
+            "a spelling shared by two pages must be offered once: {all:?}"
+        );
 
         for batch in 1..=3 {
             let mut paged = Vec::new();
@@ -2444,14 +2459,9 @@ mod tests {
             loop {
                 let rows = read
                     .navigation_reference_names_after(
-                        after.as_ref().map(|row| {
-                            (
-                                row.owner_path.as_str(),
-                                row.raw_name.as_str(),
-                                row.normalized_name.as_str(),
-                                &row.source_page_id,
-                            )
-                        }),
+                        after
+                            .as_ref()
+                            .map(|row| (row.normalized_name.as_str(), row.raw_name.as_str())),
                         batch,
                     )
                     .unwrap();

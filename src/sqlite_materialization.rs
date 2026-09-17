@@ -868,6 +868,22 @@ pub const REFERENCE_POSTINGS_NORMALIZED_NAME_INDEX_DDL: &str =
 pub const REFERENCE_POSTINGS_RAW_UUID_INDEX_DDL: &str = "CREATE INDEX reference_postings_raw_uuid_idx
     ON reference_postings(raw_uuid_claim, source_page_id, source_entity_type, source_entity_id, ordinal)
     WHERE target_type = 1";
+/// Covers the whole navigation name read: the key is exactly the statement's
+/// `DISTINCT`/`ORDER BY` tuple, and `reference_kind` rides along so the
+/// `<= 4` filter is answered from the index too. Nothing in
+/// `NAVIGATION_REFERENCE_NAMES_*_SQL` needs the table.
+///
+/// `reference_postings_normalized_name_idx` cannot serve this read: it lacks
+/// `raw_name`, so each row fell back to the table, and its key order forces a
+/// temp B-tree for the `DISTINCT`. Measured on a 10,000-page graph (1.2M
+/// postings), draining every distinct spelling went 1.276 s -> 0.022 s and
+/// 110,000 rows -> 10,010. Column order is load-bearing: putting
+/// `reference_kind` FIRST (a range predicate ahead of the sort keys) makes
+/// SQLite sort instead, measuring 1.765 s — slower than no index at all.
+pub const REFERENCE_POSTINGS_NAVIGATION_NAMES_INDEX_DDL: &str =
+    "CREATE INDEX reference_postings_navigation_names_idx
+    ON reference_postings(normalized_name, raw_name, reference_kind)
+    WHERE target_type = 0";
 pub const REFERENCE_ALIAS_DECLARATIONS_SOURCE_INDEX_DDL: &str =
     "CREATE INDEX reference_alias_declarations_source_idx
     ON reference_alias_declarations(source_page_id, source_entity_type, source_entity_id, ordinal)";
@@ -921,7 +937,7 @@ pub const PROPERTY_ATOMS_PAGE_INDEX_DDL: &str = "CREATE INDEX property_atoms_pag
 // indexes and both FTS virtual tables remain live throughout construction.
 // This list must reproduce the exact normal schema before the terminal stamp
 // can advance.
-const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 35] = [
+const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 36] = [
     ("pages_name_idx", PAGES_NAME_INDEX_DDL),
     ("pages_name_key_idx", PAGES_NAME_KEY_INDEX_DDL),
     ("pages_journal_day_idx", PAGES_JOURNAL_DAY_INDEX_DDL),
@@ -954,6 +970,10 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 35] = [
     (
         "reference_postings_raw_uuid_idx",
         REFERENCE_POSTINGS_RAW_UUID_INDEX_DDL,
+    ),
+    (
+        "reference_postings_navigation_names_idx",
+        REFERENCE_POSTINGS_NAVIGATION_NAMES_INDEX_DDL,
     ),
     (
         "reference_alias_declarations_source_idx",
@@ -1252,7 +1272,7 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 29] = [
     ),
 ];
 
-const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 65] = [
+const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 66] = [
     ("table", "materialization_stamp", MATERIALIZATION_STAMP_DDL),
     (
         "table",
@@ -1378,6 +1398,11 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 65] = [
         "index",
         "reference_postings_raw_uuid_idx",
         REFERENCE_POSTINGS_RAW_UUID_INDEX_DDL,
+    ),
+    (
+        "index",
+        "reference_postings_navigation_names_idx",
+        REFERENCE_POSTINGS_NAVIGATION_NAMES_INDEX_DDL,
     ),
     (
         "index",
@@ -1549,6 +1574,7 @@ pub(crate) fn initialize_graph_projection_schema(
          {REFERENCE_POSTINGS_SOURCE_INDEX_DDL};
          {REFERENCE_POSTINGS_NORMALIZED_NAME_INDEX_DDL};
          {REFERENCE_POSTINGS_RAW_UUID_INDEX_DDL};
+         {REFERENCE_POSTINGS_NAVIGATION_NAMES_INDEX_DDL};
          {REFERENCE_ALIAS_DECLARATIONS_SOURCE_INDEX_DDL};
          {REFERENCE_ALIAS_BINDINGS_NORMALIZED_ALIAS_INDEX_DDL};
          {PROPERTIES_LOOKUP_INDEX_DDL};
@@ -4013,11 +4039,15 @@ pub struct PhysicalNavigationAliasRow {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+/// One distinct page-reference spelling in the graph.
+///
+/// Deliberately NOT per source page: the consumer folds these by name, so
+/// carrying `source_page_id` and the owner's `path` meant transporting one row
+/// per (page, spelling) pair — 110,000 rows for 10,010 names on a 10,000-page
+/// graph — and forced a `pages` join the covering index cannot serve.
 pub struct PhysicalNavigationReferenceNameRow {
-    pub source_page_id: [u8; 16],
-    pub owner_path: String,
-    pub raw_name: String,
     pub normalized_name: String,
+    pub raw_name: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4293,7 +4323,6 @@ fn navigation_reference_name_row_output_bytes(
     checked_output_bytes(
         0,
         [
-            Some(row.owner_path.as_str()),
             Some(row.raw_name.as_str()),
             Some(row.normalized_name.as_str()),
         ],
@@ -4506,16 +4535,16 @@ impl<'a> std::ops::Deref for SqliteMaterializedRead<'a> {
 /// trailing sort term may still use a temporary b-tree; both are bounded by
 /// the batch. `paged_navigation_readers_use_an_index_range` pins this.
 pub(crate) const NAVIGATION_REFERENCE_NAMES_FIRST_SQL: &str =
-    "SELECT DISTINCT r.source_page_id, p.path, r.raw_name, r.normalized_name
-     FROM reference_postings r JOIN pages p ON p.page_id = r.source_page_id
+    "SELECT DISTINCT r.normalized_name, r.raw_name
+     FROM reference_postings r
      WHERE r.target_type = 0 AND r.reference_kind <= 4
-     ORDER BY r.normalized_name, r.source_page_id, r.raw_name LIMIT ?1";
+     ORDER BY r.normalized_name, r.raw_name LIMIT ?1";
 pub(crate) const NAVIGATION_REFERENCE_NAMES_AFTER_SQL: &str =
-    "SELECT DISTINCT r.source_page_id, p.path, r.raw_name, r.normalized_name
-     FROM reference_postings r JOIN pages p ON p.page_id = r.source_page_id
+    "SELECT DISTINCT r.normalized_name, r.raw_name
+     FROM reference_postings r
      WHERE r.target_type = 0 AND r.reference_kind <= 4
-       AND (r.normalized_name, r.source_page_id, r.raw_name) > (?1, ?2, ?3)
-     ORDER BY r.normalized_name, r.source_page_id, r.raw_name LIMIT ?4";
+       AND (r.normalized_name, r.raw_name) > (?1, ?2)
+     ORDER BY r.normalized_name, r.raw_name LIMIT ?3";
 pub(crate) const NAVIGATION_ALIASES_FIRST_SQL: &str =
     "SELECT DISTINCT d.source_page_id, p.name, p.path, d.normalized_alias
      FROM reference_alias_declarations d
@@ -5279,36 +5308,38 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         )
     }
 
-    /// Stable distinct page-reference spellings. Property-key pseudo pages are
-    /// excluded because the legacy navigation surface never advertised them.
+    /// Every distinct page-reference spelling in the graph, once each.
+    /// Property-key pseudo pages are excluded because the legacy navigation
+    /// surface never advertised them.
     ///
-    /// Pages in `(normalized_name, source_page_id, raw_name)` order — the
-    /// order `reference_postings_normalized_name_idx` yields — so every batch
-    /// is one bounded index range and `LIMIT` stops the scan. The cursor tuple
-    /// keeps its `(owner_path, raw_name, normalized_name, source_page_id)`
-    /// shape; `owner_path` is carried but no longer orders anything. The
-    /// previous order over the joined page path could not be served by any
-    /// index, so each 512-row batch scanned and sorted every posting in the
-    /// graph: at 10,000 pages (600,000 postings, 110,000 distinct rows) that
-    /// was 215 batches × 1.3 s and ~11 GB of reads per launch (GH tine#543).
+    /// Pages in `(normalized_name, raw_name)` order — the key order of
+    /// `reference_postings_navigation_names_idx` — so each batch is one
+    /// bounded range over a COVERING index: no table lookup, no `pages` join,
+    /// and no temp B-tree for either the `DISTINCT` or the `ORDER BY`. The
+    /// cursor is that same pair.
+    ///
+    /// The cursor used to be `(owner_path, raw_name, normalized_name,
+    /// source_page_id)` and a row was emitted per (page, spelling), so a
+    /// 10,000-page graph drained 110,000 rows in 215 batches taking 1.276 s —
+    /// after which the only consumer folded them by name and read no other
+    /// column. Keyed to the `DISTINCT` instead: 10,010 rows, 20 batches,
+    /// 0.022 s (GH tine#543).
     pub fn navigation_reference_names_after(
         &self,
-        after: Option<(&str, &str, &str, &[u8; 16])>,
+        after: Option<(&str, &str)>,
         limit: usize,
     ) -> Result<Vec<PhysicalNavigationReferenceNameRow>, MaterializationError> {
         let limit = checked_limit(limit)?;
-        if let Some((path, raw, normalized, _)) = after {
-            checked_query_text(path)?;
-            checked_query_text(raw)?;
+        if let Some((normalized, raw)) = after {
             checked_query_text(normalized)?;
+            checked_query_text(raw)?;
         }
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = match after {
             None => (NAVIGATION_REFERENCE_NAMES_FIRST_SQL, vec![limit.into()]),
-            Some((_, raw, normalized, page_id)) => (
+            Some((normalized, raw)) => (
                 NAVIGATION_REFERENCE_NAMES_AFTER_SQL,
                 vec![
                     normalized.to_owned().into(),
-                    page_id.to_vec().into(),
                     raw.to_owned().into(),
                     limit.into(),
                 ],
@@ -5316,12 +5347,9 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         };
         let mut statement = self.connection.prepare(sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
-            let page_id: Vec<u8> = row.get(0)?;
             Ok(PhysicalNavigationReferenceNameRow {
-                source_page_id: decode_id_sql(&page_id)?,
-                owner_path: row.get(1)?,
-                raw_name: row.get(2)?,
-                normalized_name: row.get(3)?,
+                normalized_name: row.get(0)?,
+                raw_name: row.get(1)?,
             })
         })?;
         collect_read_rows(

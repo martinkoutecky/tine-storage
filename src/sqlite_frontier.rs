@@ -23,7 +23,7 @@ use crate::sqlite_materialization::{
 use crate::ContentDigest;
 
 pub const SQLITE_APPLICATION_ID: u32 = 0x5449_4e45;
-pub const SQLITE_SCHEMA_VERSION: u32 = 28;
+pub const SQLITE_SCHEMA_VERSION: u32 = 29;
 const MAX_AUTHENTICATED_MAP_DEPTH: usize = 256;
 
 pub const META_DDL: &str = "CREATE TABLE meta (
@@ -214,7 +214,7 @@ const EXPECTED_TABLES: [&str; 48] = [
     "tags",
     "tasks",
 ];
-const EXPECTED_INDEXES: [&str; 37] = [
+const EXPECTED_INDEXES: [&str; 38] = [
     "applied_batches_acceptance_sequence_uq",
     "applied_batches_batch_id_uq",
     "block_path_refs_lookup_idx",
@@ -241,6 +241,7 @@ const EXPECTED_INDEXES: [&str; 37] = [
     "property_atoms_page_idx",
     "reference_alias_bindings_normalized_alias_idx",
     "reference_alias_declarations_source_idx",
+    "reference_postings_navigation_names_idx",
     "reference_postings_normalized_name_idx",
     "reference_postings_raw_uuid_idx",
     "reference_postings_source_idx",
@@ -3793,7 +3794,7 @@ mod tests {
 
     #[test]
     fn prior_sqlite_schema_is_refused_instead_of_migrated_or_dually_read() {
-        for unsupported in [21u32, 26, 27, 29] {
+        for unsupported in [21u32, 26, 27, 28, 30] {
             let (_path, connection, _) = initialized();
             connection
                 .pragma_update(None, "user_version", unsupported)
