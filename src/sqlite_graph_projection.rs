@@ -49,7 +49,14 @@ pub struct PhysicalGraphProjectionSourceDelta {
 /// actual authority.
 pub struct PhysicalGraphProjectionDatabase {
     connection: Connection,
+    /// Whether the most recent apply built its secondary indexes once at the
+    /// end (the fresh-build route) rather than per inserted row.
+    last_apply_deferred_indexes: std::cell::Cell<bool>,
 }
+
+/// The smallest page-cache ceiling [`PhysicalGraphProjectionDatabase::set_page_cache_budget`]
+/// accepts; below SQLite's own ~2 MiB default a budget is a slowdown, never a saving.
+pub const MIN_PAGE_CACHE_BUDGET_BYTES: u64 = 2 * 1024 * 1024;
 
 impl PhysicalGraphProjectionDatabase {
     pub fn open_writable(path: &Path) -> Result<Self, MaterializationError> {
@@ -67,7 +74,10 @@ impl PhysicalGraphProjectionDatabase {
              PRAGMA foreign_keys = ON;
              PRAGMA trusted_schema = OFF;",
         )?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            last_apply_deferred_indexes: std::cell::Cell::new(false),
+        })
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self, MaterializationError> {
@@ -76,7 +86,60 @@ impl PhysicalGraphProjectionDatabase {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         connection.busy_timeout(Duration::from_secs(5))?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            last_apply_deferred_indexes: std::cell::Cell::new(false),
+        })
+    }
+
+    /// Bound this connection's SQLite page cache at `bytes`, rounded down to
+    /// whole KiB and never below [`MIN_PAGE_CACHE_BUDGET_BYTES`].
+    ///
+    /// SQLite allocates cache pages on demand up to the ceiling, so a generous
+    /// budget costs a small graph nothing. A ceiling below a bulk build's
+    /// working set is what GH #543 measured: at SQLite's ~2 MiB default a
+    /// 600,000-block build spilled and re-read every dirty page (8.8M cache
+    /// misses, 27 GB read for 49 MB of Markdown); the same build at 512 MiB
+    /// took 8,896 misses. The caller owns the formula; this only applies it.
+    pub fn set_page_cache_budget(&self, bytes: u64) -> Result<(), MaterializationError> {
+        let kib = i64::try_from(bytes.max(MIN_PAGE_CACHE_BUDGET_BYTES) / 1024).map_err(|_| {
+            MaterializationError::InvalidInput("page cache budget overflows".into())
+        })?;
+        self.connection.pragma_update(None, "cache_size", -kib)?;
+        Ok(())
+    }
+
+    /// Lower the page-cache ceiling to `bytes` and hand the pages above it
+    /// back to the allocator now, rather than when they next age out. A bulk
+    /// build raises the ceiling for its duration; this is how it returns the
+    /// memory afterwards.
+    pub fn shrink_page_cache_budget(&self, bytes: u64) -> Result<(), MaterializationError> {
+        self.set_page_cache_budget(bytes)?;
+        // SAFETY: the handle belongs to this live connection; the call only
+        // frees cache pages that hold no pinned content.
+        unsafe { rusqlite::ffi::sqlite3_db_release_memory(self.connection.handle()) };
+        Ok(())
+    }
+
+    /// The page-cache ceiling currently in force, in bytes.
+    pub fn page_cache_budget(&self) -> Result<u64, MaterializationError> {
+        let cache_size: i64 = self
+            .connection
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))?;
+        if cache_size < 0 {
+            return Ok(cache_size.unsigned_abs() * 1024);
+        }
+        let page_size: u64 = self
+            .connection
+            .query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        Ok(cache_size.unsigned_abs() * page_size)
+    }
+
+    /// Whether the most recent `apply*` call took the fresh-build route
+    /// (secondary indexes built once after the rows) rather than maintaining
+    /// them per row.
+    pub fn last_apply_deferred_indexes(&self) -> bool {
+        self.last_apply_deferred_indexes.get()
     }
 
     pub fn initialize_schema(&self) -> Result<(), MaterializationError> {
@@ -251,6 +314,21 @@ impl PhysicalGraphProjectionDatabase {
                 transaction.execute("DELETE FROM query_page_order", [])?;
             }
         }
+        // Fresh-build route (GH #543): into an empty projection, every row of
+        // every secondary index lands on a random B-tree leaf (the keys are
+        // UUIDs), so a graph-sized build touches the whole index set per
+        // page and, past the page-cache ceiling, spills and re-reads it.
+        // Building the indexes once after the rows is an external sort
+        // instead. Readers on this WAL file see the old snapshot until the
+        // commit, and a rollback restores the indexes, so the route is
+        // invisible outside this transaction. It is taken only while the
+        // covered tables are empty: without indexes the per-page cleanup
+        // lookups below are full scans, free here and quadratic otherwise.
+        let deferred_indexes = !change.replacements.is_empty()
+            && sqlite_materialization::deferred_index_tables_are_empty(&transaction)?;
+        if deferred_indexes {
+            sqlite_materialization::drop_deferred_indexes(&transaction)?;
+        }
         let instrumentation = sqlite_materialization::apply_graph_projection_rows(
             &transaction,
             &change.replacements,
@@ -299,7 +377,11 @@ impl PhysicalGraphProjectionDatabase {
         if let Some(order) = page_order {
             reconcile_query_page_order(&transaction, order)?;
         }
+        if deferred_indexes {
+            sqlite_materialization::create_deferred_indexes(&transaction)?;
+        }
         transaction.commit()?;
+        self.last_apply_deferred_indexes.set(deferred_indexes);
         Ok(instrumentation)
     }
 
@@ -820,6 +902,353 @@ mod tests {
         PhysicalReferenceTarget, PhysicalTask,
     };
     use crate::ContentDigest;
+
+    /// The GH #543 fixture shape: `pages` pages of 60 blocks, each block
+    /// carrying one page link and one tag, every identity a random UUID
+    /// (as Direct Files derives them), so every index insert is a random
+    /// B-tree leaf exactly as in the reporter-scale build.
+    fn gh543_snapshot(
+        pages: usize,
+    ) -> (
+        PhysicalGraphProjectionChange,
+        Vec<PhysicalGraphProjectionSourceRevision>,
+        Vec<[u8; 16]>,
+    ) {
+        use crate::sqlite_materialization::{PhysicalReference, PhysicalTag};
+        let page_ids = (0..pages)
+            .map(|_| *uuid::Uuid::new_v4().as_bytes())
+            .collect::<Vec<_>>();
+        let mut replacements = Vec::with_capacity(pages);
+        let mut postings = Vec::with_capacity(pages * 120);
+        for (position, page_id) in page_ids.iter().enumerate() {
+            let target = (position + 1) % pages;
+            let target_name = format!("Topic {target} 你好");
+            let normalized_target = target_name.to_lowercase();
+            let mut blocks = Vec::with_capacity(60);
+            for block in 0..60 {
+                let block_id = *uuid::Uuid::new_v4().as_bytes();
+                let tag = format!("tag{}", block % 10);
+                let content = format!(
+                    "outline sentinel543 你好世界 page {position} block {block} [[{target_name}]] #{tag}"
+                );
+                for (ordinal, (raw, normalized)) in
+                    [(&target_name, &normalized_target), (&tag, &tag)]
+                        .into_iter()
+                        .enumerate()
+                {
+                    postings.push(PhysicalReferencePosting {
+                        source_page_id: *page_id,
+                        source_entity: PhysicalEntityId::Block(block_id),
+                        source_locator: b"content".to_vec(),
+                        ordinal: ordinal as u32,
+                        kind: 0,
+                        target: PhysicalReferenceTarget::PageName {
+                            raw_name: raw.clone(),
+                            normalized_name: normalized.clone(),
+                            resolved_page_id: (ordinal == 0).then_some(page_ids[target]),
+                        },
+                    });
+                }
+                blocks.push(PhysicalBlock {
+                    block_id,
+                    query_result_id: uuid::Uuid::from_bytes(block_id).to_string(),
+                    own_refs: vec![normalized_target.clone(), tag.clone()],
+                    home_document_id: *page_id,
+                    parent: None,
+                    order: format!("{block:04}"),
+                    content: content.clone(),
+                    searchable_text: content.clone(),
+                    normalized_searchable_text: content.to_lowercase(),
+                    query_visible: content.clone(),
+                    query_visible_folded: content.to_lowercase(),
+                    heading_level: None,
+                    collapsed: false,
+                    logseq_uuid: None,
+                    logseq_identity_origin: None,
+                    references: vec![PhysicalReference {
+                        target: PhysicalEntityId::Page(page_ids[target]),
+                        kind: 0,
+                    }],
+                    properties: Vec::new(),
+                    tags: vec![PhysicalTag {
+                        tag: tag.clone(),
+                        tag_key: tag.clone(),
+                    }],
+                    task: None,
+                    planning: None,
+                    path_refs: vec![normalized_target.clone(), tag],
+                    property_atoms: Vec::new(),
+                });
+            }
+            let name = format!("Topic {position} 你好");
+            replacements.push(PhysicalPage {
+                page_id: *page_id,
+                query_page_order: Some(position as u64),
+                home_document_id: *page_id,
+                name_key: name.to_lowercase(),
+                path: format!("pages/主题-{position:05}.md"),
+                name,
+                text_kind: 0,
+                journal_day: None,
+                preamble: None,
+                searchable_text: String::new(),
+                normalized_searchable_text: String::new(),
+                references: Vec::new(),
+                properties: Vec::new(),
+                tags: Vec::new(),
+                property_atoms: Vec::new(),
+                blocks,
+            });
+        }
+        let revisions = page_ids
+            .iter()
+            .map(|page_id| PhysicalGraphProjectionSourceRevision {
+                page_id: *page_id,
+                revision: "probe".into(),
+            })
+            .collect();
+        (
+            PhysicalGraphProjectionChange {
+                replacements,
+                deletions: Vec::new(),
+                reference_postings: postings,
+            },
+            revisions,
+            page_ids,
+        )
+    }
+
+    fn db_status(connection: &Connection, op: std::ffi::c_int) -> i64 {
+        let mut current: std::ffi::c_int = 0;
+        let mut highwater: std::ffi::c_int = 0;
+        // SAFETY: the handle outlives this call and both out-pointers are
+        // valid for the duration; `reset = 0` leaves the counters untouched.
+        let rc = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                connection.handle(),
+                op,
+                &mut current,
+                &mut highwater,
+                0,
+            )
+        };
+        assert_eq!(rc, rusqlite::ffi::SQLITE_OK);
+        i64::from(current)
+    }
+
+    fn secondary_index_count(connection: &Connection) -> i64 {
+        connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// GH #543: an apply into an empty projection builds the 35 secondary
+    /// indexes once after its rows; the committed schema is the fresh schema
+    /// byte for byte, and the next apply into the populated projection keeps
+    /// every index live. A rollback restores the indexes too.
+    #[test]
+    fn fresh_build_defers_secondary_indexes_and_restores_the_exact_schema() {
+        let path = std::env::temp_dir().join(format!(
+            "tine-gh543-deferred-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.initialize_schema().unwrap();
+        let fresh_indexes = secondary_index_count(&database.connection);
+        assert_eq!(fresh_indexes, 35);
+        let (change, revisions, order) = gh543_snapshot(3);
+
+        database
+            .apply_with_source_revisions_aliases_and_page_order(&change, &revisions, &[], &order)
+            .unwrap();
+        assert!(database.last_apply_deferred_indexes());
+        assert_eq!(secondary_index_count(&database.connection), fresh_indexes);
+        database.validate_schema().unwrap();
+        let blocks: i64 = database
+            .connection
+            .query_row("SELECT COUNT(*) FROM blocks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(blocks, 180);
+
+        // A populated projection keeps its indexes through an apply.
+        let edit = PhysicalGraphProjectionChange {
+            replacements: vec![change.replacements[0].clone()],
+            deletions: Vec::new(),
+            reference_postings: change
+                .reference_postings
+                .iter()
+                .filter(|posting| posting.source_page_id == change.replacements[0].page_id)
+                .cloned()
+                .collect(),
+        };
+        database
+            .apply_with_source_revisions_and_aliases(&edit, &revisions[..1], &[])
+            .unwrap();
+        assert!(!database.last_apply_deferred_indexes());
+        database.validate_schema().unwrap();
+
+        // A fresh build that fails mid-transaction leaves the indexes in place.
+        database.reset().unwrap();
+        let mut broken = change.clone();
+        broken.reference_postings.push(PhysicalReferencePosting {
+            source_page_id: [0xEE; 16],
+            source_entity: PhysicalEntityId::Page([0xEE; 16]),
+            source_locator: b"nowhere".to_vec(),
+            ordinal: 0,
+            kind: 0,
+            target: PhysicalReferenceTarget::PageName {
+                raw_name: "x".into(),
+                normalized_name: "x".into(),
+                resolved_page_id: None,
+            },
+        });
+        database
+            .apply_with_source_revisions_aliases_and_page_order(&broken, &revisions, &[], &order)
+            .unwrap_err();
+        assert_eq!(secondary_index_count(&database.connection), fresh_indexes);
+        database.validate_schema().unwrap();
+        drop(database);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn page_cache_budget_is_applied_floored_and_shrunk() {
+        let path =
+            std::env::temp_dir().join(format!("tine-gh543-budget-{}.sqlite", uuid::Uuid::new_v4()));
+        let database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.initialize_schema().unwrap();
+        let default_budget = database.page_cache_budget().unwrap();
+        assert!(default_budget <= MIN_PAGE_CACHE_BUDGET_BYTES);
+        database.set_page_cache_budget(300 * 1024 * 1024).unwrap();
+        assert_eq!(database.page_cache_budget().unwrap(), 300 * 1024 * 1024);
+        database.set_page_cache_budget(1).unwrap();
+        assert_eq!(
+            database.page_cache_budget().unwrap(),
+            MIN_PAGE_CACHE_BUDGET_BYTES
+        );
+        database.shrink_page_cache_budget(8 * 1024 * 1024).unwrap();
+        assert_eq!(database.page_cache_budget().unwrap(), 8 * 1024 * 1024);
+        drop(database);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// GH #543 build-cost probe. Not a gate: it returns immediately unless
+    /// `TINE_STORAGE_BUILD_PROBE` names the matrix, e.g.
+    /// `TINE_STORAGE_BUILD_PROBE="pages=1000;cache_mib=2,64,512;defer=0,1"`,
+    /// run as `cargo test --release -p tine-storage gh543_build_probe -- --nocapture`.
+    /// `defer=0` pre-seeds one page so the apply takes the ordinary
+    /// indexes-live route; `defer=1` applies into the empty projection.
+    #[test]
+    fn gh543_build_probe() {
+        let Ok(spec) = std::env::var("TINE_STORAGE_BUILD_PROBE") else {
+            return;
+        };
+        let axis = |key: &str, default: &str| -> Vec<u64> {
+            spec.split(';')
+                .find_map(|part| part.strip_prefix(&format!("{key}=")))
+                .unwrap_or(default)
+                .split(',')
+                .map(|value| value.trim().parse::<u64>().unwrap())
+                .collect()
+        };
+        for pages in axis("pages", "1000") {
+            let (change, revisions, order) = gh543_snapshot(pages as usize);
+            let (seed_change, seed_revisions, seed_ids) = gh543_snapshot(1);
+            for cache_mib in axis("cache_mib", "2") {
+                for defer in axis("defer", "1") {
+                    let path = std::env::temp_dir()
+                        .join(format!("tine-gh543-probe-{}.sqlite", uuid::Uuid::new_v4()));
+                    let mut database =
+                        PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+                    database.initialize_schema().unwrap();
+                    database
+                        .set_page_cache_budget(cache_mib * 1024 * 1024)
+                        .unwrap();
+                    // The seed page stays projected, so the ordinary route's
+                    // inventory must list it too (after the probe pages, whose
+                    // own positions are 0..pages).
+                    let order = if defer == 0 {
+                        database
+                            .apply_with_source_revisions_and_aliases(
+                                &seed_change,
+                                &seed_revisions,
+                                &[],
+                            )
+                            .unwrap();
+                        assert!(database.last_apply_deferred_indexes());
+                        let mut with_seed = order.clone();
+                        with_seed.push(seed_ids[0]);
+                        with_seed
+                    } else {
+                        order.clone()
+                    };
+                    let started = std::time::Instant::now();
+                    database
+                        .apply_with_source_revisions_aliases_and_page_order(
+                            &change,
+                            &revisions,
+                            &[],
+                            &order,
+                        )
+                        .unwrap();
+                    let elapsed = started.elapsed();
+                    assert_eq!(database.last_apply_deferred_indexes(), defer == 1);
+                    let misses = db_status(
+                        &database.connection,
+                        rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                    );
+                    let writes = db_status(
+                        &database.connection,
+                        rusqlite::ffi::SQLITE_DBSTATUS_CACHE_WRITE,
+                    );
+                    let spills = db_status(
+                        &database.connection,
+                        rusqlite::ffi::SQLITE_DBSTATUS_CACHE_SPILL,
+                    );
+                    let used = db_status(
+                        &database.connection,
+                        rusqlite::ffi::SQLITE_DBSTATUS_CACHE_USED,
+                    );
+                    let size = |suffix: &str| {
+                        std::fs::metadata(format!("{}{suffix}", path.display()))
+                            .map(|m| m.len())
+                            .unwrap_or(0)
+                    };
+                    let wal_bytes = size("-wal");
+                    let checkpoint_started = std::time::Instant::now();
+                    database.checkpoint_truncate().unwrap();
+                    let checkpoint = checkpoint_started.elapsed();
+                    database.validate_schema().unwrap();
+                    let block_count: i64 = database
+                        .connection
+                        .query_row("SELECT COUNT(*) FROM blocks", [], |row| row.get(0))
+                        .unwrap();
+                    assert_eq!(block_count, pages as i64 * 60 + i64::from(defer == 0) * 60);
+                    println!(
+                        "GH543PROBE pages={pages} cache_mib={cache_mib} defer={defer} \
+                         apply_ms={} checkpoint_ms={} cache_miss={misses} cache_write={writes} \
+                         cache_spill={spills} cache_used_bytes={used} db_bytes={} wal_bytes_before_checkpoint={wal_bytes}",
+                        elapsed.as_millis(),
+                        checkpoint.as_millis(),
+                        size(""),
+                    );
+                    drop(database);
+                    for suffix in ["", "-wal", "-shm"] {
+                        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+                    }
+                }
+            }
+        }
+    }
 
     struct SnapshotFixture {
         writer: Connection,

@@ -5,6 +5,42 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.20.1] - 2026-09-17
+
+Patch line from v0.20.0, the revision Tine pins; the sealed-history work on
+`main` (0.21–0.23) is not included.
+
+### Added
+
+- `PhysicalGraphProjectionDatabase::set_page_cache_budget`,
+  `shrink_page_cache_budget`, `page_cache_budget` and
+  `MIN_PAGE_CACHE_BUDGET_BYTES`: the consumer sizes the writer's SQLite page
+  cache to a bulk build and hands the memory back after the commit (GH
+  tine#543 — at SQLite's ~2 MiB default a 600,000-block build spilled and
+  re-read every dirty page: 8.8M cache misses, 27 GB read for 49 MB of
+  Markdown; the same build at 512 MiB took 8,896 misses).
+- `PhysicalGraphProjectionDatabase::last_apply_deferred_indexes` reports which
+  route the most recent apply took.
+
+### Changed
+
+- An `apply*` into an empty graph projection (fresh, rebuilt, or just
+  `reset()`) drops the 35 secondary indexes before its rows and recreates
+  them from the same DDL before the commit, inside the one existing
+  transaction — an external sort instead of a random leaf write per row. The
+  committed schema text is identical; a rollback restores the indexes; an
+  apply into a populated projection is unchanged. Measured (`gh543_build_probe`,
+  release, Linux): 13% faster and 4.6% smaller at 10,000 pages, 20% fewer
+  cache misses under a tight budget.
+
+### Unit cost
+
+- No persisted record changes. The build's page-cache working set is ~12
+  bytes per byte of projected text (the knee of the miss curve in
+  `gh543_build_probe`: 1,000 pages / 5.1 MB text — 2 MiB: 445k misses,
+  32 MiB: 14k, 64 MiB: 13k, 512 MiB: 1); the projection file itself stays
+  ~32× its text.
+
 ## [0.20.0] - 2026-09-08
 
 ### Added

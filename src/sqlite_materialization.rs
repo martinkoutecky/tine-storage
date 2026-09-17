@@ -2359,8 +2359,66 @@ pub(crate) fn begin_terminal_construction_in_open_candidate(
          WHERE singleton = 1",
         [],
     )?;
+    drop_deferred_indexes(transaction)?;
+    Ok(())
+}
+
+/// Every table one of [`TERMINAL_DEFERRED_INDEXES`] covers. A build may run
+/// with those indexes dropped only while all of these are empty: the per-page
+/// cleanup and FTS lookups that precede insertion are full scans without their
+/// index — free on an empty table, quadratic on a populated one.
+const DEFERRED_INDEX_TABLES: [&str; 14] = [
+    "pages",
+    "page_portable_path_claims",
+    "blocks",
+    "search_fts_owners",
+    "refs",
+    "reference_postings",
+    "reference_alias_declarations",
+    "reference_alias_bindings",
+    "properties",
+    "tags",
+    "tasks",
+    "block_planning",
+    "block_path_refs",
+    "property_atoms",
+];
+
+/// True when every table a deferred index covers holds no rows, i.e. the
+/// projection is fresh or was just reset, so a bulk insert may build its
+/// secondary indexes once at the end instead of maintaining them per row.
+pub(crate) fn deferred_index_tables_are_empty(
+    connection: &Connection,
+) -> Result<bool, MaterializationError> {
+    for table in DEFERRED_INDEX_TABLES {
+        let occupied: bool = connection.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table})"),
+            [],
+            |row| row.get(0),
+        )?;
+        if occupied {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Drop the ordinary secondary indexes for a bulk build. Primary keys and the
+/// FTS virtual tables stay live; [`create_deferred_indexes`] must run in the
+/// same transaction before it commits.
+pub(crate) fn drop_deferred_indexes(connection: &Connection) -> Result<(), MaterializationError> {
     for (name, _) in TERMINAL_DEFERRED_INDEXES {
-        transaction.execute(&format!("DROP INDEX {name}"), [])?;
+        connection.execute(&format!("DROP INDEX {name}"), [])?;
+    }
+    Ok(())
+}
+
+/// Recreate the indexes [`drop_deferred_indexes`] removed, from the same DDL
+/// the fresh schema uses, so the stored schema text is byte-identical to a
+/// projection that never took the bulk route.
+pub(crate) fn create_deferred_indexes(connection: &Connection) -> Result<(), MaterializationError> {
+    for (_, ddl) in TERMINAL_DEFERRED_INDEXES {
+        connection.execute(ddl, [])?;
     }
     Ok(())
 }
@@ -2436,9 +2494,7 @@ pub(crate) fn finish_terminal_graph_projection_in_open_candidate(
             ],
         )?;
     }
-    for (_, ddl) in TERMINAL_DEFERRED_INDEXES {
-        transaction.execute(ddl, [])?;
-    }
+    create_deferred_indexes(transaction)?;
     transaction.execute(
         "UPDATE materialization_stamp
          SET acceptance_sequence = ?1,
