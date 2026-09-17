@@ -4496,9 +4496,57 @@ impl<'a> std::ops::Deref for SqliteMaterializedRead<'a> {
     }
 }
 
+/// Paged navigation readers, keyed on index-served columns.
+///
+/// Every `*_after` reader in this file is drained batch by batch by the
+/// consumer, so its per-batch cost must be bounded by the batch, not by the
+/// table: the keyset predicate is a row-value comparison SQLite turns into one
+/// index range (`SEARCH … USING INDEX … (a,b)>(?,?)`), and the `ORDER BY`
+/// prefix is the index order, so `LIMIT` ends the scan. `DISTINCT` and a
+/// trailing sort term may still use a temporary b-tree; both are bounded by
+/// the batch. `paged_navigation_readers_use_an_index_range` pins this.
+pub(crate) const NAVIGATION_REFERENCE_NAMES_FIRST_SQL: &str =
+    "SELECT DISTINCT r.source_page_id, p.path, r.raw_name, r.normalized_name
+     FROM reference_postings r JOIN pages p ON p.page_id = r.source_page_id
+     WHERE r.target_type = 0 AND r.reference_kind <= 4
+     ORDER BY r.normalized_name, r.source_page_id, r.raw_name LIMIT ?1";
+pub(crate) const NAVIGATION_REFERENCE_NAMES_AFTER_SQL: &str =
+    "SELECT DISTINCT r.source_page_id, p.path, r.raw_name, r.normalized_name
+     FROM reference_postings r JOIN pages p ON p.page_id = r.source_page_id
+     WHERE r.target_type = 0 AND r.reference_kind <= 4
+       AND (r.normalized_name, r.source_page_id, r.raw_name) > (?1, ?2, ?3)
+     ORDER BY r.normalized_name, r.source_page_id, r.raw_name LIMIT ?4";
+pub(crate) const NAVIGATION_ALIASES_FIRST_SQL: &str =
+    "SELECT DISTINCT d.source_page_id, p.name, p.path, d.normalized_alias
+     FROM reference_alias_declarations d
+     JOIN pages p ON p.page_id = d.source_page_id
+     ORDER BY d.source_page_id, d.normalized_alias LIMIT ?1";
+pub(crate) const NAVIGATION_ALIASES_AFTER_SQL: &str =
+    "SELECT DISTINCT d.source_page_id, p.name, p.path, d.normalized_alias
+     FROM reference_alias_declarations d
+     JOIN pages p ON p.page_id = d.source_page_id
+     WHERE (d.source_page_id, d.normalized_alias) > (?1, ?2)
+     ORDER BY d.source_page_id, d.normalized_alias LIMIT ?3";
+
 impl<'a> SqliteGraphProjectionRead<'a> {
     pub(crate) const fn new(connection: &'a Connection) -> Self {
         Self { connection }
+    }
+
+    /// The `EXPLAIN QUERY PLAN` detail lines for `sql`, for plan-shape guards.
+    #[cfg(test)]
+    pub(crate) fn query_plan(
+        &self,
+        sql: &str,
+        args: &[rusqlite::types::Value],
+    ) -> Result<Vec<String>, MaterializationError> {
+        let mut statement = self
+            .connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        let rows = statement.query_map(rusqlite::params_from_iter(args.iter()), |row| {
+            row.get::<_, String>(3)
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn page(&self, page_id: [u8; 16]) -> Result<Option<PhysicalPageRow>, MaterializationError> {
@@ -5186,7 +5234,14 @@ impl<'a> SqliteGraphProjectionRead<'a> {
     }
 
     /// Stable, deduplicated alias declarations joined to their owning page.
-    /// The cursor is the final `(owner_path, normalized_alias, source_page_id)`.
+    ///
+    /// Pages in `(source_page_id, normalized_alias)` order — the order
+    /// `reference_alias_declarations_source_idx` yields — so every batch is a
+    /// bounded index range and `LIMIT` stops the scan. The cursor tuple keeps
+    /// its `(owner_path, normalized_alias, source_page_id)` shape; `owner_path`
+    /// is carried but no longer orders anything (an order over the joined
+    /// page path cannot be served by any index, so each batch used to scan and
+    /// sort the whole join: GH tine#543).
     pub fn navigation_aliases_after(
         &self,
         after: Option<(&str, &str, &[u8; 16])>,
@@ -5198,25 +5253,12 @@ impl<'a> SqliteGraphProjectionRead<'a> {
             checked_query_text(alias)?;
         }
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = match after {
-            None => (
-                "SELECT DISTINCT d.source_page_id, p.name, p.path, d.normalized_alias
-                 FROM reference_alias_declarations d
-                 JOIN pages p ON p.page_id = d.source_page_id
-                 ORDER BY p.path, d.normalized_alias, d.source_page_id LIMIT ?1",
-                vec![limit.into()],
-            ),
-            Some((path, alias, page_id)) => (
-                "SELECT DISTINCT d.source_page_id, p.name, p.path, d.normalized_alias
-                 FROM reference_alias_declarations d
-                 JOIN pages p ON p.page_id = d.source_page_id
-                 WHERE p.path > ?1
-                    OR (p.path = ?1 AND d.normalized_alias > ?2)
-                    OR (p.path = ?1 AND d.normalized_alias = ?2 AND d.source_page_id > ?3)
-                 ORDER BY p.path, d.normalized_alias, d.source_page_id LIMIT ?4",
+            None => (NAVIGATION_ALIASES_FIRST_SQL, vec![limit.into()]),
+            Some((_, alias, page_id)) => (
+                NAVIGATION_ALIASES_AFTER_SQL,
                 vec![
-                    path.to_owned().into(),
-                    alias.to_owned().into(),
                     page_id.to_vec().into(),
+                    alias.to_owned().into(),
                     limit.into(),
                 ],
             ),
@@ -5239,6 +5281,16 @@ impl<'a> SqliteGraphProjectionRead<'a> {
 
     /// Stable distinct page-reference spellings. Property-key pseudo pages are
     /// excluded because the legacy navigation surface never advertised them.
+    ///
+    /// Pages in `(normalized_name, source_page_id, raw_name)` order — the
+    /// order `reference_postings_normalized_name_idx` yields — so every batch
+    /// is one bounded index range and `LIMIT` stops the scan. The cursor tuple
+    /// keeps its `(owner_path, raw_name, normalized_name, source_page_id)`
+    /// shape; `owner_path` is carried but no longer orders anything. The
+    /// previous order over the joined page path could not be served by any
+    /// index, so each 512-row batch scanned and sorted every posting in the
+    /// graph: at 10,000 pages (600,000 postings, 110,000 distinct rows) that
+    /// was 215 batches × 1.3 s and ~11 GB of reads per launch (GH tine#543).
     pub fn navigation_reference_names_after(
         &self,
         after: Option<(&str, &str, &str, &[u8; 16])>,
@@ -5251,28 +5303,13 @@ impl<'a> SqliteGraphProjectionRead<'a> {
             checked_query_text(normalized)?;
         }
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = match after {
-            None => (
-                "SELECT DISTINCT r.source_page_id, p.path, r.raw_name, r.normalized_name
-                 FROM reference_postings r JOIN pages p ON p.page_id = r.source_page_id
-                 WHERE r.target_type = 0 AND r.reference_kind <= 4
-                 ORDER BY p.path, r.raw_name, r.normalized_name, r.source_page_id LIMIT ?1",
-                vec![limit.into()],
-            ),
-            Some((path, raw, normalized, page_id)) => (
-                "SELECT DISTINCT r.source_page_id, p.path, r.raw_name, r.normalized_name
-                 FROM reference_postings r JOIN pages p ON p.page_id = r.source_page_id
-                 WHERE r.target_type = 0 AND r.reference_kind <= 4
-                   AND (p.path > ?1
-                     OR (p.path = ?1 AND r.raw_name > ?2)
-                     OR (p.path = ?1 AND r.raw_name = ?2 AND r.normalized_name > ?3)
-                     OR (p.path = ?1 AND r.raw_name = ?2 AND r.normalized_name = ?3
-                         AND r.source_page_id > ?4))
-                 ORDER BY p.path, r.raw_name, r.normalized_name, r.source_page_id LIMIT ?5",
+            None => (NAVIGATION_REFERENCE_NAMES_FIRST_SQL, vec![limit.into()]),
+            Some((_, raw, normalized, page_id)) => (
+                NAVIGATION_REFERENCE_NAMES_AFTER_SQL,
                 vec![
-                    path.to_owned().into(),
-                    raw.to_owned().into(),
                     normalized.to_owned().into(),
                     page_id.to_vec().into(),
+                    raw.to_owned().into(),
                     limit.into(),
                 ],
             ),

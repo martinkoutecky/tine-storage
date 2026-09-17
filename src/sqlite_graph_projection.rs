@@ -893,6 +893,11 @@ impl PhysicalProjectionQuerySnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sqlite_materialization::{
+        PhysicalNavigationReferenceNameRow, NAVIGATION_ALIASES_AFTER_SQL,
+        NAVIGATION_ALIASES_FIRST_SQL, NAVIGATION_REFERENCE_NAMES_AFTER_SQL,
+        NAVIGATION_REFERENCE_NAMES_FIRST_SQL,
+    };
     use std::collections::BTreeSet;
 
     use crate::sqlite_materialization::test_parse_config_hash;
@@ -2233,6 +2238,175 @@ mod tests {
             .unwrap()
             .is_empty());
         database.quick_check().unwrap();
+        drop(database);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// The four navigation readers page on index-served keysets. GH tine#543:
+    /// the previous order over the joined page path could not use any index,
+    /// so every 512-row batch scanned and sorted the whole join — O(N²) over
+    /// the graph, ~11 GB of reads per launch at 10,000 pages.
+    fn plan_uses_index_range(plan: &[String], expected: &str) -> Result<(), String> {
+        if !plan.iter().any(|line| line.starts_with(expected)) {
+            return Err(format!("expected `{expected}…` in plan {plan:?}"));
+        }
+        // An index-ordered scan streams and `LIMIT` ends it; a table scan or
+        // a sort of the whole result does not.
+        if let Some(line) = plan.iter().find(|line| {
+            (line.starts_with("SCAN ") && !line.contains(" USING INDEX "))
+                || line.as_str() == "USE TEMP B-TREE FOR ORDER BY"
+        }) {
+            return Err(format!(
+                "paged reader would sort or scan the whole table per batch (`{line}`): \
+                 key the batch on the columns of an existing index, as \
+                 NAVIGATION_REFERENCE_NAMES_AFTER_SQL does; plan {plan:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn paged_navigation_readers_use_an_index_range() {
+        let path = std::env::temp_dir().join(format!(
+            "tine-storage-graph-plan-guard-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.initialize_schema().unwrap();
+        let read = database.read();
+        let text = |value: &str| rusqlite::types::Value::from(value.to_owned());
+        let blob = rusqlite::types::Value::from(vec![0u8; 16]);
+        let limit = rusqlite::types::Value::from(512i64);
+
+        let shapes: [(&str, &[rusqlite::types::Value], &str); 4] = [
+            (
+                NAVIGATION_REFERENCE_NAMES_FIRST_SQL,
+                &[limit.clone()],
+                "SCAN r USING INDEX reference_postings_normalized_name_idx",
+            ),
+            (
+                NAVIGATION_REFERENCE_NAMES_AFTER_SQL,
+                &[text("topic"), blob.clone(), text("Topic"), limit.clone()],
+                "SEARCH r USING INDEX reference_postings_normalized_name_idx",
+            ),
+            (
+                NAVIGATION_ALIASES_FIRST_SQL,
+                &[limit.clone()],
+                "SCAN d USING INDEX ",
+            ),
+            (
+                NAVIGATION_ALIASES_AFTER_SQL,
+                &[blob.clone(), text("alias"), limit.clone()],
+                "SEARCH d USING ",
+            ),
+        ];
+        for (sql, args, expected) in shapes {
+            let plan = read.query_plan(sql, args).unwrap();
+            plan_uses_index_range(&plan, expected).unwrap_or_else(|why| panic!("{why}\n{sql}"));
+        }
+
+        // The pre-fix shape (v0.20.1) is the counterexample the guard exists
+        // for: an order over the joined path is a full scan plus a sort.
+        let pre_fix = read
+            .query_plan(
+                "SELECT DISTINCT r.source_page_id, p.path, r.raw_name, r.normalized_name
+                 FROM reference_postings r JOIN pages p ON p.page_id = r.source_page_id
+                 WHERE r.target_type = 0 AND r.reference_kind <= 4
+                   AND (p.path > ?1 OR (p.path = ?1 AND r.raw_name > ?2))
+                 ORDER BY p.path, r.raw_name, r.normalized_name, r.source_page_id LIMIT ?3",
+                &[text("pages/a.md"), text("Topic"), limit],
+            )
+            .unwrap();
+        assert!(
+            plan_uses_index_range(&pre_fix, "SEARCH r USING INDEX").is_err(),
+            "guard must reject the v0.20.1 plan: {pre_fix:?}"
+        );
+
+        drop(read);
+        drop(database);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// Draining one row at a time visits exactly the distinct rows an
+    /// unbounded read returns — no row skipped or repeated at a batch edge,
+    /// including two spellings of one name on one page and one spelling on
+    /// two pages.
+    #[test]
+    fn navigation_reference_names_page_without_gaps_or_repeats() {
+        let path = std::env::temp_dir().join(format!(
+            "tine-storage-graph-name-paging-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.initialize_schema().unwrap();
+        let posting = |page: u8, ordinal: u32, raw_name: &str, normalized_name: &str| {
+            PhysicalReferencePosting {
+                source_page_id: [page; 16],
+                source_entity: PhysicalEntityId::Page([page; 16]),
+                source_locator: b"preamble".to_vec(),
+                ordinal,
+                kind: 0,
+                target: PhysicalReferenceTarget::PageName {
+                    raw_name: raw_name.into(),
+                    normalized_name: normalized_name.into(),
+                    resolved_page_id: None,
+                },
+            }
+        };
+        database
+            .apply(&PhysicalGraphProjectionChange {
+                replacements: vec![
+                    page(1, "TODO", "a"),
+                    page(2, "TODO", "b"),
+                    page(3, "TODO", "c"),
+                ],
+                deletions: Vec::new(),
+                reference_postings: vec![
+                    posting(1, 0, "Zeta", "zeta"),
+                    posting(1, 1, "zeta", "zeta"),
+                    posting(1, 2, "Zeta", "zeta"),
+                    posting(2, 0, "Zeta", "zeta"),
+                    posting(2, 1, "Alpha", "alpha"),
+                    posting(3, 0, "alpha", "alpha"),
+                    posting(3, 1, "Mid", "mid"),
+                ],
+            })
+            .unwrap();
+        let read = database.read();
+        let all = read.navigation_reference_names_after(None, 100).unwrap();
+        assert_eq!(all.len(), 6, "{all:?}");
+
+        for batch in 1..=3 {
+            let mut paged = Vec::new();
+            let mut after: Option<PhysicalNavigationReferenceNameRow> = None;
+            loop {
+                let rows = read
+                    .navigation_reference_names_after(
+                        after.as_ref().map(|row| {
+                            (
+                                row.owner_path.as_str(),
+                                row.raw_name.as_str(),
+                                row.normalized_name.as_str(),
+                                &row.source_page_id,
+                            )
+                        }),
+                        batch,
+                    )
+                    .unwrap();
+                let done = rows.len() < batch;
+                after = rows.last().cloned();
+                paged.extend(rows);
+                if done {
+                    break;
+                }
+            }
+            assert_eq!(paged, all, "batch size {batch}");
+        }
+        drop(read);
         drop(database);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

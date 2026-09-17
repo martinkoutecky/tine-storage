@@ -5,6 +5,37 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.20.2] - 2026-09-17
+
+Patch line from v0.20.1, the revision Tine pins; the sealed-history work on
+`main` (0.21–0.23) is not included.
+
+### Fixed
+
+- `navigation_reference_names_after` and `navigation_aliases_after` page on
+  the columns of an existing index (`reference_postings_normalized_name_idx`,
+  `reference_alias_declarations_source_idx`) with a row-value keyset, so each
+  batch is one bounded index range. They ordered by the joined page path,
+  which no index serves: every 512-row batch scanned and sorted the whole
+  join, O(N²) over the graph. Tine drains the reference names on every
+  launch; at 10,000 pages (600,000 postings, 110,000 distinct rows) that was
+  215 batches × 1.3 s and ~11 GB of reads before search would answer
+  (GH tine#543). Measured on that projection: full drain 65 s → 1.3 s.
+  Signatures and the cursor tuple are unchanged; only the order of rows
+  changes, and the one consumer builds an order-independent set.
+
+### Added (test-only)
+
+- `paged_navigation_readers_use_an_index_range` pins the plan shape of the
+  four navigation readers (`EXPLAIN QUERY PLAN`: an index range or an
+  index-ordered scan, never a whole-result sort), with the v0.20.1 query as
+  the rejected counterexample; `navigation_reference_names_page_without_gaps_or_repeats`
+  drains at batch sizes 1–3 against the unbounded read.
+
+### Unit cost
+
+- No persisted record or index changes; the schema text is identical.
+
 ## [0.20.1] - 2026-09-17
 
 Patch line from v0.20.0, the revision Tine pins; the sealed-history work on
