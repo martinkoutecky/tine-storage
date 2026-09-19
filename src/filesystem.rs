@@ -1,7 +1,6 @@
 #[cfg(windows)]
 use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsMaybeDirExt as _};
 use cap_std::fs::{Dir, OpenOptions};
-#[cfg(any(target_os = "linux", target_os = "android"))]
 #[cfg(unix)]
 use std::ffi::CString;
 use std::fmt;
@@ -27,31 +26,6 @@ use std::path::PathBuf;
 #[cfg(windows)]
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
-
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct ImmutablePublicationTestStats {
-    exact_durability_barriers: usize,
-    batch_durability_barriers: usize,
-}
-
-#[cfg(test)]
-thread_local! {
-    static IMMUTABLE_PUBLICATION_TEST_STATS: std::cell::Cell<ImmutablePublicationTestStats> =
-        const { std::cell::Cell::new(ImmutablePublicationTestStats {
-            exact_durability_barriers: 0,
-            batch_durability_barriers: 0,
-        }) };
-}
-
-#[cfg(test)]
-fn note_exact_durability_barrier() {
-    IMMUTABLE_PUBLICATION_TEST_STATS.with(|stats| {
-        let mut current = stats.get();
-        current.exact_durability_barriers = current.exact_durability_barriers.saturating_add(1);
-        stats.set(current);
-    });
-}
 
 /// A failure at the generic physical-filesystem boundary.
 #[derive(Debug)]
@@ -164,11 +138,6 @@ impl ValidatedDirectorySync {
             _capability: capability,
             entry_durability,
         })
-    }
-
-    /// Validate that directory synchronization can proceed.
-    pub fn preflight(&self) -> io::Result<()> {
-        self.sync()
     }
 
     /// Synchronize the directory entry or report the platform durability limit.
@@ -1196,6 +1165,7 @@ pub fn read_required_regular(
     })
 }
 
+#[cfg(not(windows))]
 pub fn publish_immutable_exact(
     dir: &Dir,
     filename: &str,
@@ -1204,6 +1174,7 @@ pub fn publish_immutable_exact(
     publish_immutable_exact_impl(dir, filename, bytes, false)
 }
 
+#[cfg(not(windows))]
 /// Publish exact immutable bytes while the caller holds the sole writer lease
 /// for this private namespace.
 ///
@@ -1222,6 +1193,7 @@ pub fn publish_immutable_exact_single_writer(
     publish_immutable_exact_impl(dir, filename, bytes, true)
 }
 
+#[cfg(not(windows))]
 fn publish_immutable_exact_impl(
     dir: &Dir,
     filename: &str,
@@ -1271,11 +1243,10 @@ fn publish_immutable_exact_impl(
     {
         cleanup?;
     }
-    #[cfg(test)]
-    note_exact_durability_barrier();
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn install_immutable_name(
     dir: &Dir,
     from: &str,
@@ -1302,7 +1273,7 @@ fn finish_immutable_publication_sync(
     finish_android_immutable_publication_sync(dir, filename, bytes, result)
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", windows)))]
 fn finish_immutable_publication_sync(
     _dir: &Dir,
     _filename: &str,
@@ -1312,6 +1283,7 @@ fn finish_immutable_publication_sync(
     result.map_err(FilesystemError::from)
 }
 
+#[cfg(not(windows))]
 fn verify_existing(dir: &Dir, filename: &str, expected: &[u8]) -> Result<(), FilesystemError> {
     let existing = match read_required_regular(
         dir,
@@ -1506,7 +1478,7 @@ fn rename_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     linux_renameat2_noreplace(dir, from, dir, to)
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "android", windows))]
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
 fn rename_noreplace(dir: &Dir, from: &str, to: &str) -> io::Result<()> {
     dir.hard_link(from, dir, to)?;
     dir.remove_file(from)
@@ -1589,12 +1561,6 @@ fn finish_android_single_writer_install(
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn flush_exact_batch(_archive: &Dir) -> Result<(), FilesystemError> {
-    // Each entry already passed through the ordinary durable publisher.
-    Ok(())
-}
-
 #[cfg(any(test, windows))]
 fn validated_windows_directory_entry_durability(
     is_dir: bool,
@@ -1613,7 +1579,9 @@ fn validated_windows_directory_entry_durability(
 mod tests {
     use super::*;
     use cap_std::ambient_authority;
+    #[cfg(not(windows))]
     use std::sync::{Arc, Barrier};
+    #[cfg(not(windows))]
     use std::thread;
 
     struct TestDirectory {
@@ -1637,6 +1605,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     fn temporary_entries(dir: &Dir) -> Vec<String> {
         dir.entries()
             .unwrap()
@@ -1645,6 +1614,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(not(windows))]
     fn assert_persisted_entries(fixture: &TestDirectory, entries: &[(&str, &[u8])]) {
         for (filename, bytes) in entries {
             assert_eq!(fixture.dir.read(filename).unwrap(), *bytes);
@@ -1652,6 +1622,7 @@ mod tests {
         assert!(temporary_entries(&fixture.dir).is_empty());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn exact_publish_retries_identically_without_temporary_residue() {
         let fixture = TestDirectory::new("exact-retry");
@@ -1660,6 +1631,7 @@ mod tests {
         assert_persisted_entries(&fixture, &[("entry", b"exact bytes")]);
     }
 
+    #[cfg(not(windows))]
     #[test]
     #[cfg(unix)]
     fn android_exact_publish_accepts_only_directory_sync_capability_refusal() {
@@ -1876,6 +1848,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn divergent_existing_bytes_collide_without_clobbering() {
         let fixture = TestDirectory::new("collision");
@@ -1928,21 +1901,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    fn portable_batch_keeps_per_artifact_durable_publication() {
-        let fixture = TestDirectory::new("portable-batch-publication");
-        let mut batch = ExactImmutablePublicationBatch::new(&fixture.dir).unwrap();
-        batch
-            .publish(&fixture.dir, "entry", b"exact bytes")
-            .unwrap();
-
-        // The portable implementation intentionally remains the ordinary
-        // per-artifact durable publisher rather than the Linux/Android batch.
-        assert_persisted_entries(&fixture, &[("entry", b"exact bytes")]);
-        batch.finish().unwrap();
-    }
-
+    #[cfg(not(windows))]
     #[test]
     fn concurrent_publishers_converge_and_preserve_one_divergent_winner() {
         let fixture = TestDirectory::new("concurrent");
