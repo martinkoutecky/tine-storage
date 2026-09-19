@@ -5,6 +5,35 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.25.0] - 2026-09-19
+
+Continues the patch line Tine pins (v0.24.0). The crate is now the Direct Files
+durability and projection crate only; this is the compact-projection campaign's
+P1 packet (Tine ADR 0066 removed Managed Storage on 2026-09-15).
+
+### Removed
+
+- **Breaking.** The Managed Storage spine: the frontier-stamped SQLite database
+  (`PhysicalSqliteDatabase`, `StoredFrontier`, `PhysicalApplyRequest`,
+  `SqliteMaterializedRead`, the apply/preflight/terminal-construction family),
+  the SQLite file set and checkpoint fingerprints, the projection query
+  progress types, local journals v1 and v2, durable batches, digest-sealed
+  payloads, the sealed accepted-history index (`sealed_accepted_index`), the
+  managed layout vocabulary, and every `test-support` seam that fed them.
+  Nothing in Tine imported any of it: the deletion is a reachability census
+  from Tine's imports, verified by rustc's dead-code lint at a fixed point,
+  and `api.txt` now lists exactly the 52 names Tine's production and test
+  code reaches. `formats::FORMAT_MANIFEST` keeps two rows,
+  `SQLITE_APPLICATION_ID` and `SQLITE_SCHEMA_VERSION`; the Direct projection
+  DDL and schema version 29 are untouched, so no projection file is rebuilt.
+  Also removed from the facade: row types and reads Tine never named
+  (`PhysicalBlockHomeClaim`, the identity-record and UUID-introduction rows,
+  `PhysicalSearchIndexStatus`, `query_block_preorder`, …) and the unused
+  filesystem re-exports (`open_dir_nofollow`, `publish_immutable_exact`,
+  `ExactImmutablePublicationBatch`, …). The `test-support` feature stays
+  declared, and empty, so a consumer manifest that enables it still resolves.
+- The `fs2` dependency.
+
 ## [0.24.0] - 2026-09-17
 
 Continues the patch line Tine pins (v0.20.3). The sealed-history work on `main`

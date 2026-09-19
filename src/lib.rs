@@ -3,9 +3,16 @@
 //! The dependency direction is `src-tauri -> tine-core -> tine-storage`.
 //! This crate owns physical storage mechanisms; `tine-core` owns policy,
 //! authority, validation, and domain interpretation. SQLite is a disposable
-//! projection: the oplog/archive remains authoritative and can rebuild it.
-//! Consequently, this crate never depends on `tine-core`, `lsdoc`, Tauri, or
-//! UI crates.
+//! projection of the Direct Files graph: the Markdown/Org files remain
+//! authoritative and can rebuild it. Consequently, this crate never depends on
+//! `tine-core`, `lsdoc`, Tauri, or UI crates.
+//!
+//! Since 0.25.0 the crate is the Direct Files durability and projection crate
+//! only. The Managed Storage spine (oplog batches, local journals, sealed
+//! accepted-history indexes, the frontier-stamped SQLite database and its
+//! file set) was deleted in the compact-projection campaign's P1 packet after
+//! Tine removed Managed Storage (Tine ADR 0066); it lives in git history up to
+//! v0.24.0 and nothing here reads or writes its formats.
 //!
 //! SQLite implementation modules remain private. Consumers use [`sqlite`],
 //! the deliberately curated physical-storage boundary that does not expose a
@@ -21,137 +28,38 @@
 
 pub mod api_surface;
 mod content_digest;
-mod digest_sealed;
-mod durable_batch;
 mod filesystem;
 pub mod formats;
-mod local_journal;
-mod local_journal_v2;
-mod managed_layout;
 mod package_store;
-mod sealed_accepted_index_impl;
-mod sqlite_database;
-mod sqlite_fileset;
-mod sqlite_frontier;
 mod sqlite_graph_projection;
 mod sqlite_materialization;
-mod sqlite_query_progress;
 
-/// Curated physical SQLite API for the disposable projection.
+/// Curated physical SQLite API for the disposable Direct Files projection.
 ///
-/// This facade exposes typed DTOs, errors, bounded reads, instrumentation,
-/// physical file-set/candidate publication, and the connection-owning database
-/// wrapper. It intentionally excludes raw DDL, direct connection access, and
-/// lower-level production implementation helpers. Persistent-format constants
-/// are not here either: they live in [`formats`], which owns every value a
-/// reader must agree with a writer about.
+/// This facade exposes typed DTOs, errors, bounded reads, the query snapshot,
+/// and the connection-owning projection database. It intentionally excludes
+/// raw DDL, direct connection access, and lower-level implementation helpers.
+/// Persistent-format constants are not here either: they live in [`formats`],
+/// which owns every value a reader must agree with a writer about.
 pub mod sqlite {
-    pub use crate::sqlite_database::{PhysicalSqliteDatabase, PhysicalWriteInstrumentation};
-    pub use crate::sqlite_fileset::{
-        PhysicalFileCheckpoint, PhysicalSqliteCheckpoint, SqliteFileSet, SqliteFileSetError,
-        SqliteForensicPathMapping,
-    };
-    pub use crate::sqlite_frontier::{
-        ApplyDisposition, ApplyFault, ApplyResult, FrontierError, PhysicalAcceptedBatch,
-        PhysicalApplyRequest, PhysicalCheckpointFrontierRoot, PhysicalCheckpointGenerationAnchor,
-        PhysicalCheckpointGenerationBinding, PhysicalClaim, PhysicalFrontierDocument,
-        PhysicalFrontierRoot, PreflightDisposition, StoredBatch, StoredFrontier,
-    };
     pub use crate::sqlite_graph_projection::{
         PhysicalGraphProjectionDatabase, PhysicalGraphProjectionSourceDelta,
         PhysicalGraphProjectionSourceRevision, PhysicalProjectionQueryCancellation,
         PhysicalProjectionQueryReader, PhysicalProjectionQuerySnapshot, PhysicalQueryValue,
     };
     pub use crate::sqlite_materialization::{
-        query_block_preorder, query_page_result_estimated_bytes, query_result_estimated_bytes,
+        query_page_result_estimated_bytes, query_result_estimated_bytes,
         ApplyChangeInstrumentation, MaterializationError, PhysicalAliasDeclaration, PhysicalBlock,
-        PhysicalBlockHomeClaim, PhysicalBlockHomeClaimRow, PhysicalBlockPropertyCandidateRow,
-        PhysicalBlockReferenceCountRow, PhysicalBlockReferrerCandidateRow, PhysicalBlockRow,
-        PhysicalBlockStructureRow, PhysicalEntityId, PhysicalFuzzyCandidatePageRow,
-        PhysicalGraphProjectionChange, PhysicalIdentityRecord, PhysicalIdentityRecordRow,
-        PhysicalLogseqUuidIntroduction, PhysicalLogseqUuidIntroductionRow,
-        PhysicalMaterializationChange, PhysicalNavigationAliasRow, PhysicalNavigationPageRow,
-        PhysicalNavigationReferenceNameRow, PhysicalPage, PhysicalPageInventoryRow,
-        PhysicalPagePortablePathClaim, PhysicalPageReferrerCandidateRow, PhysicalPageRow,
-        PhysicalPlainTextCandidatePageRow, PhysicalPlanning, PhysicalProperty,
-        PhysicalPropertyAtom, PhysicalPropertyFacetRow, PhysicalPropertyRow, PhysicalReference,
-        PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalReferrerRow, PhysicalSearchHit,
-        PhysicalSearchIndexBuildStep, PhysicalSearchIndexStatus, PhysicalTag, PhysicalTagRow,
-        PhysicalTask, PhysicalTaskCandidateBlockRow, PhysicalTaskCandidateLocatorRow,
-        PhysicalTaskCandidatePageRow, PhysicalTaskRow, PhysicalTerminalConstructionBatch,
-        PhysicalTerminalMaterializationChunk, PhysicalTerminalProjectionStamp,
-        SqliteGraphProjectionRead, SqliteMaterializedRead, MAX_MATERIALIZATION_QUERY_BYTES,
+        PhysicalEntityId, PhysicalGraphProjectionChange, PhysicalPage,
+        PhysicalPagePortablePathClaim, PhysicalPlanning, PhysicalProperty, PhysicalPropertyAtom,
+        PhysicalReference, PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalTag,
+        PhysicalTask, SqliteGraphProjectionRead, MAX_MATERIALIZATION_QUERY_BYTES,
         MAX_MATERIALIZATION_QUERY_ROWS, MAX_MATERIALIZATION_READ_BYTES,
-    };
-    pub use crate::sqlite_query_progress::{
-        PhysicalProjectionQueryObservation, PhysicalProjectionQueryProgress,
-        PhysicalProjectionQueryProgressOutcome, PhysicalProjectionQueryRequest,
-        PhysicalProjectionQueryTarget,
-    };
-
-    #[cfg(feature = "test-support")]
-    pub use crate::sqlite_fileset::physical_checkpoint_interior_ranges_for_test;
-
-    #[cfg(feature = "test-support")]
-    pub use crate::sqlite_materialization::{
-        apply_change as apply_materialization_change_for_test,
-        initialize_schema as initialize_materialization_schema_for_test,
-        row_digests_by_table as materialization_row_digests_by_table_for_test,
-        seed_terminal_chunk_in_open_candidate as seed_terminal_chunk_for_test,
-    };
-}
-
-/// Canonical logical and physical formats for checkpoint-generation accepted
-/// history indexes.
-///
-/// The module is intentionally independent of Tine's engine policy and of any
-/// particular filesystem layout. Both the engine and SQLite compose the same
-/// reader/writer with their own content-addressed object store.
-///
-/// The authenticated map is domain-blind: it keys entries by bounded canonical
-/// key bytes supplied by the domain owner ([`sealed_accepted_index::AuthenticatedMapKey`],
-/// 1..=`formats::MAX_AUTHENTICATED_MAP_KEY_BYTES` bytes) and never parses them.
-/// A fixed-width 16-byte identifier is one such key. Every implementation must
-/// derive node digests from the single shared
-/// [`sealed_accepted_index::authenticated_map_node_digest`], which length-frames
-/// each key so roots stay comparable across arbitrary caller key spaces.
-pub mod sealed_accepted_index {
-    pub use crate::sealed_accepted_index_impl::{
-        accepted_causal_record_digest, authenticated_map_empty_digest,
-        authenticated_map_node_digest, authenticated_map_priority,
-        authenticated_map_priority_order, authenticated_map_root, causal_clock_counter_digest,
-        AcceptedEvidenceBindingV2, AcceptedSequenceChildV2, AcceptedSequenceEntryV2,
-        AcceptedSequenceNodeV2, AcceptedSequenceRootV2, AcceptedStatusRecordV2,
-        AuthenticatedMapKey, AuthenticatedMapLinkV1, AuthenticatedMapRootV1, CausalTipRecordV2,
-        SealedAcceptedCausalClockEntryV2, SealedAcceptedCausalRecordV2,
-        SealedAcceptedEvidenceDecoder, SealedAcceptedIndexError, SealedAcceptedIndexObjectStore,
-        SealedAcceptedIndexRead, SealedAcceptedIndexReader, SealedAcceptedIndexRootsV2,
-        SealedAcceptedIndexWriter, SealedAcceptedMembershipProofV2, SealedAcceptedObjectKind,
-        SealedAuthenticatedMapNodeV2, MAX_ACCEPTED_INDEX_DEPTH,
     };
 }
 
 pub use content_digest::ContentDigest;
-pub use digest_sealed::{DigestSealedError, DigestSealedPayload};
-pub use durable_batch::{
-    BatchCausalDot, BatchError, CausalPeerId, DurableBatchContract, LineageDigest,
-    ObjectDescriptor, ObjectKind, OperationBatch, OperationObject, SemanticEffectDigest,
-};
-pub use filesystem::{
-    ensure_directory_nofollow, nonblocking_lock_is_contended, open_dir_nofollow,
-    open_existing_dir_nofollow, open_file_nofollow, publish_immutable_exact,
-    publish_immutable_exact_single_writer, read_optional_regular, read_required_regular,
-    require_regular_entry, sync_dir_required, CompletedExactImmutablePublicationBatch,
-    DurableDirectoryPublication, ExactImmutablePublicationBatch, FilesystemError,
-    StagedExactImmutablePublication,
-};
-pub use local_journal::{
-    LocalJournalAppend, LocalJournalError, LocalJournalFrame, LocalJournalPayloadKind,
-    LocalJournalRecovery, LocalJournalSegment, LocalJournalStats,
-};
-pub use local_journal_v2::{
-    LocalJournalAppendError, LocalJournalSegmentV2, LocalJournalSegmentV2Selection,
-};
+pub use filesystem::{sync_dir_required, DurableDirectoryPublication, FilesystemError};
 pub use package_store::{
     publish_package_noclobber, recover_package_store, retire_package, PackageFile,
     PackagePublishOutcome, PackageStoreError,

@@ -929,12 +929,10 @@ mod tests {
         NAVIGATION_ALIASES_FIRST_SQL, NAVIGATION_REFERENCE_NAMES_AFTER_SQL,
         NAVIGATION_REFERENCE_NAMES_FIRST_SQL,
     };
-    use std::collections::BTreeSet;
 
-    use crate::sqlite_materialization::test_parse_config_hash;
     use crate::sqlite_materialization::{
-        PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityId, PhysicalMaterializationChange,
-        PhysicalPage, PhysicalPagePortablePathClaim, PhysicalPlanning, PhysicalReferencePosting,
+        PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityId, PhysicalPage,
+        PhysicalPagePortablePathClaim, PhysicalPlanning, PhysicalReferencePosting,
         PhysicalReferenceTarget, PhysicalTask,
     };
     use crate::ContentDigest;
@@ -2336,7 +2334,7 @@ mod tests {
             "tine-storage-graph-plan-guard-{}.sqlite",
             uuid::Uuid::new_v4()
         ));
-        let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        let database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
         database.initialize_schema().unwrap();
         let read = database.read();
         let text = |value: &str| rusqlite::types::Value::from(value.to_owned());
@@ -2875,125 +2873,6 @@ mod tests {
             }
         );
         drop(database);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
-    }
-
-    #[test]
-    fn standalone_and_managed_adapters_materialize_identical_graph_facts() {
-        let path = std::env::temp_dir().join(format!(
-            "tine-storage-graph-projection-parity-{}.sqlite",
-            uuid::Uuid::new_v4()
-        ));
-        let source = page(7, "TODO", "Shared projection needle");
-        let posting = PhysicalReferencePosting {
-            source_page_id: [7; 16],
-            source_entity: PhysicalEntityId::Page([7; 16]),
-            source_locator: b"preamble".to_vec(),
-            ordinal: 0,
-            kind: 0,
-            target: PhysicalReferenceTarget::PageName {
-                raw_name: "Shared Target".into(),
-                normalized_name: "shared target".into(),
-                resolved_page_id: None,
-            },
-        };
-        let alias = PhysicalAliasDeclaration {
-            source_page_id: [7; 16],
-            source_entity: PhysicalEntityId::Page([7; 16]),
-            source_locator: b"page-alias".to_vec(),
-            ordinal: 0,
-            raw_alias: "Shared Alias".into(),
-            normalized_alias: "shared alias".into(),
-        };
-        let path_claim = PhysicalPagePortablePathClaim {
-            page_id: [7; 16],
-            portable_path_key: ContentDigest::of(b"shared portable path"),
-        };
-
-        let mut standalone = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
-        standalone.initialize_schema().unwrap();
-        standalone
-            .apply_with_source_revisions_aliases_and_portable_paths(
-                &PhysicalGraphProjectionChange {
-                    replacements: vec![source.clone()],
-                    deletions: Vec::new(),
-                    reference_postings: vec![posting.clone()],
-                },
-                &[PhysicalGraphProjectionSourceRevision {
-                    page_id: [7; 16],
-                    revision: "shared-source".into(),
-                }],
-                std::slice::from_ref(&alias),
-                std::slice::from_ref(&path_claim),
-            )
-            .unwrap();
-
-        let managed = Connection::open_in_memory().unwrap();
-        let empty = ContentDigest::of(b"empty");
-        let frontier = ContentDigest::of(b"frontier-1");
-        sqlite_materialization::initialize_schema(&managed, empty, test_parse_config_hash())
-            .unwrap();
-        let transaction = managed.unchecked_transaction().unwrap();
-        sqlite_materialization::apply_change(
-            &transaction,
-            &PhysicalMaterializationChange {
-                batch_id: [9; 16],
-                replacements: vec![source],
-                deletions: Vec::new(),
-                pages_with_live_metadata_delta: BTreeSet::from([[7; 16]]),
-                derived_reference_postings: vec![posting],
-                derived_aliases: vec![alias],
-                portable_path_claims: vec![path_claim],
-                block_home_claims: Vec::new(),
-                page_name_identity_records: Vec::new(),
-                portable_path_identity_records: Vec::new(),
-                logseq_uuid_introductions: Vec::new(),
-            },
-            1,
-            ContentDigest::of(b"input"),
-            frontier,
-        )
-        .unwrap();
-        transaction.commit().unwrap();
-        let managed_read =
-            sqlite_materialization::SqliteMaterializedRead::new(&managed, 1, frontier).unwrap();
-
-        assert_eq!(
-            standalone.read().tasks(None, 10).unwrap(),
-            managed_read.tasks(None, 10).unwrap()
-        );
-        assert_eq!(
-            standalone.read().search("needle", 10).unwrap(),
-            managed_read.search("needle", 10).unwrap()
-        );
-        assert_eq!(
-            standalone.read().pages(None, 10).unwrap(),
-            managed_read.pages(None, 10).unwrap()
-        );
-        let derived_counts = |connection: &Connection| {
-            [
-                "reference_postings",
-                "reference_alias_declarations",
-                "reference_alias_bindings",
-                "page_portable_path_claims",
-            ]
-            .map(|table| {
-                connection
-                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                        row.get::<_, i64>(0)
-                    })
-                    .unwrap()
-            })
-        };
-        assert_eq!(
-            derived_counts(&standalone.connection),
-            derived_counts(&managed)
-        );
-        assert_eq!(derived_counts(&managed), [1, 1, 1, 1]);
-
-        drop(standalone);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
         }

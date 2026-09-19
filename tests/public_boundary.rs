@@ -14,22 +14,14 @@
 //! This is the fixture `tine-core` would become after extraction, in miniature:
 //! when the crate moves out of tree, its consumers see exactly this much.
 
-use serde::{Deserialize, Serialize};
 use tine_storage::formats::{self, FormatKind, FormatValue};
-use tine_storage::sealed_accepted_index::{
-    authenticated_map_empty_digest, AcceptedSequenceRootV2, AcceptedStatusRecordV2,
-};
 use tine_storage::sqlite::{
-    MaterializationError, PhysicalBlockStructureRow, PhysicalCheckpointFrontierRoot,
-    PhysicalCheckpointGenerationBinding, PhysicalFrontierRoot, PhysicalGraphProjectionChange,
-    PhysicalGraphProjectionDatabase, PhysicalTaskCandidateBlockRow, SqliteGraphProjectionRead,
-    SqliteMaterializedRead,
+    MaterializationError, PhysicalGraphProjectionChange, PhysicalGraphProjectionDatabase,
+    SqliteGraphProjectionRead,
 };
 use tine_storage::{
     publish_package_noclobber, recover_package_store, retire_package, ContentDigest,
-    DigestSealedError, DigestSealedPayload, DurableDirectoryPublication, LocalJournalAppendError,
-    LocalJournalError, LocalJournalSegmentV2, LocalJournalSegmentV2Selection, PackageFile,
-    PackagePublishOutcome,
+    DurableDirectoryPublication, PackageFile, PackagePublishOutcome,
 };
 use uuid::Uuid;
 
@@ -55,37 +47,6 @@ fn owned_ranked_query_is_usable_from_an_external_worker() {
     assert_eq!(rows, vec![vec![PhysicalQueryValue::Blob(vec![0, 255])]]);
     drop(writer);
     std::fs::remove_file(path).unwrap();
-}
-
-/// A durable payload survives a canonical encode/decode round trip, using only
-/// public paths. Not a redundant unit test: the unit suite proves the codec,
-/// this proves the codec is *usable* by someone who is not this crate.
-#[test]
-fn a_sealed_payload_round_trips_through_the_public_api() {
-    let payload = DigestSealedPayload::new(7, b"external consumer".to_vec());
-    let digest = payload.payload_digest();
-
-    let encoded = payload.encode_canonical().expect("canonical encode");
-    let decoded = DigestSealedPayload::decode_canonical(&encoded).expect("canonical decode");
-
-    assert_eq!(decoded.schema_version(), 7);
-    assert_eq!(decoded.payload(), b"external consumer");
-    assert_eq!(decoded.payload_digest(), digest);
-    decoded.verify_digest().expect("digest verifies");
-}
-
-/// Corruption must be reportable to a consumer, not just detectable inside the
-/// crate: `DigestSealedError` has to be public for the `Result` to be usable.
-#[test]
-fn a_corrupt_payload_reports_a_public_error() {
-    let payload = DigestSealedPayload::new(1, b"tamper".to_vec());
-    let mut encoded = payload.encode_canonical().expect("canonical encode");
-    let last = encoded.len() - 1;
-    encoded[last] ^= 0xff;
-
-    let outcome: Result<DigestSealedPayload, DigestSealedError> =
-        DigestSealedPayload::decode_canonical(&encoded);
-    assert!(outcome.is_err(), "a tampered payload decoded as valid");
 }
 
 /// A content digest is constructible and inspectable from outside.
@@ -137,113 +98,9 @@ fn immutable_package_protocol_is_usable_from_the_public_api() {
 }
 
 #[test]
-fn sealed_accepted_index_codecs_are_usable_from_outside_the_crate() {
-    let empty = AcceptedSequenceRootV2::empty();
-    assert_eq!(
-        AcceptedSequenceRootV2::decode(&empty.encode().unwrap()).unwrap(),
-        empty
-    );
-
-    let record = AcceptedStatusRecordV2 {
-        batch_id: [7; 16],
-        no_op: false,
-        evidence_schema: 8,
-        exact_evidence_bytes: vec![1, 2, 3],
-        accepted_causal_record_digest: ContentDigest::from_bytes([9; 32]),
-    };
-    let address = record.value_digest();
-    assert_eq!(
-        AcceptedStatusRecordV2::decode(record.batch_id, address, &record.encode().unwrap())
-            .unwrap(),
-        record
-    );
-    assert_eq!(
-        authenticated_map_empty_digest(),
-        ContentDigest::of(b"tine/oplog/authenticated-map/v1/empty")
-    );
-}
-
-#[test]
-fn live_and_checkpoint_frontiers_are_explicit_and_publicly_typed() {
-    let empty = ContentDigest::of(b"empty");
-    let live = PhysicalFrontierRoot {
-        canonical_bytes: vec![1],
-        acceptance_sequence: 0,
-        document_count: 0,
-        document_map_root_key: None,
-        document_map_root_digest: empty,
-        batch_map_root_key: None,
-        batch_map_root_digest: empty,
-        state_digest: empty,
-    };
-    assert_eq!(live.digest(), ContentDigest::of(&[1]));
-
-    let generation = PhysicalCheckpointGenerationBinding {
-        generation_id: [1; 16],
-        predecessor_generation_id: None,
-        full_anchor_generation_id: [1; 16],
-        covered_count: 0,
-        covered_document_count: 0,
-        covered_block_count: 0,
-        covered_retained_bytes_total: 0,
-        covered_semantic_capsules_root_digest: empty,
-        covered_batch_root_key: None,
-        covered_batch_root_digest: empty,
-        covered_status_root_key: None,
-        covered_status_root_digest: empty,
-        covered_sequence_root_digest: None,
-        covered_sequence_height: 0,
-        covered_causal_tip_root_key: None,
-        covered_causal_tip_root_digest: empty,
-        covered_head_facts_root_digest: empty,
-        current_projection_payload_pins_root_digest: empty,
-        nonlinear_state_root_digest: empty,
-        retention_pins_root_digest: empty,
-    };
-    let checkpoint = PhysicalCheckpointFrontierRoot {
-        canonical_bytes: vec![2],
-        acceptance_sequence: 0,
-        document_count: 0,
-        document_overlay_count: 0,
-        retained_bytes_total: 0,
-        document_map_root_key: None,
-        document_map_root_digest: empty,
-        batch_map_root_key: None,
-        batch_map_root_digest: empty,
-        batch_map_count: 0,
-        status_map_root_key: None,
-        status_map_root_digest: empty,
-        status_map_count: 0,
-        sequence_root_digest: None,
-        sequence_height: 0,
-        sequence_count: 0,
-        generation,
-        state_digest: empty,
-    };
-    assert_eq!(checkpoint.digest(), ContentDigest::of(&[2]));
-}
-
-/// Compile-use the exact production signatures from an external crate without
-/// requiring a test-only connection constructor.
-#[test]
-fn sparse_task_candidate_reads_are_publicly_typed() {
-    fn compile_use(read: &SqliteMaterializedRead<'_>) {
-        let _: Result<Vec<PhysicalTaskCandidateBlockRow>, MaterializationError> =
-            read.task_candidate_blocks_after("TODO", None, 64);
-        let _: Result<Vec<PhysicalTaskCandidateBlockRow>, MaterializationError> = read
-            .task_candidate_blocks_after_with_header_validation("TODO", None, 64, |_, _| Ok(()));
-        let _: Result<Option<PhysicalBlockStructureRow>, MaterializationError> =
-            read.block_structure([0; 16]);
-    }
-
-    let _compile_use: for<'a> fn(&SqliteMaterializedRead<'a>) = compile_use;
-}
-
-#[test]
 fn standalone_graph_projection_is_usable_without_managed_storage_types() {
-    fn compile_read(read: &SqliteGraphProjectionRead<'_>) {
-        let _: Result<Vec<PhysicalTaskCandidateBlockRow>, MaterializationError> =
-            read.task_candidate_blocks_after("TODO", None, 64);
+    fn compile_read(read: &SqliteGraphProjectionRead<'_>) -> Result<usize, MaterializationError> {
+        read.pages(None, 8).map(|rows| rows.len())
     }
 
     let path = std::env::temp_dir().join(format!(
@@ -260,7 +117,7 @@ fn standalone_graph_projection_is_usable_without_managed_storage_types() {
             reference_postings: Vec::new(),
         })
         .unwrap();
-    compile_read(&database.read());
+    assert_eq!(compile_read(&database.read()).unwrap(), 0);
     let mut snapshot =
         tine_storage::sqlite::PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(()))
             .unwrap();
@@ -311,95 +168,6 @@ fn a_receipt_can_be_generated_from_the_public_manifest() {
     );
 }
 
-/// Format constants are reachable at `formats::NAME`. The negative half — that
-/// they are reachable *only* there — is enforced by
-/// `formats::tests::no_format_constant_has_a_second_export_path`, because a
-/// nonexistent path cannot be named in code that has to compile.
-#[test]
-fn format_constants_are_reachable_through_formats() {
-    assert!(formats::MAX_OBJECT_BYTES > 0);
-    assert_eq!(formats::SQLITE_SCHEMA_VERSION, 29);
-    assert_eq!(formats::MAX_AUTHENTICATED_MAP_KEY_BYTES, 48);
-    assert_eq!(formats::LOCAL_JOURNAL_SEGMENT_PROTOCOL_VERSION, 2);
-    assert_eq!(formats::LOCAL_JOURNAL_SEGMENT_HEADER_BYTES, 136);
-    assert_eq!(formats::LOCAL_JOURNAL_FRONTIER_BYTES, 240);
-    assert_eq!(formats::SHARED_FRONTIER_HEADS_DIR, "frontier-heads-v1");
-    assert_eq!(
-        formats::LOCAL_ACTIVATION_RESERVATION_FILE,
-        "local-activation-v1.reservation"
-    );
-}
-
-#[test]
-fn journal_v2_selection_and_append_certainty_are_publicly_typed() {
-    let selection = LocalJournalSegmentV2Selection::new(
-        "device.journal-v2",
-        Uuid::from_u128(1),
-        Uuid::from_u128(2),
-        17,
-    )
-    .unwrap();
-    assert_eq!(selection.segment_name(), "device.journal-v2");
-    assert_eq!(selection.segment_id(), Uuid::from_u128(1));
-    assert_eq!(selection.device_id(), Uuid::from_u128(2));
-    assert_eq!(selection.base_sequence(), 17);
-    assert_eq!(
-        selection.segment_name_digest(),
-        ContentDigest::of(b"device.journal-v2")
-    );
-
-    let failure =
-        LocalJournalAppendError::DefinitelyNotAppended(LocalJournalError::SequenceExhausted);
-    assert!(!failure.outcome_is_unknown());
-    assert_eq!(failure.cause(), &LocalJournalError::SequenceExhausted);
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-enum ExternalJournalKind {
-    Effect,
-}
-
-#[test]
-#[cfg(any(unix, windows))]
-fn journal_v2_can_be_prepared_opened_and_appended_from_the_public_api() {
-    let root = std::env::temp_dir().join(format!("tine-storage-public-v2-{}", Uuid::new_v4()));
-    std::fs::create_dir(&root).unwrap();
-    let dir = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
-    let selection = LocalJournalSegmentV2Selection::new(
-        "external.journal-v2",
-        Uuid::from_u128(3),
-        Uuid::from_u128(4),
-        9,
-    )
-    .unwrap();
-    LocalJournalSegmentV2::<ExternalJournalKind>::prepare(&dir, &selection).unwrap();
-    let (mut segment, recovery) = LocalJournalSegmentV2::open_selected(&dir, &selection).unwrap();
-    assert_eq!(recovery.frames_recovered, 0);
-    let appended = segment
-        .append(ExternalJournalKind::Effect, b"public")
-        .unwrap();
-    assert_eq!(appended.sequence, 9);
-    assert_eq!(appended.data_durability_syncs, 2);
-    drop(segment);
-
-    let private_selection = LocalJournalSegmentV2Selection::new(
-        "private.journal-v2",
-        Uuid::from_u128(5),
-        Uuid::from_u128(4),
-        10,
-    )
-    .unwrap();
-    LocalJournalSegmentV2::<ExternalJournalKind>::prepare_single_writer(&dir, &private_selection)
-        .unwrap();
-    let (private_segment, private_recovery) =
-        LocalJournalSegmentV2::<ExternalJournalKind>::open_selected(&dir, &private_selection)
-            .unwrap();
-    assert_eq!(private_recovery.frames_recovered, 0);
-    drop(private_segment);
-    drop(dir);
-    std::fs::remove_dir_all(root).unwrap();
-}
-
 #[test]
 #[cfg(any(unix, windows))]
 fn durable_publication_exposes_create_replace_move_and_retire_to_a_consumer() {
@@ -443,225 +211,11 @@ fn durable_publication_exposes_create_replace_move_and_retire_to_a_consumer() {
 #[test]
 fn the_api_surface_is_enumerable_by_a_consumer() {
     let names = tine_storage::api_surface::exported_names();
-    assert!(names.len() > 100, "the published surface looks truncated");
+    assert!(names.len() > 40, "the published surface looks truncated");
+    // Since 0.25.0 no seam is gated behind `test-support`; the inventory still
+    // records the flag so a consumer can tell a future seam from production API.
     assert!(
-        names.iter().filter(|name| name.test_support_only).count() > 0,
-        "no test-support seams recorded; a consumer cannot tell them from production API"
-    );
-}
-
-#[test]
-fn persistent_map_removal_is_available_without_test_support() {
-    use std::collections::BTreeMap;
-    use tine_storage::sealed_accepted_index::{
-        AuthenticatedMapRootV1, SealedAcceptedIndexError, SealedAcceptedIndexObjectStore,
-        SealedAcceptedIndexReader, SealedAcceptedIndexWriter, SealedAcceptedObjectKind,
-    };
-    #[derive(Default)]
-    struct MapObjects(BTreeMap<ContentDigest, Vec<u8>>);
-    impl SealedAcceptedIndexObjectStore for MapObjects {
-        fn read_sealed_accepted_object(
-            &self,
-            kind: SealedAcceptedObjectKind,
-            address: ContentDigest,
-        ) -> Result<Option<Vec<u8>>, SealedAcceptedIndexError> {
-            assert_eq!(kind, SealedAcceptedObjectKind::MapNode);
-            Ok(self.0.get(&address).cloned())
-        }
-        fn publish_sealed_accepted_object(
-            &mut self,
-            kind: SealedAcceptedObjectKind,
-            address: ContentDigest,
-            bytes: &[u8],
-        ) -> Result<(), SealedAcceptedIndexError> {
-            assert_eq!(kind, SealedAcceptedObjectKind::MapNode);
-            self.0.insert(address, bytes.to_vec());
-            Ok(())
-        }
-    }
-    let mut store = MapObjects::default();
-    let value = ContentDigest::of(b"retained logical record");
-    let root = SealedAcceptedIndexWriter::new(&mut store)
-        .upsert_map(AuthenticatedMapRootV1::empty(), [1; 16], value)
-        .unwrap();
-    let removed = SealedAcceptedIndexWriter::new(&mut store)
-        .remove_map(root, [1; 16])
-        .unwrap();
-    assert_eq!(removed, AuthenticatedMapRootV1::empty());
-    assert_eq!(
-        SealedAcceptedIndexReader::new(&store)
-            .map_value(root, [1; 16])
-            .unwrap(),
-        Some(value)
-    );
-    assert_eq!(
-        SealedAcceptedIndexReader::new(&store)
-            .map_value(removed, [1; 16])
-            .unwrap(),
-        None
-    );
-}
-
-/// The authenticated map is domain-blind at the public boundary: a consumer
-/// supplies its own tagged, variable-width key bytes and gets the same root the
-/// crate's own callers get, with no key type of the crate's invention.
-#[test]
-fn a_consumer_can_key_the_shared_map_by_its_own_tagged_document_keys() {
-    use std::collections::BTreeMap;
-    use tine_storage::formats::MAX_AUTHENTICATED_MAP_KEY_BYTES;
-    use tine_storage::sealed_accepted_index::{
-        authenticated_map_root, AuthenticatedMapKey, AuthenticatedMapRootV1,
-        SealedAcceptedIndexError, SealedAcceptedIndexObjectStore, SealedAcceptedIndexReader,
-        SealedAcceptedIndexWriter, SealedAcceptedObjectKind,
-    };
-
-    #[derive(Default)]
-    struct MapObjects(BTreeMap<ContentDigest, Vec<u8>>);
-    impl SealedAcceptedIndexObjectStore for MapObjects {
-        fn read_sealed_accepted_object(
-            &self,
-            _kind: SealedAcceptedObjectKind,
-            address: ContentDigest,
-        ) -> Result<Option<Vec<u8>>, SealedAcceptedIndexError> {
-            Ok(self.0.get(&address).cloned())
-        }
-        fn publish_sealed_accepted_object(
-            &mut self,
-            _kind: SealedAcceptedObjectKind,
-            address: ContentDigest,
-            bytes: &[u8],
-        ) -> Result<(), SealedAcceptedIndexError> {
-            self.0.insert(address, bytes.to_vec());
-            Ok(())
-        }
-    }
-
-    // The consumer's own key space: a 17-byte entity key and a 33-byte
-    // membership key that share the same leading UUID.
-    let entity = AuthenticatedMapKey::new(&[&[0x01_u8][..], &[0xab; 16][..]].concat()).unwrap();
-    let membership =
-        AuthenticatedMapKey::new(&[&[0x02_u8][..], &[0xab; 16][..], &[0xcd; 16][..]].concat())
-            .unwrap();
-    assert_eq!(entity.len(), 17);
-    assert_eq!(membership.len(), 33);
-    assert_ne!(entity, membership);
-    assert!(entity < membership);
-
-    // A 16-byte identity is one such key, unchanged.
-    assert_eq!(
-        AuthenticatedMapKey::from([0x5a; 16]),
-        AuthenticatedMapKey::new(&[0x5a; 16]).unwrap()
-    );
-
-    // Bounds are the crate's, and they are visible through `formats`.
-    assert_eq!(MAX_AUTHENTICATED_MAP_KEY_BYTES, 48);
-    assert!(AuthenticatedMapKey::new(&[]).is_err());
-    assert!(AuthenticatedMapKey::new(&[0; MAX_AUTHENTICATED_MAP_KEY_BYTES + 1]).is_err());
-
-    let entity_value = ContentDigest::of(b"entity dependencies");
-    let membership_value = ContentDigest::of(b"membership dependencies");
-    let mut store = MapObjects::default();
-    let mut root = AuthenticatedMapRootV1::empty();
-    for (key, value) in [(membership, membership_value), (entity, entity_value)] {
-        root = SealedAcceptedIndexWriter::new(&mut store)
-            .upsert_map(root, key, value)
-            .unwrap();
-    }
-    assert_eq!(
-        root,
-        authenticated_map_root(&[(entity, entity_value), (membership, membership_value)]).unwrap()
-    );
-
-    let reader = SealedAcceptedIndexReader::new(&store);
-    assert_eq!(reader.map_value(root, entity).unwrap(), Some(entity_value));
-    assert_eq!(
-        reader.map_value(root, membership).unwrap(),
-        Some(membership_value)
-    );
-}
-
-#[test]
-fn a_consumer_can_separate_enrolled_devices_from_writer_incarnations() {
-    use tine_storage::{
-        BatchCausalDot, BatchError, CausalPeerId, DurableBatchContract, LineageDigest,
-        ObjectDescriptor, ObjectKind, OperationBatch, OperationObject, SemanticEffectDigest,
-    };
-
-    #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-    struct Contract;
-    impl DurableBatchContract for Contract {
-        type WorkspaceId = Uuid;
-        type DocumentId = Uuid;
-        type BatchId = Uuid;
-        type DeviceId = u64;
-        type CausalPeerKey = Uuid;
-        type SessionId = Uuid;
-        type Origin = u8;
-        type DependencyFrontier = Vec<Uuid>;
-        type ManifestValidationState = ();
-        const OPERATION_SCHEMA_VERSION: u32 = 1;
-        const MANAGED_ENTITY_SET_VERSION: u32 = 1;
-        fn begin_manifest_validation() {}
-        fn validate_descriptor_policy(
-            _: &mut (),
-            _: &ObjectDescriptor<Self>,
-        ) -> Result<(), BatchError<Self>> {
-            Ok(())
-        }
-        fn finish_manifest_validation(_: ()) -> Result<(), BatchError<Self>> {
-            Ok(())
-        }
-    }
-    let workspace = Uuid::from_u128(1);
-    let object = OperationObject::<Contract>::new(
-        workspace,
-        Uuid::from_u128(2),
-        ObjectKind::SemanticEffect,
-        b"preserved original effect".to_vec(),
-    )
-    .unwrap();
-    let mut decoded = Vec::new();
-    for incarnation in [71, 72] {
-        let peer = CausalPeerId::<Contract>::from_key(Uuid::from_u128(incarnation));
-        let batch = OperationBatch::<Contract>::new_with_causality(
-            workspace,
-            LineageDigest::of(b"same enrollment"),
-            Uuid::from_u128(incarnation),
-            11,
-            Uuid::from_u128(3),
-            0,
-            BatchCausalDot::new(peer, 1).unwrap(),
-            vec![],
-            vec![],
-            SemanticEffectDigest::of(object.payload()),
-            vec![object.descriptor().unwrap()],
-        )
-        .unwrap();
-        let restored = OperationBatch::<Contract>::decode(&batch.encode().unwrap()).unwrap();
-        assert_eq!(restored, batch);
-        assert_eq!(restored.author_device_id(), 11);
-        assert_eq!(
-            restored.causal_dot().peer_id().key(),
-            Uuid::from_u128(incarnation)
-        );
-        decoded.push(restored);
-    }
-    assert_ne!(decoded[0].causal_dot(), decoded[1].causal_dot());
-}
-
-#[test]
-fn projection_progress_is_usable_without_backend_specific_types() {
-    use tine_storage::sqlite::{
-        PhysicalProjectionQueryProgress, PhysicalProjectionQueryProgressOutcome,
-    };
-    let progress = PhysicalProjectionQueryProgress::new();
-    let target = progress.target(1);
-    let request = progress.request();
-    progress.publish(&target, 2).unwrap();
-    assert_eq!(
-        progress.wait_for_target(&target, &request, std::time::Duration::ZERO),
-        PhysicalProjectionQueryProgressOutcome::Ready {
-            minimum_revision: 2
-        }
+        names.iter().all(|name| !name.test_support_only),
+        "an ungated export is recorded as a test-support seam"
     );
 }

@@ -211,10 +211,9 @@ pub fn exported_names() -> Vec<ExportedName> {
     const FORMATS_RS: &str = include_str!("formats.rs");
 
     let sqlite_body = inline_module_body(LIB_RS, "sqlite");
-    let sealed_body = inline_module_body(LIB_RS, "sealed_accepted_index");
-    // The root region is lib.rs with both public facade bodies removed, so an
-    // export inside either module is not counted twice.
-    let root_region = LIB_RS.replace(sqlite_body, "").replace(sealed_body, "");
+    // The root region is lib.rs with the public facade body removed, so an
+    // export inside the module is not counted twice.
+    let root_region = LIB_RS.replace(sqlite_body, "");
 
     let mut names = Vec::new();
     names.extend(parse_exports(ExportPath::Root, &root_region));
@@ -231,7 +230,7 @@ pub fn exported_names() -> Vec<ExportedName> {
     ));
 
     // The public modules are themselves public paths.
-    for module in ["api_surface", "formats", "sealed_accepted_index", "sqlite"] {
+    for module in ["api_surface", "formats", "sqlite"] {
         names.push(ExportedName {
             path: ExportPath::Root,
             name: module.to_string(),
@@ -247,29 +246,10 @@ pub fn exported_names() -> Vec<ExportedName> {
 /// Render the surface in the form stored in `api.txt`.
 pub fn render() -> String {
     let names = exported_names();
-    const LIB_RS: &str = include_str!("lib.rs");
-    let sealed_body = inline_module_body(LIB_RS, "sealed_accepted_index");
-
-    // `ExportPath` predates nested facades and is a public exhaustive enum.
-    // Extending it would turn every new facade into a breaking API change.
-    // Keep the legacy structured inventory stable and add exact nested paths
-    // only at the rendered-inventory boundary.
-    let mut rows: Vec<(String, bool)> = names
+    let rows: Vec<(String, bool)> = names
         .iter()
         .map(|name| (name.row(), name.test_support_only))
         .collect();
-    let mut sealed_names = parse_exports(ExportPath::Root, sealed_body);
-    sealed_names.sort();
-    sealed_names.dedup();
-    rows.extend(sealed_names.into_iter().map(|name| {
-        (
-            format!("tine_storage::sealed_accepted_index::{}", name.name),
-            name.test_support_only,
-        )
-    }));
-    // `exported_names` is already in the historical ExportPath order. Append
-    // the new nested facade as its own final group, matching that established
-    // inventory layout without changing the public enum that defines it.
 
     let production = rows.iter().filter(|(_, gated)| !gated).count();
     let gated = rows.len() - production;
@@ -322,13 +302,13 @@ mod tests {
     fn the_parse_finds_a_plausible_surface() {
         let names = exported_names();
         assert!(
-            names.len() > 100,
+            names.len() > 40,
             "parsed only {} exported names; the parser has stopped seeing the surface",
             names.len()
         );
         for expected in [
             "ContentDigest",
-            "OperationBatch",
+            "PackagePublishOutcome",
             "DurableDirectoryPublication",
         ] {
             assert!(
@@ -344,9 +324,18 @@ mod tests {
                 .any(|n| n.name == "SQLITE_SCHEMA_VERSION" && n.path == ExportPath::Formats),
             "format constants are not being attributed to `formats`"
         );
+        // Since 0.25.0 no export is gated behind `test-support` (the Managed
+        // seams left with the Managed spine), so the cfg parse is exercised
+        // on a synthetic module body instead of the live `lib.rs`.
+        let gated = parse_exports(
+            ExportPath::Sqlite,
+            "    #[cfg(feature = \"test-support\")]\n    pub use crate::x::seam_for_test;\n",
+        );
         assert!(
-            names.iter().any(|n| n.test_support_only),
-            "no export was recognized as test-support-gated; the cfg parse is broken"
+            gated
+                .iter()
+                .any(|n| n.name == "seam_for_test" && n.test_support_only),
+            "a test-support-gated export was not recognized; the cfg parse is broken"
         );
         // `formats`' own export-path guard writes the literal `"pub use "` in
         // its source. A scan that reaches the test module invents an export
