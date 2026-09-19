@@ -139,7 +139,7 @@ pub fn query_page_result_estimated_bytes<'a>(
 /// Expand parent-local sibling order into whole-page preorder. Returns original
 /// input indices and one-based depths, so producers can share ordering without
 /// allocating document payload. Equal orders use block ID.
-pub fn query_block_preorder<'a>(
+pub(crate) fn query_block_preorder<'a>(
     blocks: impl IntoIterator<Item = ([u8; 16], Option<[u8; 16]>, &'a str)>,
 ) -> Result<Vec<(usize, usize)>, MaterializationError> {
     let blocks = blocks.into_iter().collect::<Vec<_>>();
@@ -1545,28 +1545,6 @@ fn canonical_sql(sql: &str) -> String {
     sql.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn ensure_stamp(
-    connection: &Connection,
-    sequence: u64,
-    frontier_digest: ContentDigest,
-) -> Result<(), MaterializationError> {
-    let (found_sequence, found_digest): (i64, Vec<u8>) = connection.query_row(
-        "SELECT acceptance_sequence, frontier_root_digest
-         FROM materialization_stamp WHERE singleton = 1",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    if u64::try_from(found_sequence).ok() != Some(sequence)
-        || found_digest.as_slice() != frontier_digest.as_bytes()
-    {
-        return Err(MaterializationError::Stale {
-            materialized: u64::try_from(found_sequence).unwrap_or(0),
-            frontier: sequence,
-        });
-    }
-    Ok(())
-}
-
 pub(crate) fn search_index_status(
     connection: &Connection,
 ) -> Result<PhysicalSearchIndexStatus, MaterializationError> {
@@ -2789,14 +2767,6 @@ pub struct PhysicalPageRow {
     pub searchable_text: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PhysicalPageInventoryRow {
-    pub page_id: [u8; 16],
-    pub name: String,
-    pub path: String,
-    pub text_kind: i64,
-}
-
 /// Lightweight page row for navigation/autocomplete.  It deliberately omits
 /// searchable body text so a title lookup never retains graph-sized content.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2842,54 +2812,6 @@ pub struct PhysicalBlockRow {
     pub collapsed: bool,
     pub logseq_uuid: Option<[u8; 16]>,
     pub logseq_identity_origin: Option<i64>,
-}
-
-/// One candidate home retained for a block identity across accepted history.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PhysicalBlockHomeClaimRow {
-    pub block_id: [u8; 16],
-    pub home_document_id: [u8; 16],
-    pub batch_id: Option<[u8; 16]>,
-    pub causal_peer_id: Option<[u8; 16]>,
-    pub causal_counter: Option<u64>,
-}
-
-/// One bounded opaque causal-identity record returned by its digest key.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PhysicalIdentityRecordRow {
-    pub key_digest: ContentDigest,
-    pub record: Vec<u8>,
-}
-
-/// One accepted-history external UUID introduction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PhysicalLogseqUuidIntroductionRow {
-    pub logseq_uuid: [u8; 16],
-    pub block_id: [u8; 16],
-    pub home_document_id: [u8; 16],
-    pub batch_id: Option<[u8; 16]>,
-    pub causal_peer_id: Option<[u8; 16]>,
-    pub causal_counter: Option<u64>,
-}
-
-/// The structural fields required for a bounded block ancestor walk.
-///
-/// Deliberately excludes content, search text, UUIDs, and parser-owned
-/// semantic facets so callers cannot accidentally turn a structural point
-/// lookup into a page-body transfer.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PhysicalBlockStructureRow {
-    pub block_id: [u8; 16],
-    pub page_id: [u8; 16],
-    pub parent: Option<[u8; 16]>,
-    pub order: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PhysicalReferrerRow {
-    pub source: PhysicalEntityId,
-    pub source_page_id: [u8; 16],
-    pub kind: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3063,12 +2985,6 @@ fn page_row_output_bytes(row: &PhysicalPageRow) -> Result<usize, Materialization
     )
 }
 
-fn page_inventory_row_output_bytes(
-    row: &PhysicalPageInventoryRow,
-) -> Result<usize, MaterializationError> {
-    checked_output_bytes(32, [Some(row.name.as_str()), Some(row.path.as_str())])
-}
-
 fn navigation_page_row_output_bytes(
     row: &PhysicalNavigationPageRow,
 ) -> Result<usize, MaterializationError> {
@@ -3119,12 +3035,6 @@ fn block_row_output_bytes(row: &PhysicalBlockRow) -> Result<usize, Materializati
     )
 }
 
-fn block_structure_row_output_bytes(
-    row: &PhysicalBlockStructureRow,
-) -> Result<usize, MaterializationError> {
-    checked_output_bytes(48, [Some(row.order.as_str())])
-}
-
 fn task_candidate_block_row_output_bytes(
     row: &PhysicalTaskCandidateBlockRow,
 ) -> Result<usize, MaterializationError> {
@@ -3150,10 +3060,6 @@ fn task_candidate_locator_row_output_bytes(
             Some(row.page_path.as_str()),
         ],
     )
-}
-
-fn referrer_row_output_bytes(_: &PhysicalReferrerRow) -> Result<usize, MaterializationError> {
-    checked_output_bytes(64, [])
 }
 
 fn property_row_output_bytes(row: &PhysicalPropertyRow) -> Result<usize, MaterializationError> {
@@ -3339,44 +3245,6 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         Ok(page)
     }
 
-    /// Return bounded candidates that claim one CRDT home document. Multiple
-    /// rows are preserved so the semantic owner can diagnose a duplicate-home
-    /// graph instead of the physical layer choosing one page.
-    pub fn pages_by_home_document_id(
-        &self,
-        home_document_id: [u8; 16],
-        limit: usize,
-    ) -> Result<Vec<PhysicalPageRow>, MaterializationError> {
-        self.pages_by_home_document_id_with_header_validation(
-            home_document_id,
-            limit,
-            allow_any_page_header,
-        )
-    }
-
-    pub fn pages_by_home_document_id_with_header_validation(
-        &self,
-        home_document_id: [u8; 16],
-        limit: usize,
-        mut validate_header: impl FnMut(&str, i64) -> Result<(), MaterializationError>,
-    ) -> Result<Vec<PhysicalPageRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        let mut statement = self.connection.prepare(
-            "SELECT page_id, home_document_id, name, name_key, path,
-                    text_kind, preamble, searchable_text
-             FROM pages LEFT JOIN page_text USING (page_id)
-             WHERE home_document_id = ?1
-             ORDER BY page_id LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![home_document_id.as_slice(), limit], |row| {
-            page_row_with_header_validation(row, &mut validate_header)
-        })?;
-        collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from).and_then(|row| row)),
-            page_row_output_bytes,
-        )
-    }
-
     pub fn block(
         &self,
         block_id: [u8; 16],
@@ -3396,184 +3264,6 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         if let Some(row) = &block {
             let mut budget = MaterializationReadBudget::default();
             budget.add(block_row_output_bytes(row)?)?;
-        }
-        Ok(block)
-    }
-
-    /// Return bounded accepted-history homes for one block identity.
-    ///
-    /// Rows remain after the live block is deleted. Multiple rows therefore
-    /// represent semantic ambiguity for the caller; storage never chooses one.
-    pub fn block_home_claims(
-        &self,
-        block_id: [u8; 16],
-        limit: usize,
-    ) -> Result<Vec<PhysicalBlockHomeClaimRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        let mut statement = self.connection.prepare(
-            "SELECT block_id, home_document_id, batch_id, causal_peer_id,
-                    causal_counter
-             FROM block_home_claims
-             WHERE block_id = ?1
-             ORDER BY claim_kind, claim_key, home_document_id LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![block_id.as_slice(), limit], |row| {
-            let block_id: Vec<u8> = row.get(0)?;
-            let home_document_id: Vec<u8> = row.get(1)?;
-            let batch_id: Option<Vec<u8>> = row.get(2)?;
-            let causal_peer_id: Option<Vec<u8>> = row.get(3)?;
-            let causal_counter: Option<i64> = row.get(4)?;
-            Ok(PhysicalBlockHomeClaimRow {
-                block_id: decode_id_sql(&block_id)?,
-                home_document_id: decode_id_sql(&home_document_id)?,
-                batch_id: batch_id.as_deref().map(decode_id_sql).transpose()?,
-                causal_peer_id: causal_peer_id.as_deref().map(decode_id_sql).transpose()?,
-                causal_counter: causal_counter
-                    .map(|counter| u64::try_from(counter).map_err(sql_decode_error))
-                    .transpose()?,
-            })
-        })?;
-        collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from)),
-            |_| Ok(72),
-        )
-    }
-
-    /// Return the complete causal ownership record for one normalized page
-    /// name. The record encoding remains application-owned.
-    pub fn page_name_identity_record(
-        &self,
-        key_digest: ContentDigest,
-    ) -> Result<Option<PhysicalIdentityRecordRow>, MaterializationError> {
-        self.identity_record("page_name_identity_records", key_digest)
-    }
-
-    /// Return the complete causal ownership record for one portable path.
-    pub fn portable_path_identity_record(
-        &self,
-        key_digest: ContentDigest,
-    ) -> Result<Option<PhysicalIdentityRecordRow>, MaterializationError> {
-        self.identity_record("portable_path_identity_records", key_digest)
-    }
-
-    fn identity_record(
-        &self,
-        table: &'static str,
-        key_digest: ContentDigest,
-    ) -> Result<Option<PhysicalIdentityRecordRow>, MaterializationError> {
-        let sql = match table {
-            "page_name_identity_records" => {
-                "SELECT key_digest, record FROM page_name_identity_records
-                 WHERE key_digest = ?1"
-            }
-            "portable_path_identity_records" => {
-                "SELECT key_digest, record FROM portable_path_identity_records
-                 WHERE key_digest = ?1"
-            }
-            _ => {
-                return Err(MaterializationError::InvalidInput(
-                    "unknown causal identity record table".into(),
-                ));
-            }
-        };
-        let row: Option<(Vec<u8>, Vec<u8>)> = self
-            .connection
-            .query_row(sql, params![key_digest.as_bytes().as_slice()], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .optional()?;
-        row.map(|(stored_key, record)| {
-            if record.is_empty() || record.len() > MAX_MATERIALIZATION_FIELD_BYTES {
-                return Err(MaterializationError::Corrupt(
-                    "causal identity record has an invalid byte length".into(),
-                ));
-            }
-            let stored_key = decode_digest(stored_key)?;
-            if stored_key != key_digest {
-                return Err(MaterializationError::Corrupt(
-                    "causal identity record key does not match its lookup".into(),
-                ));
-            }
-            let mut budget = MaterializationReadBudget::default();
-            budget.add(record.len().saturating_add(32))?;
-            Ok(PhysicalIdentityRecordRow {
-                key_digest: stored_key,
-                record,
-            })
-        })
-        .transpose()
-    }
-
-    /// Return bounded accepted-history introductions for one external UUID.
-    /// Multiple rows are preserved for application-level ambiguity handling.
-    pub fn logseq_uuid_introductions(
-        &self,
-        logseq_uuid: [u8; 16],
-        limit: usize,
-    ) -> Result<Vec<PhysicalLogseqUuidIntroductionRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        let mut statement = self.connection.prepare(
-            "SELECT logseq_uuid, block_id, home_document_id, batch_id,
-                    causal_peer_id, causal_counter
-             FROM logseq_uuid_introductions
-             WHERE logseq_uuid = ?1
-             ORDER BY claim_kind, claim_key, block_id, home_document_id LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![logseq_uuid.as_slice(), limit], |row| {
-            let stored_uuid: Vec<u8> = row.get(0)?;
-            let block_id: Vec<u8> = row.get(1)?;
-            let home_document_id: Vec<u8> = row.get(2)?;
-            let batch_id: Option<Vec<u8>> = row.get(3)?;
-            let causal_peer_id: Option<Vec<u8>> = row.get(4)?;
-            let causal_counter: Option<i64> = row.get(5)?;
-            Ok(PhysicalLogseqUuidIntroductionRow {
-                logseq_uuid: decode_id_sql(&stored_uuid)?,
-                block_id: decode_id_sql(&block_id)?,
-                home_document_id: decode_id_sql(&home_document_id)?,
-                batch_id: batch_id.as_deref().map(decode_id_sql).transpose()?,
-                causal_peer_id: causal_peer_id.as_deref().map(decode_id_sql).transpose()?,
-                causal_counter: causal_counter
-                    .map(|counter| u64::try_from(counter).map_err(sql_decode_error))
-                    .transpose()?,
-            })
-        })?;
-        let result = collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from)),
-            |_| Ok(88),
-        )?;
-        if result
-            .iter()
-            .any(|introduction| introduction.logseq_uuid != logseq_uuid)
-        {
-            return Err(MaterializationError::Corrupt(
-                "Logseq UUID introduction key does not match its lookup".into(),
-            ));
-        }
-        Ok(result)
-    }
-
-    /// Read only the structural fields needed to walk one block's ancestors.
-    ///
-    /// This intentionally omits body/search text and public UUIDs. It follows
-    /// the same point-read error and aggregate-output budget behavior as
-    /// [`Self::block`].
-    pub fn block_structure(
-        &self,
-        block_id: [u8; 16],
-    ) -> Result<Option<PhysicalBlockStructureRow>, MaterializationError> {
-        let block = self
-            .connection
-            .query_row(
-                "SELECT block_id, page_id, parent_block_id, order_key
-                 FROM blocks WHERE block_id = ?1",
-                params![block_id.as_slice()],
-                block_structure_row,
-            )
-            .optional()
-            .map_err(MaterializationError::from)?;
-        if let Some(row) = &block {
-            let mut budget = MaterializationReadBudget::default();
-            budget.add(block_structure_row_output_bytes(row)?)?;
         }
         Ok(block)
     }
@@ -3604,151 +3294,6 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         )
     }
 
-    pub fn pages_by_name(
-        &self,
-        name: &str,
-        limit: usize,
-    ) -> Result<Vec<PhysicalPageRow>, MaterializationError> {
-        self.pages_by_name_with_header_validation(name, limit, allow_any_page_header)
-    }
-
-    pub fn pages_by_name_with_header_validation(
-        &self,
-        name: &str,
-        limit: usize,
-        validate_header: impl FnMut(&str, i64) -> Result<(), MaterializationError>,
-    ) -> Result<Vec<PhysicalPageRow>, MaterializationError> {
-        self.pages_by_text_column_with_header_validation("name", name, limit, validate_header)
-    }
-
-    pub fn pages_by_name_key(
-        &self,
-        name_key: &str,
-        limit: usize,
-    ) -> Result<Vec<PhysicalPageRow>, MaterializationError> {
-        self.pages_by_name_key_with_header_validation(name_key, limit, allow_any_page_header)
-    }
-
-    pub fn pages_by_name_key_with_header_validation(
-        &self,
-        name_key: &str,
-        limit: usize,
-        validate_header: impl FnMut(&str, i64) -> Result<(), MaterializationError>,
-    ) -> Result<Vec<PhysicalPageRow>, MaterializationError> {
-        self.pages_by_text_column_with_header_validation(
-            "name_key",
-            name_key,
-            limit,
-            validate_header,
-        )
-    }
-
-    /// Exact OG-compatible logical-name lookup scoped by managed text kind.
-    /// Callers use a limit of two to distinguish one owner from ambiguity
-    /// without scanning or retaining an unbounded duplicate set.
-    pub fn pages_by_name_key_and_kind(
-        &self,
-        name_key: &str,
-        kind: i64,
-        limit: usize,
-    ) -> Result<Vec<PhysicalPageRow>, MaterializationError> {
-        self.pages_by_name_key_and_kind_with_header_validation(
-            name_key,
-            kind,
-            limit,
-            allow_any_page_header,
-        )
-    }
-
-    pub fn pages_by_name_key_and_kind_with_header_validation(
-        &self,
-        name_key: &str,
-        kind: i64,
-        limit: usize,
-        mut validate_header: impl FnMut(&str, i64) -> Result<(), MaterializationError>,
-    ) -> Result<Vec<PhysicalPageRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        checked_query_text(name_key)?;
-        let mut statement = self.connection.prepare(
-            "SELECT page_id, home_document_id, name, name_key, path,
-                    text_kind, preamble, searchable_text
-             FROM pages LEFT JOIN page_text USING (page_id)
-             WHERE name_key = ?1 AND text_kind = ?2
-             ORDER BY page_id LIMIT ?3",
-        )?;
-        let rows = statement.query_map(params![name_key, kind, limit], |row| {
-            page_row_with_header_validation(row, &mut validate_header)
-        })?;
-        collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from).and_then(|row| row)),
-            page_row_output_bytes,
-        )
-    }
-
-    pub fn pages_by_path(
-        &self,
-        path: &String,
-        limit: usize,
-    ) -> Result<Vec<PhysicalPageRow>, MaterializationError> {
-        self.pages_by_path_with_header_validation(path, limit, allow_any_page_header)
-    }
-
-    pub fn pages_by_path_with_header_validation(
-        &self,
-        path: &String,
-        limit: usize,
-        validate_header: impl FnMut(&str, i64) -> Result<(), MaterializationError>,
-    ) -> Result<Vec<PhysicalPageRow>, MaterializationError> {
-        self.pages_by_text_column_with_header_validation(
-            "path",
-            path.as_str(),
-            limit,
-            validate_header,
-        )
-    }
-
-    /// Return bounded candidates whose caller-derived portable path key
-    /// matches exactly. Multiple rows are meaningful: the application must
-    /// classify case/Unicode-equivalent source-path conflicts rather than let
-    /// the physical index choose an owner.
-    pub fn pages_by_portable_path_key(
-        &self,
-        portable_path_key: ContentDigest,
-        limit: usize,
-    ) -> Result<Vec<PhysicalPageRow>, MaterializationError> {
-        self.pages_by_portable_path_key_with_header_validation(
-            portable_path_key,
-            limit,
-            allow_any_page_header,
-        )
-    }
-
-    pub fn pages_by_portable_path_key_with_header_validation(
-        &self,
-        portable_path_key: ContentDigest,
-        limit: usize,
-        mut validate_header: impl FnMut(&str, i64) -> Result<(), MaterializationError>,
-    ) -> Result<Vec<PhysicalPageRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        let mut statement = self.connection.prepare(
-            "SELECT p.page_id, p.home_document_id, p.name, p.name_key, p.path,
-                    p.text_kind, pt.preamble, pt.searchable_text
-             FROM page_portable_path_claims AS c
-             JOIN pages AS p ON p.page_id = c.page_id
-             LEFT JOIN page_text AS pt ON pt.page_id = p.page_id
-             WHERE c.portable_path_key = ?1
-             ORDER BY p.page_id LIMIT ?2",
-        )?;
-        let rows = statement.query_map(
-            params![portable_path_key.as_bytes().as_slice(), limit],
-            |row| page_row_with_header_validation(row, &mut validate_header),
-        )?;
-        collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from).and_then(|row| row)),
-            page_row_output_bytes,
-        )
-    }
-
     /// Bounded stable page listing for application-facing exact queries. This
     /// only reads the stamped materialization captured on construction; it is
     /// intentionally not a filesystem or graph-tree enumeration.
@@ -3760,7 +3305,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         self.pages_with_header_validation(kind, limit, allow_any_page_header)
     }
 
-    pub fn pages_with_header_validation(
+    pub(crate) fn pages_with_header_validation(
         &self,
         kind: Option<i64>,
         limit: usize,
@@ -3788,74 +3333,6 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         collect_read_rows(
             rows.map(|row| row.map_err(MaterializationError::from).and_then(|row| row)),
             page_row_output_bytes,
-        )
-    }
-
-    /// Stable bounded page-inventory pagination. The cursor is the final
-    /// `(path, page_id)` returned by the preceding call.
-    pub fn page_inventory_after_with_header_validation(
-        &self,
-        after_path: Option<&str>,
-        after_page_id: Option<&[u8; 16]>,
-        kind: Option<i64>,
-        limit: usize,
-        mut validate_header: impl FnMut(&str, i64) -> Result<(), MaterializationError>,
-    ) -> Result<Vec<PhysicalPageInventoryRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        if after_path.is_some() != after_page_id.is_some() {
-            return Err(MaterializationError::InvalidQuery(
-                "page inventory cursor requires both path and page ID".into(),
-            ));
-        }
-        if let Some(path) = after_path {
-            checked_query_text(path)?;
-        }
-        let (sql, args): (&str, Vec<rusqlite::types::Value>) =
-            match (after_path, after_page_id, kind) {
-                (None, None, None) => (
-                    "SELECT page_id, name, path, text_kind
-                     FROM pages ORDER BY path, page_id LIMIT ?1",
-                    vec![limit.into()],
-                ),
-                (None, None, Some(kind)) => (
-                    "SELECT page_id, name, path, text_kind
-                     FROM pages WHERE text_kind = ?1
-                     ORDER BY path, page_id LIMIT ?2",
-                    vec![kind.into(), limit.into()],
-                ),
-                (Some(path), Some(page_id), None) => (
-                    "SELECT page_id, name, path, text_kind
-                     FROM pages
-                     WHERE path > ?1 OR (path = ?1 AND page_id > ?2)
-                     ORDER BY path, page_id LIMIT ?3",
-                    vec![
-                        path.to_owned().into(),
-                        page_id.to_vec().into(),
-                        limit.into(),
-                    ],
-                ),
-                (Some(path), Some(page_id), Some(kind)) => (
-                    "SELECT page_id, name, path, text_kind
-                     FROM pages
-                     WHERE text_kind = ?1
-                       AND (path > ?2 OR (path = ?2 AND page_id > ?3))
-                     ORDER BY path, page_id LIMIT ?4",
-                    vec![
-                        kind.into(),
-                        path.to_owned().into(),
-                        page_id.to_vec().into(),
-                        limit.into(),
-                    ],
-                ),
-                _ => unreachable!("cursor presence was validated above"),
-            };
-        let mut statement = self.connection.prepare(sql)?;
-        let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
-            page_inventory_row_with_header_validation(row, &mut validate_header)
-        })?;
-        collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from).and_then(|row| row)),
-            page_inventory_row_output_bytes,
         )
     }
 
@@ -3890,95 +3367,6 @@ impl<'a> SqliteGraphProjectionRead<'a> {
                      ORDER BY path, page_id LIMIT ?3",
                 vec![
                     path.to_owned().into(),
-                    page_id.to_vec().into(),
-                    limit.into(),
-                ],
-            ),
-            _ => unreachable!("cursor presence was validated above"),
-        };
-        let mut statement = self.connection.prepare(sql)?;
-        let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
-            navigation_page_row_with_header_validation(row, &mut validate_header)
-        })?;
-        collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from).and_then(|row| row)),
-            navigation_page_row_output_bytes,
-        )
-    }
-
-    /// Bounded lightweight candidates for one normalized logical page name.
-    pub fn navigation_pages_by_name_key_with_header_validation(
-        &self,
-        name_key: &str,
-        limit: usize,
-        mut validate_header: impl FnMut(&str, i64) -> Result<(), MaterializationError>,
-    ) -> Result<Vec<PhysicalNavigationPageRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        checked_query_text(name_key)?;
-        let mut statement = self.connection.prepare(
-            "SELECT page_id, name, name_key, path, text_kind, preamble, page_text.page_id
-             FROM pages LEFT JOIN page_text USING (page_id) WHERE name_key = ?1
-             ORDER BY page_id LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![name_key, limit], |row| {
-            navigation_page_row_with_header_validation(row, &mut validate_header)
-        })?;
-        collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from).and_then(|row| row)),
-            navigation_page_row_output_bytes,
-        )
-    }
-
-    /// Stable bounded lookup of descendants in one Logseq namespace.
-    ///
-    /// The appended `/` is an ASCII byte and its exclusive successor is `0`,
-    /// so `[parent/, parent0)` is exactly the binary-collation range of keys
-    /// beginning with `parent/`. The existing `(name_key, page_id)` index can
-    /// therefore seek directly to the namespace instead of scanning pages.
-    pub fn navigation_pages_by_name_key_namespace_after_with_header_validation(
-        &self,
-        parent_name_key: &str,
-        after_name_key: Option<&str>,
-        after_page_id: Option<&[u8; 16]>,
-        limit: usize,
-        mut validate_header: impl FnMut(&str, i64) -> Result<(), MaterializationError>,
-    ) -> Result<Vec<PhysicalNavigationPageRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        checked_query_text(parent_name_key)?;
-        if parent_name_key.is_empty() {
-            return Err(MaterializationError::InvalidQuery(
-                "page namespace parent key must not be empty".into(),
-            ));
-        }
-        if after_name_key.is_some() != after_page_id.is_some() {
-            return Err(MaterializationError::InvalidQuery(
-                "page namespace cursor requires both name key and page ID".into(),
-            ));
-        }
-        if let Some(after) = after_name_key {
-            checked_query_text(after)?;
-        }
-        let lower = format!("{parent_name_key}/");
-        let upper = format!("{parent_name_key}0");
-        let (sql, args): (&str, Vec<rusqlite::types::Value>) = match (after_name_key, after_page_id)
-        {
-            (None, None) => (
-                "SELECT page_id, name, name_key, path, text_kind, preamble, page_text.page_id
-                     FROM pages LEFT JOIN page_text USING (page_id)
-                     WHERE name_key >= ?1 AND name_key < ?2
-                     ORDER BY name_key, page_id LIMIT ?3",
-                vec![lower.into(), upper.into(), limit.into()],
-            ),
-            (Some(after), Some(page_id)) => (
-                "SELECT page_id, name, name_key, path, text_kind, preamble, page_text.page_id
-                     FROM pages LEFT JOIN page_text USING (page_id)
-                     WHERE name_key >= ?1 AND name_key < ?2
-                       AND (name_key > ?3 OR (name_key = ?3 AND page_id > ?4))
-                     ORDER BY name_key, page_id LIMIT ?5",
-                vec![
-                    lower.into(),
-                    upper.into(),
-                    after.to_owned().into(),
                     page_id.to_vec().into(),
                     limit.into(),
                 ],
@@ -4091,84 +3479,6 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         )
     }
 
-    fn pages_by_text_column_with_header_validation(
-        &self,
-        column: &str,
-        value: &str,
-        limit: usize,
-        mut validate_header: impl FnMut(&str, i64) -> Result<(), MaterializationError>,
-    ) -> Result<Vec<PhysicalPageRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        checked_query_text(value)?;
-        let sql = format!(
-            "SELECT page_id, home_document_id, name, name_key, path,
-                    text_kind, preamble, searchable_text
-             FROM pages LEFT JOIN page_text USING (page_id) WHERE {column} = ?1 ORDER BY page_id LIMIT ?2"
-        );
-        let mut statement = self.connection.prepare(&sql)?;
-        let rows = statement.query_map(params![value, limit], |row| {
-            page_row_with_header_validation(row, &mut validate_header)
-        })?;
-        collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from).and_then(|row| row)),
-            page_row_output_bytes,
-        )
-    }
-
-    pub fn blocks_on_page(
-        &self,
-        page_id: [u8; 16],
-        limit: usize,
-    ) -> Result<Vec<PhysicalBlockRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        let mut statement = self.connection.prepare(
-            "SELECT block_id, page_id, home_document_id, parent_block_id,
-                    order_key, content, searchable_text, heading_level,
-                    collapsed, logseq_uuid, logseq_identity_origin
-             FROM blocks LEFT JOIN block_text USING (block_id) WHERE page_id = ?1
-             ORDER BY order_key, block_id LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![page_id.as_slice(), limit], block_row)?;
-        collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from)),
-            block_row_output_bytes,
-        )
-    }
-
-    pub fn referrers_to(
-        &self,
-        target: PhysicalEntityId,
-        limit: usize,
-    ) -> Result<Vec<PhysicalReferrerRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        let (target_type, target_id) = target.sql_parts();
-        let mut statement = self.connection.prepare(
-            "SELECT source_type, source_id, source_page_id, reference_kind
-             FROM refs
-             WHERE target_type = ?1 AND target_id = ?2
-             ORDER BY source_page_id, source_type, source_id, reference_kind, ordinal
-             LIMIT ?3",
-        )?;
-        let rows =
-            statement.query_map(params![target_type, target_id.as_slice(), limit], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, Vec<u8>>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            })?;
-        let rows = rows.map(|row| {
-            let (source_type, source_id, source_page_id, kind) = row?;
-            Ok(PhysicalReferrerRow {
-                source: decode_entity(source_type, &source_id)?,
-                source_page_id: decode_id(&source_page_id)?,
-                kind,
-            })
-        });
-        collect_read_rows(rows, referrer_row_output_bytes)
-    }
-
     /// Aggregate raw UUID postings by distinct source block. Raw claims are
     /// used deliberately: a dangling `((uuid))` still drives a badge if a
     /// matching block later appears.
@@ -4178,15 +3488,6 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         limit: usize,
     ) -> Result<Vec<PhysicalBlockReferenceCountRow>, MaterializationError> {
         self.block_reference_counts_query(None, after, limit)
-    }
-
-    pub fn block_reference_counts_for_source_page_after(
-        &self,
-        source_page_id: [u8; 16],
-        after: Option<[u8; 16]>,
-        limit: usize,
-    ) -> Result<Vec<PhysicalBlockReferenceCountRow>, MaterializationError> {
-        self.block_reference_counts_query(Some(source_page_id), after, limit)
     }
 
     fn block_reference_counts_query(
@@ -4398,73 +3699,6 @@ impl<'a> SqliteGraphProjectionRead<'a> {
                 vec![phrase.into(), page_id.to_vec().into(), limit.into()],
             ),
         };
-        let mut statement = self.connection.prepare(sql)?;
-        let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
-            let page_id: Vec<u8> = row.get(0)?;
-            Ok(PhysicalPlainTextCandidatePageRow {
-                page_id: decode_id_sql(&page_id)?,
-            })
-        })?;
-        collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from)),
-            |_| Ok(16),
-        )
-    }
-
-    /// Page-level candidates for exact normalized literal-substring matching.
-    ///
-    /// Three-or-more-character needles use SQLite's trigram index. Shorter
-    /// needles deliberately return the bounded page inventory because an exact
-    /// trigram index cannot represent them; the application parser remains the
-    /// final semantic matcher in both cases.
-    pub fn literal_substring_candidate_pages_after(
-        &self,
-        normalized_needle: &str,
-        after: Option<[u8; 16]>,
-        limit: usize,
-    ) -> Result<Vec<PhysicalPlainTextCandidatePageRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        checked_query_text(normalized_needle)?;
-        if normalized_needle.is_empty() {
-            return Err(MaterializationError::InvalidQuery(
-                "normalized literal needle must be non-empty".into(),
-            ));
-        }
-        let (sql, args): (&str, Vec<rusqlite::types::Value>) =
-            if normalized_needle.chars().count() < 3 {
-                match after {
-                    None => (
-                        "SELECT page_id FROM pages ORDER BY page_id LIMIT ?1",
-                        vec![limit.into()],
-                    ),
-                    Some(page_id) => (
-                        "SELECT page_id FROM pages WHERE page_id > ?1
-                         ORDER BY page_id LIMIT ?2",
-                        vec![page_id.to_vec().into(), limit.into()],
-                    ),
-                }
-            } else {
-                require_fts_ready(self.connection)?;
-                let phrase = format!("\"{}\"", normalized_needle.replace('"', "\"\""));
-                match after {
-                    None => (
-                        "SELECT DISTINCT owner.page_id
-                         FROM search_substring_fts AS substring
-                         JOIN search_fts_owners AS owner ON owner.rowid = substring.rowid
-                         WHERE search_substring_fts MATCH ?1
-                         ORDER BY owner.page_id LIMIT ?2",
-                        vec![phrase.into(), limit.into()],
-                    ),
-                    Some(page_id) => (
-                        "SELECT DISTINCT owner.page_id
-                         FROM search_substring_fts AS substring
-                         JOIN search_fts_owners AS owner ON owner.rowid = substring.rowid
-                         WHERE search_substring_fts MATCH ?1 AND owner.page_id > ?2
-                         ORDER BY owner.page_id LIMIT ?3",
-                        vec![phrase.into(), page_id.to_vec().into(), limit.into()],
-                    ),
-                }
-            };
         let mut statement = self.connection.prepare(sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
             let page_id: Vec<u8> = row.get(0)?;
@@ -4700,41 +3934,6 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         rows
     }
 
-    pub fn properties_named(
-        &self,
-        name: &str,
-        value: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<PhysicalPropertyRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        checked_query_text(name)?;
-        if let Some(value) = value {
-            checked_query_text(value)?;
-        }
-        let (sql, args): (&str, Vec<rusqlite::types::Value>) = match value {
-            Some(value) => (
-                "SELECT owner_type, owner_id, page_id, name, value
-                 FROM properties WHERE normalized_name = ?1 AND value = ?2
-                 ORDER BY page_id, owner_type, owner_id, ordinal LIMIT ?3",
-                vec![
-                    rusqlite::types::Value::Text(name.to_owned()),
-                    rusqlite::types::Value::Text(value.to_owned()),
-                    limit.into(),
-                ],
-            ),
-            None => (
-                "SELECT owner_type, owner_id, page_id, name, value
-                 FROM properties WHERE normalized_name = ?1
-                 ORDER BY page_id, owner_type, owner_id, ordinal LIMIT ?2",
-                vec![rusqlite::types::Value::Text(name.to_owned()), limit.into()],
-            ),
-        };
-        let mut statement = self.connection.prepare(sql)?;
-        let rows =
-            property_rows(statement.query_map(rusqlite::params_from_iter(args), property_tuple)?);
-        rows
-    }
-
     pub fn tags(
         &self,
         tag: &str,
@@ -4887,7 +4086,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
 
     /// [`Self::task_candidate_blocks_after`] with application-owned page
     /// header validation for every joined candidate page.
-    pub fn task_candidate_blocks_after_with_header_validation(
+    pub(crate) fn task_candidate_blocks_after_with_header_validation(
         &self,
         marker: &str,
         after: Option<([u8; 16], [u8; 16])>,
@@ -5059,24 +4258,6 @@ fn page_row_with_header_validation(
     }))
 }
 
-fn page_inventory_row_with_header_validation(
-    row: &rusqlite::Row<'_>,
-    validate_header: &mut impl FnMut(&str, i64) -> Result<(), MaterializationError>,
-) -> rusqlite::Result<Result<PhysicalPageInventoryRow, MaterializationError>> {
-    let page_id: Vec<u8> = row.get(0)?;
-    let path: String = row.get(2)?;
-    let kind: i64 = row.get(3)?;
-    if let Err(error) = validate_header(path.as_str(), kind) {
-        return Ok(Err(error));
-    }
-    Ok(Ok(PhysicalPageInventoryRow {
-        page_id: decode_id_sql(&page_id)?,
-        name: row.get(1)?,
-        path,
-        text_kind: kind,
-    }))
-}
-
 fn navigation_page_row_with_header_validation(
     row: &rusqlite::Row<'_>,
     validate_header: &mut impl FnMut(&str, i64) -> Result<(), MaterializationError>,
@@ -5123,18 +4304,6 @@ fn block_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhysicalBlockRow> {
         collapsed: row.get::<_, i64>(8)? != 0,
         logseq_uuid: logseq_uuid.as_deref().map(decode_id_sql).transpose()?,
         logseq_identity_origin: origin,
-    })
-}
-
-fn block_structure_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhysicalBlockStructureRow> {
-    let block_id: Vec<u8> = row.get(0)?;
-    let page_id: Vec<u8> = row.get(1)?;
-    let parent: Option<Vec<u8>> = row.get(2)?;
-    Ok(PhysicalBlockStructureRow {
-        block_id: decode_id_sql(&block_id)?,
-        page_id: decode_id_sql(&page_id)?,
-        parent: parent.as_deref().map(decode_id_sql).transpose()?,
-        order: row.get(3)?,
     })
 }
 
@@ -5222,13 +4391,6 @@ fn sql_decode_error(error: impl std::error::Error + Send + Sync + 'static) -> ru
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(error))
 }
 
-fn decode_digest(bytes: Vec<u8>) -> Result<ContentDigest, MaterializationError> {
-    let bytes: [u8; 32] = bytes
-        .try_into()
-        .map_err(|_| MaterializationError::Corrupt("invalid digest length".into()))?;
-    Ok(ContentDigest::from_bytes(bytes))
-}
-
 fn decode_id(bytes: &[u8]) -> Result<[u8; 16], MaterializationError> {
     bytes
         .try_into()
@@ -5260,19 +4422,6 @@ const SEARCH_INDEX_BUILDING_PREFIX: &str = "search index building from projectio
 impl MaterializationError {
     fn search_index_building(horizon_sequence: u64) -> Self {
         Self::Incomplete(format!("{SEARCH_INDEX_BUILDING_PREFIX}{horizon_sequence}"))
-    }
-
-    /// Returns the build horizon when this error represents a temporarily
-    /// unavailable lazy search index. Consumers can branch on this method
-    /// without matching error text or requiring a new exhaustive enum variant.
-    pub fn search_index_building_horizon(&self) -> Option<u64> {
-        match self {
-            Self::Incomplete(detail) => detail
-                .strip_prefix(SEARCH_INDEX_BUILDING_PREFIX)?
-                .parse()
-                .ok(),
-            _ => None,
-        }
     }
 }
 

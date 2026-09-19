@@ -5,6 +5,33 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## [0.26.0] - 2026-09-19
+
+Completes the compact-projection P1 deliverable: the public surface is what
+Tine's Direct Files path uses, plus the named keeps.
+
+### Removed
+
+- 35 public methods on `PhysicalProjectionQuerySnapshot`,
+  `PhysicalGraphProjectionDatabase` and `SqliteGraphProjectionRead` that no
+  Tine production code calls (the `*_with_header_validation` family, the
+  `pages_by_*` lookups, `open_managed`, the `apply_with_*` variants, the
+  source-revision reuse path, `query_block_preorder`, `ensure_stamp`,
+  `search_index_building_horizon`, `build_durability_relaxed`, …) together
+  with the row types and helpers only they reached (1,224 lines). 0.25.0 had
+  removed the unreachable modules; the crate-level dead-code lint cannot see
+  an unused `pub` method, so this pass was made against Tine's actual imports.
+- Five tests that exercised only removed methods.
+
+### Unchanged
+
+- `api.txt` (52 exported names): every removed method lived on a type that
+  stays exported. `SQLITE_SCHEMA_VERSION` = 29 and `SQLITE_APPLICATION_ID`
+  are unchanged: no projection rebuild. The exported names Tine does not
+  reference directly are the named keeps (the two SQLite identity constants),
+  the crate's own certification tooling (`api_surface`, `formats`), and types
+  that appear in the signatures of methods Tine does call.
+
 ## [0.25.0] - 2026-09-19
 
 Continues the patch line Tine pins (v0.24.0). The crate is now the Direct Files
