@@ -8,7 +8,7 @@ second source of truth.
 
 | Artifact | Format identity | Compatibility rule |
 | --- | --- | --- |
-| SQLite projection | application ID `0x54494e45`; schema 29 | SQLite is disposable. A file whose `user_version` differs is rebuilt from the graph's Markdown/Org files, never reinterpreted under a new schema. |
+| SQLite projection | application ID `0x54494e45`; schema 30 | SQLite is disposable. A file whose `user_version` differs is rebuilt from the graph's Markdown/Org files, never reinterpreted under a new schema. |
 
 The Managed Storage formats (oplog manifest/object protocol, local journal v1
 and v2, sealed accepted-history index, engine scratch, checkpoint fingerprints,

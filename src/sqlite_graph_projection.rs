@@ -1,9 +1,7 @@
-//! Regime-neutral disposable graph projection.
+//! Disposable Direct Files graph projection.
 //!
-//! This database owns only parser-derived graph facts and their indexes. It has
-//! no oplog frontier, sync role, authority claim, or managed-storage lifecycle.
-//! A Direct Files watcher/parser and a managed accepted-event adapter can feed
-//! the same page replacement/delete transaction.
+//! This database owns only parser-derived graph facts and their indexes. A
+//! Direct Files watcher/parser feeds the page replacement/delete transaction.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
@@ -16,14 +14,14 @@ use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
 use crate::sqlite_materialization::{
     self, ApplyChangeInstrumentation, MaterializationError, PhysicalAliasDeclaration,
-    PhysicalGraphProjectionChange, PhysicalPagePortablePathClaim, SqliteGraphProjectionRead,
+    PhysicalGraphProjectionChange, SqliteGraphProjectionRead,
 };
 const PREPARED_STATEMENT_CACHE_STATEMENTS: usize = 64;
 const SOURCE_REVISION_MAX_BYTES: usize = 4096;
 const SOURCE_REVISIONS_DDL: &str = "CREATE TABLE direct_source_revisions (
     page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16),
     revision TEXT NOT NULL CHECK (length(CAST(revision AS BLOB)) BETWEEN 1 AND 4096),
-    query_metadata_schema INTEGER NOT NULL DEFAULT 29 CHECK (query_metadata_schema = 29),
+    query_metadata_schema INTEGER NOT NULL DEFAULT 30 CHECK (query_metadata_schema = 30),
     FOREIGN KEY (page_id) REFERENCES pages(page_id) ON DELETE CASCADE
 ) STRICT";
 
@@ -228,7 +226,7 @@ impl PhysicalGraphProjectionDatabase {
         change: &PhysicalGraphProjectionChange,
         aliases: &[PhysicalAliasDeclaration],
     ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
-        self.apply_inner(change, None, aliases, None, None)
+        self.apply_inner(change, None, aliases, None)
     }
 
     /// Apply page/reference facts, exact source revisions, and aliases in one
@@ -240,7 +238,7 @@ impl PhysicalGraphProjectionDatabase {
         revisions: &[PhysicalGraphProjectionSourceRevision],
         aliases: &[PhysicalAliasDeclaration],
     ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
-        self.apply_inner(change, Some(revisions), aliases, None, None)
+        self.apply_inner(change, Some(revisions), aliases, None)
     }
 
     /// Reconcile a complete ordered Direct inventory in the same page/source
@@ -254,7 +252,7 @@ impl PhysicalGraphProjectionDatabase {
         aliases: &[PhysicalAliasDeclaration],
         page_order: &[[u8; 16]],
     ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
-        self.apply_inner(change, Some(revisions), aliases, None, Some(page_order))
+        self.apply_inner(change, Some(revisions), aliases, Some(page_order))
     }
 
     fn apply_inner(
@@ -262,7 +260,6 @@ impl PhysicalGraphProjectionDatabase {
         change: &PhysicalGraphProjectionChange,
         revisions: Option<&[PhysicalGraphProjectionSourceRevision]>,
         aliases: &[PhysicalAliasDeclaration],
-        portable_paths: Option<&[PhysicalPagePortablePathClaim]>,
         page_order: Option<&[[u8; 16]]>,
     ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
         let replacement_ids = change
@@ -330,20 +327,12 @@ impl PhysicalGraphProjectionDatabase {
             &change.replacements,
             &change.deletions,
             None,
-            None,
         )?;
         sqlite_materialization::replace_graph_projection_reference_facts(
             &transaction,
             change,
             aliases,
         )?;
-        if let Some(portable_paths) = portable_paths {
-            sqlite_materialization::replace_graph_projection_portable_path_claims(
-                &transaction,
-                &change.replacements,
-                portable_paths,
-            )?;
-        }
         for page_id in &change.deletions {
             transaction.execute(
                 "DELETE FROM direct_source_revisions WHERE page_id = ?1",
@@ -539,10 +528,9 @@ impl rusqlite::ToSql for PhysicalQueryValue {
 /// The read-only statement seam over the graph projection.
 ///
 /// **Raw SQL crosses this boundary; authority does not.** The projection is a
-/// disposable cache derived from the oplog, so a malformed statement fails a
-/// read and can never corrupt truth — which is exactly why the projection may
-/// have a statement seam and the oplog, the frontier and the Markdown/Org tree
-/// may not.
+/// disposable cache derived from the Markdown/Org tree, so a malformed
+/// statement fails a read and can never corrupt truth. The authoritative tree
+/// does not expose this seam.
 ///
 /// The restriction is the ENGINE's, not a validator's: this type owns a
 /// connection opened `SQLITE_OPEN_READ_ONLY`, and there is no constructor that
@@ -780,7 +768,7 @@ impl PhysicalProjectionQuerySnapshot {
 
     /// Local projection image revision, read in this snapshot's transaction.
     /// Pair with the owner's projection-instance identity; it is not a saved
-    /// revision target or an authority frontier, and is reset by a fresh file.
+    /// revision target and is reset by a fresh file.
     pub fn query_revision(&mut self) -> Result<u64, MaterializationError> {
         self.read(|reader| sqlite_materialization::query_projection_revision(&reader.connection))
     }
@@ -895,7 +883,7 @@ mod tests {
         Vec<PhysicalGraphProjectionSourceRevision>,
         Vec<[u8; 16]>,
     ) {
-        use crate::sqlite_materialization::{PhysicalReference, PhysicalTag};
+        use crate::sqlite_materialization::PhysicalTag;
         let page_ids = (0..pages)
             .map(|_| *uuid::Uuid::new_v4().as_bytes())
             .collect::<Vec<_>>();
@@ -946,10 +934,6 @@ mod tests {
                     collapsed: false,
                     logseq_uuid: None,
                     logseq_identity_origin: None,
-                    references: vec![PhysicalReference {
-                        target: PhysicalEntityId::Page(page_ids[target]),
-                        kind: 0,
-                    }],
                     properties: Vec::new(),
                     tags: vec![PhysicalTag {
                         tag: tag.clone(),
@@ -974,7 +958,6 @@ mod tests {
                 preamble: None,
                 searchable_text: String::new(),
                 normalized_searchable_text: String::new(),
-                references: Vec::new(),
                 properties: Vec::new(),
                 tags: Vec::new(),
                 property_atoms: Vec::new(),
@@ -1028,7 +1011,7 @@ mod tests {
             .unwrap()
     }
 
-    /// GH #543: an apply into an empty projection builds the 36 secondary
+    /// GH #543: an apply into an empty projection builds the 32 secondary
     /// indexes once after its rows; the committed schema is the fresh schema
     /// byte for byte, and the next apply into the populated projection keeps
     /// every index live. A rollback restores the indexes too.
@@ -1041,7 +1024,7 @@ mod tests {
         let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
         database.initialize_schema().unwrap();
         let fresh_indexes = secondary_index_count(&database.connection);
-        assert_eq!(fresh_indexes, 36);
+        assert_eq!(fresh_indexes, 32);
         let (change, revisions, order) = gh543_snapshot(3);
 
         database
@@ -1246,10 +1229,7 @@ mod tests {
                 .execute_batch(
                     "PRAGMA journal_mode=WAL;
                 CREATE TABLE payload (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
-                INSERT INTO payload VALUES (1, 'before');
-                CREATE TABLE materialization_stamp (singleton INTEGER PRIMARY KEY,
-                    acceptance_sequence INTEGER, frontier_root_digest BLOB);
-                INSERT INTO materialization_stamp VALUES (1, 7, zeroblob(32));",
+                INSERT INTO payload VALUES (1, 'before');",
                 )
                 .unwrap();
             Self { writer, path }
@@ -1595,7 +1575,6 @@ mod tests {
             preamble: None,
             searchable_text: content.into(),
             normalized_searchable_text: content.to_lowercase(),
-            references: Vec::new(),
             properties: Vec::new(),
             tags: Vec::new(),
             property_atoms: Vec::new(),
@@ -1616,7 +1595,6 @@ mod tests {
                 collapsed: false,
                 logseq_uuid: None,
                 logseq_identity_origin: None,
-                references: Vec::new(),
                 properties: Vec::new(),
                 tags: Vec::new(),
                 task: Some(PhysicalTask {
@@ -2033,19 +2011,29 @@ mod tests {
         database.initialize_schema().unwrap();
         database.validate_schema().unwrap();
 
-        let managed_tables: i64 = database
+        let obsolete_tables = database
             .connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
+            .prepare(
+                "SELECT name FROM sqlite_master
                  WHERE type = 'table'
-                   AND name IN ('materialization_stamp', 'materialization_batches')",
-                [],
-                |row| row.get(0),
+                   AND name IN (
+                     'materialization_stamp', 'materialization_batches',
+                     'block_home_claims', 'logseq_uuid_introductions',
+                     'page_name_identity_records', 'portable_path_identity_records',
+                     'page_portable_path_claims', 'reference_alias_bindings',
+                     'search_fts_outbox', 'search_fts_build', 'refs'
+                   )
+                 ORDER BY name",
             )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(
-            managed_tables, 0,
-            "the standalone graph projection must not grow managed-frontier tables"
+            obsolete_tables,
+            Vec::<String>::new(),
+            "the Direct projection must not create obsolete Managed tables"
         );
 
         database

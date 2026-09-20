@@ -8,13 +8,11 @@ use std::fmt;
 
 use rusqlite::{params, Connection, OptionalExtension as _};
 
-use crate::ContentDigest;
-
 /// `PRAGMA application_id` of every Tine projection file.
 pub const SQLITE_APPLICATION_ID: u32 = 0x5449_4e45;
 /// `PRAGMA user_version` of the Direct Files projection schema. A file whose
 /// version differs is rebuilt from the graph, never reinterpreted.
-pub const SQLITE_SCHEMA_VERSION: u32 = 29;
+pub const SQLITE_SCHEMA_VERSION: u32 = 30;
 pub const MAX_MATERIALIZATION_QUERY_ROWS: usize = 10_000;
 pub const MAX_MATERIALIZATION_QUERY_BYTES: usize = 64 * 1024;
 pub const MAX_MATERIALIZATION_READ_BYTES: usize = 64 * 1024 * 1024;
@@ -55,12 +53,6 @@ impl PhysicalEntityId {
             Self::Block(id) => (1, id),
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PhysicalReference {
-    pub target: PhysicalEntityId,
-    pub kind: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -216,8 +208,8 @@ pub struct PhysicalPlanning {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalBlock {
     pub block_id: [u8; 16],
-    /// Public query identity, assigned by the application's current session or
-    /// Managed identity owner. The disposable physical UUID is not a substitute.
+    /// Public query identity assigned by the application's current session.
+    /// The disposable physical UUID is not a substitute.
     pub query_result_id: String,
     /// Own normalized reference names, before ancestor/page closure expansion.
     pub own_refs: Vec<String>,
@@ -240,7 +232,6 @@ pub struct PhysicalBlock {
     pub collapsed: bool,
     pub logseq_uuid: Option<[u8; 16]>,
     pub logseq_identity_origin: Option<i64>,
-    pub references: Vec<PhysicalReference>,
     pub properties: Vec<PhysicalProperty>,
     pub tags: Vec<PhysicalTag>,
     pub task: Option<PhysicalTask>,
@@ -255,8 +246,8 @@ pub struct PhysicalBlock {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalPage {
     pub page_id: [u8; 16],
-    /// Direct's current session inventory position. Managed supplies None and
-    /// orders by path. This is rebuildable metadata, never identity authority.
+    /// Direct's current session inventory position. This is rebuildable
+    /// metadata, never identity authority.
     pub query_page_order: Option<u64>,
     pub home_document_id: [u8; 16],
     pub name: String,
@@ -269,7 +260,6 @@ pub struct PhysicalPage {
     pub preamble: Option<String>,
     pub searchable_text: String,
     pub normalized_searchable_text: String,
-    pub references: Vec<PhysicalReference>,
     pub properties: Vec<PhysicalProperty>,
     pub tags: Vec<PhysicalTag>,
     pub property_atoms: Vec<PhysicalPropertyAtom>,
@@ -309,24 +299,11 @@ pub struct PhysicalAliasDeclaration {
     pub normalized_alias: String,
 }
 
-/// One parser-owned page's platform-neutral path identity.
-///
-/// The caller owns Unicode normalization and case-folding policy. Storage
-/// retains only the resulting fixed-width key so both Direct Files and managed
-/// storage can use the same bounded candidate lookup without teaching this
-/// physical crate graph-path semantics.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PhysicalPagePortablePathClaim {
-    pub page_id: [u8; 16],
-    pub portable_path_key: ContentDigest,
-}
-
 /// One regime-neutral update to the disposable graph projection.
 ///
-/// This contains only parser-derived graph facts. Direct Files may apply it
-/// from an observed file change; managed storage applies the same rows only
-/// after its own accepted-frontier checks. No oplog sequence, authority stamp,
-/// or sync state crosses this boundary.
+/// This contains only parser-derived graph facts. Direct Files applies it from
+/// an observed file change; no authority stamp or sync state crosses this
+/// boundary.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalGraphProjectionChange {
     pub replacements: Vec<PhysicalPage>,
@@ -358,12 +335,6 @@ pub(crate) struct FtsChangeInstrumentation {
     substring_rows: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PhysicalSearchIndexStatus {
-    Building { horizon_sequence: u64 },
-    Ready,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FtsEntityRow {
     entity_type: i64,
@@ -379,45 +350,6 @@ impl FtsEntityRow {
     }
 }
 
-pub const MATERIALIZATION_STAMP_DDL: &str = "CREATE TABLE materialization_stamp (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    acceptance_sequence INTEGER NOT NULL CHECK (acceptance_sequence >= 0),
-    frontier_root_digest BLOB NOT NULL CHECK (length(frontier_root_digest) = 32),
-    parse_config_hash BLOB NOT NULL CHECK (length(parse_config_hash) = 32)
-) WITHOUT ROWID, STRICT";
-pub const MATERIALIZATION_BATCHES_DDL: &str = "CREATE TABLE materialization_batches (
-    acceptance_sequence INTEGER PRIMARY KEY CHECK (acceptance_sequence > 0),
-    batch_id BLOB NOT NULL UNIQUE CHECK (length(batch_id) = 16),
-    input_digest BLOB NOT NULL CHECK (length(input_digest) = 32)
-) WITHOUT ROWID, STRICT";
-pub const SEARCH_FTS_BUILD_DDL: &str = "CREATE TABLE search_fts_build (
-    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    phase INTEGER NOT NULL CHECK (phase IN (0, 1, 2)),
-    horizon_sequence INTEGER NOT NULL CHECK (horizon_sequence >= 0),
-    cursor_entity_type INTEGER CHECK (cursor_entity_type IN (0, 1)),
-    cursor_entity_id BLOB CHECK (
-        cursor_entity_id IS NULL OR length(cursor_entity_id) = 16
-    ),
-    CHECK (
-        (cursor_entity_type IS NULL AND cursor_entity_id IS NULL)
-        OR (cursor_entity_type IS NOT NULL AND cursor_entity_id IS NOT NULL)
-    )
-) WITHOUT ROWID, STRICT";
-pub const SEARCH_FTS_OUTBOX_DDL: &str = "CREATE TABLE search_fts_outbox (
-    entity_type INTEGER NOT NULL CHECK (entity_type IN (0, 1)),
-    entity_id BLOB NOT NULL CHECK (length(entity_id) = 16),
-    acceptance_sequence INTEGER NOT NULL CHECK (acceptance_sequence >= 0),
-    page_id BLOB CHECK (page_id IS NULL OR length(page_id) = 16),
-    text TEXT,
-    normalized_text TEXT,
-    tombstone INTEGER NOT NULL CHECK (tombstone IN (0, 1)),
-    CHECK (
-        (tombstone = 1 AND page_id IS NULL AND text IS NULL AND normalized_text IS NULL)
-        OR (tombstone = 0 AND page_id IS NOT NULL AND text IS NOT NULL
-            AND normalized_text IS NOT NULL)
-    ),
-    PRIMARY KEY (entity_type, entity_id)
-) WITHOUT ROWID, STRICT";
 pub const REFERENCE_POSTINGS_DDL: &str = "CREATE TABLE reference_postings (
     source_page_id BLOB NOT NULL CHECK (length(source_page_id) = 16),
     source_entity_type INTEGER NOT NULL CHECK (source_entity_type IN (0, 1)),
@@ -471,28 +403,6 @@ pub const REFERENCE_ALIAS_DECLARATIONS_DDL: &str = "CREATE TABLE reference_alias
         source_page_id, source_entity_type, source_entity_id, source_locator, ordinal
     )
 ) WITHOUT ROWID, STRICT";
-/// An alias binding is the resolution itself: which pages a normalized alias
-/// currently names, in candidate order.
-///
-/// It deliberately does NOT record the catalog root it was resolved against.
-/// That stamp was written by every path and read by none, and because it sat
-/// in the primary key it made two correct builds of the same graph disagree:
-/// an incremental drain stamps the root that was current when the alias was
-/// last touched, while a rebuild stamps the root it resolved at. Same alias,
-/// same ordinal, same page, different provenance -- enough to fail a
-/// byte-equality proof for a value nothing consults. The projection's own
-/// `materialization_stamp` already records the catalog root the whole database
-/// is at, which is the question anyone actually asks.
-pub const REFERENCE_ALIAS_BINDINGS_DDL: &str = "CREATE TABLE reference_alias_bindings (
-    normalized_alias TEXT NOT NULL CHECK (
-        length(CAST(normalized_alias AS BLOB)) BETWEEN 1 AND 4194304
-    ),
-    candidate_ordinal INTEGER NOT NULL CHECK (candidate_ordinal >= 0),
-    resolved_page_id BLOB CHECK (
-        resolved_page_id IS NULL OR length(resolved_page_id) = 16
-    ),
-    PRIMARY KEY (normalized_alias, candidate_ordinal)
-) WITHOUT ROWID, STRICT";
 pub const PAGES_DDL: &str = "CREATE TABLE pages (
     page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16),
     home_document_id BLOB NOT NULL CHECK (length(home_document_id) = 16),
@@ -510,11 +420,6 @@ const PAGE_TEXT_DDL: &str = "CREATE TABLE page_text (
     normalized_searchable_text TEXT NOT NULL CHECK (
         length(CAST(normalized_searchable_text AS BLOB)) <= 4194304
     )
-) STRICT";
-pub const PAGE_PORTABLE_PATH_CLAIMS_DDL: &str = "CREATE TABLE page_portable_path_claims (
-    page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16)
-        REFERENCES pages(page_id) ON DELETE CASCADE,
-    portable_path_key BLOB NOT NULL CHECK (length(portable_path_key) = 32)
 ) STRICT";
 pub const BLOCKS_DDL: &str = "CREATE TABLE blocks (
     block_id BLOB PRIMARY KEY CHECK (length(block_id) = 16),
@@ -552,70 +457,6 @@ const BLOCK_TEXT_DDL: &str = "CREATE TABLE block_text (
     ),
     query_visible TEXT NOT NULL CHECK (length(CAST(query_visible AS BLOB)) <= 4194304)
 ) STRICT";
-pub const BLOCK_HOME_CLAIMS_DDL: &str = "CREATE TABLE block_home_claims (
-    block_id BLOB NOT NULL CHECK (length(block_id) = 16),
-    home_document_id BLOB NOT NULL CHECK (length(home_document_id) = 16),
-    claim_kind INTEGER NOT NULL CHECK (claim_kind IN (0, 1)),
-    claim_key BLOB NOT NULL CHECK (length(claim_key) = 16),
-    batch_id BLOB CHECK (batch_id IS NULL OR length(batch_id) = 16),
-    causal_peer_id BLOB CHECK (
-        causal_peer_id IS NULL OR length(causal_peer_id) = 16
-    ),
-    causal_counter INTEGER CHECK (causal_counter IS NULL OR causal_counter > 0),
-    CHECK (
-        (claim_kind = 0 AND claim_key = zeroblob(16) AND batch_id IS NULL
-            AND causal_peer_id IS NULL AND causal_counter IS NULL)
-        OR
-        (claim_kind = 1 AND batch_id IS NOT NULL AND claim_key = batch_id
-            AND ((causal_peer_id IS NULL AND causal_counter IS NULL)
-                OR (causal_peer_id IS NOT NULL AND causal_counter IS NOT NULL)))
-    ),
-    PRIMARY KEY (block_id, claim_kind, claim_key, home_document_id)
-) WITHOUT ROWID, STRICT";
-pub const PAGE_NAME_IDENTITY_RECORDS_DDL: &str = "CREATE TABLE page_name_identity_records (
-    key_digest BLOB PRIMARY KEY CHECK (length(key_digest) = 32),
-    record BLOB NOT NULL CHECK (length(record) BETWEEN 1 AND 4194304)
-) WITHOUT ROWID, STRICT";
-pub const PORTABLE_PATH_IDENTITY_RECORDS_DDL: &str = "CREATE TABLE portable_path_identity_records (
-    key_digest BLOB PRIMARY KEY CHECK (length(key_digest) = 32),
-    record BLOB NOT NULL CHECK (length(record) BETWEEN 1 AND 4194304)
-) WITHOUT ROWID, STRICT";
-pub const LOGSEQ_UUID_INTRODUCTIONS_DDL: &str = "CREATE TABLE logseq_uuid_introductions (
-    logseq_uuid BLOB NOT NULL CHECK (length(logseq_uuid) = 16),
-    block_id BLOB NOT NULL CHECK (length(block_id) = 16),
-    home_document_id BLOB NOT NULL CHECK (length(home_document_id) = 16),
-    claim_kind INTEGER NOT NULL CHECK (claim_kind IN (0, 1)),
-    claim_key BLOB NOT NULL CHECK (length(claim_key) = 16),
-    batch_id BLOB CHECK (batch_id IS NULL OR length(batch_id) = 16),
-    causal_peer_id BLOB CHECK (
-        causal_peer_id IS NULL OR length(causal_peer_id) = 16
-    ),
-    causal_counter INTEGER CHECK (causal_counter IS NULL OR causal_counter > 0),
-    CHECK (
-        (claim_kind = 0 AND claim_key = zeroblob(16) AND batch_id IS NULL
-            AND causal_peer_id IS NULL AND causal_counter IS NULL)
-        OR
-        (claim_kind = 1 AND batch_id IS NOT NULL AND claim_key = batch_id
-            AND ((causal_peer_id IS NULL AND causal_counter IS NULL)
-                OR (causal_peer_id IS NOT NULL AND causal_counter IS NOT NULL)))
-    ),
-    PRIMARY KEY (
-        logseq_uuid, claim_kind, claim_key, block_id, home_document_id
-    )
-) WITHOUT ROWID, STRICT";
-// Retained temporarily for active v2 reads/writes. The authenticated catalog
-// migration-cleanup slice removes this legacy target-ID representation only
-// after every call site has moved to the v10 raw-evidence tables below.
-pub const REFERENCES_DDL: &str = "CREATE TABLE refs (
-    source_type INTEGER NOT NULL CHECK (source_type IN (0, 1)),
-    source_id BLOB NOT NULL CHECK (length(source_id) = 16),
-    source_page_id BLOB NOT NULL CHECK (length(source_page_id) = 16),
-    target_type INTEGER NOT NULL CHECK (target_type IN (0, 1)),
-    target_id BLOB NOT NULL CHECK (length(target_id) = 16),
-    reference_kind INTEGER NOT NULL CHECK (reference_kind BETWEEN 0 AND 3),
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    PRIMARY KEY (source_type, source_id, target_type, target_id, reference_kind, ordinal)
-) WITHOUT ROWID, STRICT";
 pub const PROPERTIES_DDL: &str = "CREATE TABLE properties (
     owner_type INTEGER NOT NULL CHECK (owner_type IN (0, 1)),
     owner_id BLOB NOT NULL CHECK (length(owner_id) = 16),
@@ -760,9 +601,6 @@ pub const PAGES_JOURNAL_DAY_INDEX_DDL: &str =
 pub const PAGES_PATH_INDEX_DDL: &str = "CREATE INDEX pages_path_idx ON pages(path, page_id)";
 pub const PAGES_HOME_DOCUMENT_ID_INDEX_DDL: &str =
     "CREATE INDEX pages_home_document_id_idx ON pages(home_document_id, page_id)";
-pub const PAGE_PORTABLE_PATH_CLAIMS_KEY_INDEX_DDL: &str =
-    "CREATE INDEX page_portable_path_claims_key_idx
-     ON page_portable_path_claims(portable_path_key, page_id)";
 pub const BLOCKS_PAGE_ORDER_INDEX_DDL: &str =
     "CREATE INDEX blocks_page_order_idx ON blocks(page_id, order_key, block_id)";
 pub const BLOCKS_PARENT_PAGE_INDEX_DDL: &str = "CREATE INDEX blocks_parent_page_idx
@@ -771,10 +609,6 @@ pub const BLOCKS_LOGSEQ_UUID_INDEX_DDL: &str = "CREATE INDEX blocks_logseq_uuid_
     ON blocks(logseq_uuid, block_id) WHERE logseq_uuid IS NOT NULL";
 pub const SEARCH_FTS_OWNERS_PAGE_INDEX_DDL: &str =
     "CREATE INDEX search_fts_owners_page_idx ON search_fts_owners(page_id, rowid)";
-pub const REFERENCES_TARGET_INDEX_DDL: &str = "CREATE INDEX references_target_idx
-    ON refs(target_type, target_id, source_page_id, source_type, source_id)";
-pub const REFERENCES_SOURCE_INDEX_DDL: &str = "CREATE INDEX references_source_idx
-    ON refs(source_page_id, source_type, source_id)";
 pub const REFERENCE_POSTINGS_SOURCE_INDEX_DDL: &str = "CREATE INDEX reference_postings_source_idx
     ON reference_postings(source_page_id, source_entity_type, source_entity_id, ordinal)";
 pub const REFERENCE_POSTINGS_NORMALIZED_NAME_INDEX_DDL: &str =
@@ -803,9 +637,6 @@ pub const REFERENCE_POSTINGS_NAVIGATION_NAMES_INDEX_DDL: &str =
 pub const REFERENCE_ALIAS_DECLARATIONS_SOURCE_INDEX_DDL: &str =
     "CREATE INDEX reference_alias_declarations_source_idx
     ON reference_alias_declarations(source_page_id, source_entity_type, source_entity_id, ordinal)";
-pub const REFERENCE_ALIAS_BINDINGS_NORMALIZED_ALIAS_INDEX_DDL: &str =
-    "CREATE INDEX reference_alias_bindings_normalized_alias_idx
-    ON reference_alias_bindings(normalized_alias, candidate_ordinal)";
 pub const PROPERTIES_LOOKUP_INDEX_DDL: &str = "CREATE INDEX properties_lookup_idx
     ON properties(normalized_name, value, page_id, owner_type, owner_id)";
 pub const PROPERTIES_PAGE_INDEX_DDL: &str = "CREATE INDEX properties_page_idx
@@ -851,9 +682,9 @@ pub const PROPERTY_ATOMS_PAGE_INDEX_DDL: &str = "CREATE INDEX property_atoms_pag
 // ordinary secondary indexes can be built once after the complete row set is
 // present instead of being maintained for every inserted row. The primary-key
 // indexes and both FTS virtual tables remain live throughout construction.
-// This list must reproduce the exact normal schema before the terminal stamp
-// can advance.
-const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 36] = [
+// This list must reproduce the exact normal schema before the transaction can
+// commit.
+const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 32] = [
     ("pages_name_idx", PAGES_NAME_INDEX_DDL),
     ("pages_name_key_idx", PAGES_NAME_KEY_INDEX_DDL),
     ("pages_journal_day_idx", PAGES_JOURNAL_DAY_INDEX_DDL),
@@ -862,10 +693,6 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 36] = [
         "pages_home_document_id_idx",
         PAGES_HOME_DOCUMENT_ID_INDEX_DDL,
     ),
-    (
-        "page_portable_path_claims_key_idx",
-        PAGE_PORTABLE_PATH_CLAIMS_KEY_INDEX_DDL,
-    ),
     ("blocks_page_order_idx", BLOCKS_PAGE_ORDER_INDEX_DDL),
     ("blocks_parent_page_idx", BLOCKS_PARENT_PAGE_INDEX_DDL),
     ("blocks_logseq_uuid_idx", BLOCKS_LOGSEQ_UUID_INDEX_DDL),
@@ -873,8 +700,6 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 36] = [
         "search_fts_owners_page_idx",
         SEARCH_FTS_OWNERS_PAGE_INDEX_DDL,
     ),
-    ("references_target_idx", REFERENCES_TARGET_INDEX_DDL),
-    ("references_source_idx", REFERENCES_SOURCE_INDEX_DDL),
     (
         "reference_postings_source_idx",
         REFERENCE_POSTINGS_SOURCE_INDEX_DDL,
@@ -894,10 +719,6 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 36] = [
     (
         "reference_alias_declarations_source_idx",
         REFERENCE_ALIAS_DECLARATIONS_SOURCE_INDEX_DDL,
-    ),
-    (
-        "reference_alias_bindings_normalized_alias_idx",
-        REFERENCE_ALIAS_BINDINGS_NORMALIZED_ALIAS_INDEX_DDL,
     ),
     ("properties_lookup_idx", PROPERTIES_LOOKUP_INDEX_DDL),
     ("properties_page_idx", PROPERTIES_PAGE_INDEX_DDL),
@@ -937,20 +758,7 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 36] = [
     ("property_atoms_page_idx", PROPERTY_ATOMS_PAGE_INDEX_DDL),
 ];
 
-const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 29] = [
-    (
-        "materialization_stamp",
-        &[
-            "singleton",
-            "acceptance_sequence",
-            "frontier_root_digest",
-            "parse_config_hash",
-        ],
-    ),
-    (
-        "materialization_batches",
-        &["acceptance_sequence", "batch_id", "input_digest"],
-    ),
+const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 18] = [
     (
         "reference_postings",
         &[
@@ -979,10 +787,6 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 29] = [
             "raw_alias",
             "normalized_alias",
         ],
-    ),
-    (
-        "reference_alias_bindings",
-        &["normalized_alias", "candidate_ordinal", "resolved_page_id"],
     ),
     (
         "pages",
@@ -1016,10 +820,6 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 29] = [
         ],
     ),
     (
-        "page_portable_path_claims",
-        &["page_id", "portable_path_key"],
-    ),
-    (
         "blocks",
         &[
             "block_id",
@@ -1032,45 +832,6 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 29] = [
             "collapsed",
             "logseq_uuid",
             "logseq_identity_origin",
-        ],
-    ),
-    (
-        "block_home_claims",
-        &[
-            "block_id",
-            "home_document_id",
-            "claim_kind",
-            "claim_key",
-            "batch_id",
-            "causal_peer_id",
-            "causal_counter",
-        ],
-    ),
-    ("page_name_identity_records", &["key_digest", "record"]),
-    ("portable_path_identity_records", &["key_digest", "record"]),
-    (
-        "logseq_uuid_introductions",
-        &[
-            "logseq_uuid",
-            "block_id",
-            "home_document_id",
-            "claim_kind",
-            "claim_key",
-            "batch_id",
-            "causal_peer_id",
-            "causal_counter",
-        ],
-    ),
-    (
-        "refs",
-        &[
-            "source_type",
-            "source_id",
-            "source_page_id",
-            "target_type",
-            "target_id",
-            "reference_kind",
-            "ordinal",
         ],
     ),
     (
@@ -1164,74 +925,19 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 29] = [
         "search_fts_owners",
         &["rowid", "entity_type", "entity_id", "page_id"],
     ),
-    (
-        "search_fts_build",
-        &[
-            "singleton",
-            "phase",
-            "horizon_sequence",
-            "cursor_entity_type",
-            "cursor_entity_id",
-        ],
-    ),
-    (
-        "search_fts_outbox",
-        &[
-            "entity_type",
-            "entity_id",
-            "acceptance_sequence",
-            "page_id",
-            "text",
-            "normalized_text",
-            "tombstone",
-        ],
-    ),
 ];
 
-const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 66] = [
-    ("table", "materialization_stamp", MATERIALIZATION_STAMP_DDL),
-    (
-        "table",
-        "materialization_batches",
-        MATERIALIZATION_BATCHES_DDL,
-    ),
+const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 51] = [
     ("table", "reference_postings", REFERENCE_POSTINGS_DDL),
     (
         "table",
         "reference_alias_declarations",
         REFERENCE_ALIAS_DECLARATIONS_DDL,
     ),
-    (
-        "table",
-        "reference_alias_bindings",
-        REFERENCE_ALIAS_BINDINGS_DDL,
-    ),
     ("table", "pages", PAGES_DDL),
     ("table", "page_text", PAGE_TEXT_DDL),
-    (
-        "table",
-        "page_portable_path_claims",
-        PAGE_PORTABLE_PATH_CLAIMS_DDL,
-    ),
     ("table", "blocks", BLOCKS_DDL),
     ("table", "block_text", BLOCK_TEXT_DDL),
-    ("table", "block_home_claims", BLOCK_HOME_CLAIMS_DDL),
-    (
-        "table",
-        "page_name_identity_records",
-        PAGE_NAME_IDENTITY_RECORDS_DDL,
-    ),
-    (
-        "table",
-        "portable_path_identity_records",
-        PORTABLE_PATH_IDENTITY_RECORDS_DDL,
-    ),
-    (
-        "table",
-        "logseq_uuid_introductions",
-        LOGSEQ_UUID_INTRODUCTIONS_DDL,
-    ),
-    ("table", "refs", REFERENCES_DDL),
     ("table", "properties", PROPERTIES_DDL),
     ("table", "tags", TAGS_DDL),
     ("table", "tasks", TASKS_DDL),
@@ -1250,8 +956,6 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 66] = [
     ("table", "search_fts_owners", SEARCH_FTS_OWNERS_DDL),
     ("table", "search_fts", SEARCH_FTS_DDL),
     ("table", "search_substring_fts", SEARCH_SUBSTRING_FTS_DDL),
-    ("table", "search_fts_build", SEARCH_FTS_BUILD_DDL),
-    ("table", "search_fts_outbox", SEARCH_FTS_OUTBOX_DDL),
     ("index", "pages_name_idx", PAGES_NAME_INDEX_DDL),
     ("index", "pages_name_key_idx", PAGES_NAME_KEY_INDEX_DDL),
     (
@@ -1264,11 +968,6 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 66] = [
         "index",
         "pages_home_document_id_idx",
         PAGES_HOME_DOCUMENT_ID_INDEX_DDL,
-    ),
-    (
-        "index",
-        "page_portable_path_claims_key_idx",
-        PAGE_PORTABLE_PATH_CLAIMS_KEY_INDEX_DDL,
     ),
     (
         "index",
@@ -1289,16 +988,6 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 66] = [
         "index",
         "search_fts_owners_page_idx",
         SEARCH_FTS_OWNERS_PAGE_INDEX_DDL,
-    ),
-    (
-        "index",
-        "references_target_idx",
-        REFERENCES_TARGET_INDEX_DDL,
-    ),
-    (
-        "index",
-        "references_source_idx",
-        REFERENCES_SOURCE_INDEX_DDL,
     ),
     (
         "index",
@@ -1324,11 +1013,6 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 66] = [
         "index",
         "reference_alias_declarations_source_idx",
         REFERENCE_ALIAS_DECLARATIONS_SOURCE_INDEX_DDL,
-    ),
-    (
-        "index",
-        "reference_alias_bindings_normalized_alias_idx",
-        REFERENCE_ALIAS_BINDINGS_NORMALIZED_ALIAS_INDEX_DDL,
     ),
     (
         "index",
@@ -1403,17 +1087,10 @@ pub(crate) fn initialize_graph_projection_schema(
     connection.execute_batch(&format!(
         "{REFERENCE_POSTINGS_DDL};
          {REFERENCE_ALIAS_DECLARATIONS_DDL};
-         {REFERENCE_ALIAS_BINDINGS_DDL};
          {PAGES_DDL};
          {PAGE_TEXT_DDL};
-         {PAGE_PORTABLE_PATH_CLAIMS_DDL};
          {BLOCKS_DDL};
          {BLOCK_TEXT_DDL};
-         {BLOCK_HOME_CLAIMS_DDL};
-         {PAGE_NAME_IDENTITY_RECORDS_DDL};
-         {PORTABLE_PATH_IDENTITY_RECORDS_DDL};
-         {LOGSEQ_UUID_INTRODUCTIONS_DDL};
-         {REFERENCES_DDL};
          {PROPERTIES_DDL};
          {TAGS_DDL};
          {TASKS_DDL};
@@ -1428,26 +1105,20 @@ pub(crate) fn initialize_graph_projection_schema(
          {SEARCH_FTS_OWNERS_DDL};
          {SEARCH_FTS_DDL};
          {SEARCH_SUBSTRING_FTS_DDL};
-         {SEARCH_FTS_BUILD_DDL};
-         {SEARCH_FTS_OUTBOX_DDL};
          {PAGES_NAME_INDEX_DDL};
          {PAGES_NAME_KEY_INDEX_DDL};
          {PAGES_JOURNAL_DAY_INDEX_DDL};
          {PAGES_PATH_INDEX_DDL};
          {PAGES_HOME_DOCUMENT_ID_INDEX_DDL};
-         {PAGE_PORTABLE_PATH_CLAIMS_KEY_INDEX_DDL};
          {BLOCKS_PAGE_ORDER_INDEX_DDL};
          {BLOCKS_PARENT_PAGE_INDEX_DDL};
          {BLOCKS_LOGSEQ_UUID_INDEX_DDL};
          {SEARCH_FTS_OWNERS_PAGE_INDEX_DDL};
-         {REFERENCES_TARGET_INDEX_DDL};
-         {REFERENCES_SOURCE_INDEX_DDL};
          {REFERENCE_POSTINGS_SOURCE_INDEX_DDL};
          {REFERENCE_POSTINGS_NORMALIZED_NAME_INDEX_DDL};
          {REFERENCE_POSTINGS_RAW_UUID_INDEX_DDL};
          {REFERENCE_POSTINGS_NAVIGATION_NAMES_INDEX_DDL};
          {REFERENCE_ALIAS_DECLARATIONS_SOURCE_INDEX_DDL};
-         {REFERENCE_ALIAS_BINDINGS_NORMALIZED_ALIAS_INDEX_DDL};
          {PROPERTIES_LOOKUP_INDEX_DDL};
          {PROPERTIES_PAGE_INDEX_DDL};
          {TAGS_LOOKUP_INDEX_DDL};
@@ -1468,20 +1139,14 @@ pub(crate) fn initialize_graph_projection_schema(
          {PROPERTY_ATOMS_PAGE_INDEX_DDL};"
     ))?;
     connection.execute("INSERT INTO query_projection_state VALUES (1, 0)", [])?;
-    connection.execute(
-        "INSERT INTO search_fts_build (
-             singleton, phase, horizon_sequence, cursor_entity_type, cursor_entity_id
-         ) VALUES (1, 1, 0, NULL, NULL)",
-        [],
-    )?;
     Ok(())
 }
 
 pub(crate) fn validate_graph_projection_schema(
     connection: &Connection,
 ) -> Result<(), MaterializationError> {
-    validate_schema_columns(connection, &MATERIALIZATION_TABLE_COLUMNS[2..])?;
-    for (object_type, name, expected) in &MATERIALIZATION_SCHEMA_OBJECTS[2..] {
+    validate_schema_columns(connection, &MATERIALIZATION_TABLE_COLUMNS)?;
+    for (object_type, name, expected) in &MATERIALIZATION_SCHEMA_OBJECTS {
         validate_schema_sql(connection, object_type, name, expected)?;
     }
     validate_schema_sql(
@@ -1490,16 +1155,6 @@ pub(crate) fn validate_graph_projection_schema(
         "tasks_deadline_idx",
         TASKS_DEADLINE_INDEX_DDL,
     )?;
-    let build_rows: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM search_fts_build WHERE singleton = 1",
-        [],
-        |row| row.get(0),
-    )?;
-    if build_rows != 1 {
-        return Err(MaterializationError::Corrupt(
-            "search FTS build marker cardinality is invalid".into(),
-        ));
-    }
     query_projection_revision(connection)?;
     Ok(())
 }
@@ -1545,50 +1200,16 @@ fn canonical_sql(sql: &str) -> String {
     sql.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub(crate) fn search_index_status(
-    connection: &Connection,
-) -> Result<PhysicalSearchIndexStatus, MaterializationError> {
-    let (phase, horizon): (i64, i64) = connection.query_row(
-        "SELECT phase, horizon_sequence FROM search_fts_build WHERE singleton = 1",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    let horizon_sequence = u64::try_from(horizon)
-        .map_err(|_| MaterializationError::Corrupt("FTS build horizon is negative".into()))?;
-    match phase {
-        0 => Ok(PhysicalSearchIndexStatus::Building { horizon_sequence }),
-        1 => Ok(PhysicalSearchIndexStatus::Ready),
-        2 => Err(MaterializationError::Corrupt(
-            "published projection retained terminal FTS seed phase".into(),
-        )),
-        _ => Err(MaterializationError::Corrupt(
-            "FTS build phase is outside its schema contract".into(),
-        )),
-    }
-}
-
-fn require_fts_ready(connection: &Connection) -> Result<(), MaterializationError> {
-    match search_index_status(connection)? {
-        PhysicalSearchIndexStatus::Ready => Ok(()),
-        PhysicalSearchIndexStatus::Building { horizon_sequence } => Err(
-            MaterializationError::search_index_building(horizon_sequence),
-        ),
-    }
-}
-
 /// Every table one of [`TERMINAL_DEFERRED_INDEXES`] covers. A build may run
 /// with those indexes dropped only while all of these are empty: the per-page
 /// cleanup and FTS lookups that precede insertion are full scans without their
 /// index — free on an empty table, quadratic on a populated one.
-const DEFERRED_INDEX_TABLES: [&str; 14] = [
+const DEFERRED_INDEX_TABLES: [&str; 11] = [
     "pages",
-    "page_portable_path_claims",
     "blocks",
     "search_fts_owners",
-    "refs",
     "reference_postings",
     "reference_alias_declarations",
-    "reference_alias_bindings",
     "properties",
     "tags",
     "tasks",
@@ -1759,17 +1380,9 @@ pub(crate) fn apply_graph_projection_rows(
     transaction: &Connection,
     replacements: &[PhysicalPage],
     deletions: &[[u8; 16]],
-    acceptance_sequence: Option<u64>,
     fts_instrumentation: Option<&mut FtsChangeInstrumentation>,
 ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
     advance_query_projection_revision(transaction)?;
-    // A block can move between two replacement pages. Keep its inbound refs
-    // through every cleanup pass, then remove every old owner before inserting
-    // any new owner so page-ID sort order cannot collide on the block primary key.
-    let retained_blocks = replacements
-        .iter()
-        .flat_map(|page| page.blocks.iter().map(|block| block.block_id))
-        .collect::<BTreeSet<_>>();
     let affected_pages = replacements
         .iter()
         .map(|page| page.page_id)
@@ -1778,14 +1391,14 @@ pub(crate) fn apply_graph_projection_rows(
     let old_fts = load_fts_source_rows(transaction, &affected_pages)?;
     let mut instrumentation = ApplyChangeInstrumentation::default();
     for page_id in deletions {
-        let cleanup = delete_page(transaction, *page_id, true, &retained_blocks)?;
+        let cleanup = delete_page(transaction, *page_id)?;
         instrumentation.cleanup_page_attempts += 1;
         instrumentation.cleanup_existing_pages += cleanup.existing_pages;
         instrumentation.cleanup_owned_rows += cleanup.owned_rows;
         instrumentation.cleanup_fts_rowids += cleanup.fts_rowids;
     }
     for page in replacements {
-        let cleanup = delete_page(transaction, page.page_id, false, &retained_blocks)?;
+        let cleanup = delete_page(transaction, page.page_id)?;
         instrumentation.cleanup_page_attempts += 1;
         instrumentation.cleanup_existing_pages += cleanup.existing_pages;
         instrumentation.cleanup_owned_rows += cleanup.owned_rows;
@@ -1799,7 +1412,6 @@ pub(crate) fn apply_graph_projection_rows(
         transaction,
         old_fts,
         new_fts,
-        acceptance_sequence,
         &mut instrumentation,
         fts_instrumentation,
     )?;
@@ -1838,22 +1450,6 @@ pub(crate) fn replace_graph_projection_reference_facts(
         .chain(change.deletions.iter())
         .copied()
         .collect::<BTreeSet<_>>();
-    let mut affected_aliases = aliases
-        .iter()
-        .map(|alias| alias.normalized_alias.clone())
-        .collect::<BTreeSet<_>>();
-    for page_id in &affected_pages {
-        let mut statement = transaction.prepare_cached(
-            "SELECT DISTINCT normalized_alias
-             FROM reference_alias_declarations
-             WHERE source_page_id = ?1",
-        )?;
-        let rows =
-            statement.query_map(params![page_id.as_slice()], |row| row.get::<_, String>(0))?;
-        for row in rows {
-            affected_aliases.insert(row?);
-        }
-    }
     for page_id in &affected_pages {
         transaction.execute(
             "DELETE FROM reference_postings WHERE source_page_id = ?1",
@@ -1870,84 +1466,6 @@ pub(crate) fn replace_graph_projection_reference_facts(
     for alias in aliases {
         insert_alias_declaration(transaction, alias)?;
     }
-    for alias in affected_aliases {
-        transaction.execute(
-            "DELETE FROM reference_alias_bindings WHERE normalized_alias = ?1",
-            params![&alias],
-        )?;
-        let candidates = {
-            let mut statement = transaction.prepare_cached(
-                "SELECT DISTINCT source_page_id
-                 FROM reference_alias_declarations
-                 WHERE normalized_alias = ?1
-                 ORDER BY source_page_id",
-            )?;
-            let rows = statement.query_map(params![&alias], |row| row.get::<_, Vec<u8>>(0))?;
-            rows.collect::<Result<Vec<_>, _>>()?
-        };
-        for (ordinal, page_id) in candidates.into_iter().enumerate() {
-            if page_id.len() != 16 {
-                return Err(MaterializationError::Corrupt(
-                    "reference alias declaration page ID is malformed".into(),
-                ));
-            }
-            transaction.execute(
-                "INSERT INTO reference_alias_bindings (
-                     normalized_alias, candidate_ordinal, resolved_page_id
-                 ) VALUES (?1, ?2, ?3)",
-                params![
-                    &alias,
-                    i64::try_from(ordinal).map_err(|_| {
-                        MaterializationError::InvalidInput(
-                            "reference alias candidate ordinal overflowed".into(),
-                        )
-                    })?,
-                    page_id,
-                ],
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// Install the complete portable-path candidate surface for replacement pages.
-///
-/// This is deliberately non-unique: two source files may collide after the
-/// application's platform-neutral normalization. The projection must preserve
-/// both candidates so the semantic owner can diagnose/refuse the conflict.
-pub(crate) fn replace_graph_projection_portable_path_claims(
-    transaction: &Connection,
-    replacements: &[PhysicalPage],
-    claims: &[PhysicalPagePortablePathClaim],
-) -> Result<(), MaterializationError> {
-    let replacement_ids = replacements
-        .iter()
-        .map(|page| page.page_id)
-        .collect::<BTreeSet<_>>();
-    let mut claim_ids = BTreeSet::new();
-    for claim in claims {
-        if !claim_ids.insert(claim.page_id) {
-            return Err(MaterializationError::InvalidInput(
-                "portable-path claims contain a duplicate page ID".into(),
-            ));
-        }
-    }
-    if claim_ids != replacement_ids {
-        return Err(MaterializationError::InvalidInput(
-            "portable-path claims must exactly cover replacement pages".into(),
-        ));
-    }
-    for claim in claims {
-        execute_cached(
-            transaction,
-            "INSERT INTO page_portable_path_claims (page_id, portable_path_key)
-             VALUES (?1, ?2)",
-            params![
-                claim.page_id.as_slice(),
-                claim.portable_path_key.as_bytes().as_slice(),
-            ],
-        )?;
-    }
     Ok(())
 }
 
@@ -1956,12 +1474,7 @@ pub(crate) fn reset_graph_projection_rows(
 ) -> Result<(), MaterializationError> {
     advance_query_projection_revision(transaction)?;
     transaction.execute_batch(
-        "DELETE FROM search_fts_outbox;
-         UPDATE search_fts_build
-         SET phase = 1, horizon_sequence = 0,
-             cursor_entity_type = NULL, cursor_entity_id = NULL
-         WHERE singleton = 1;
-         DELETE FROM search_substring_fts;
+        "DELETE FROM search_substring_fts;
          DELETE FROM search_fts;
          DELETE FROM search_fts_owners;
          DELETE FROM property_atoms;
@@ -1974,17 +1487,10 @@ pub(crate) fn reset_graph_projection_rows(
          DELETE FROM tasks;
          DELETE FROM tags;
          DELETE FROM properties;
-         DELETE FROM refs;
-         DELETE FROM logseq_uuid_introductions;
-         DELETE FROM portable_path_identity_records;
-         DELETE FROM page_name_identity_records;
-         DELETE FROM block_home_claims;
-         DELETE FROM reference_alias_bindings;
          DELETE FROM reference_alias_declarations;
          DELETE FROM reference_postings;
          DELETE FROM block_text;
          DELETE FROM blocks;
-         DELETE FROM page_portable_path_claims;
          DELETE FROM page_text;
          DELETE FROM pages;",
     )?;
@@ -2001,8 +1507,6 @@ struct PageCleanupInstrumentation {
 fn delete_page(
     transaction: &Connection,
     page_id: [u8; 16],
-    remove_incoming_page_references: bool,
-    retained_blocks: &BTreeSet<[u8; 16]>,
 ) -> Result<PageCleanupInstrumentation, MaterializationError> {
     let page = &page_id;
     let existing: i64 = transaction.query_row(
@@ -2032,40 +1536,6 @@ fn delete_page(
                     &format!("DELETE FROM {table} WHERE page_id = ?1"),
                     params![page.as_slice()],
                 )?);
-    }
-    let old_blocks = {
-        let mut statement =
-            transaction.prepare("SELECT block_id FROM blocks WHERE page_id = ?1")?;
-        let block_ids = statement
-            .query_map(params![page.as_slice()], |row| row.get::<_, Vec<u8>>(0))?
-            .map(|block_id| {
-                block_id
-                    .map_err(MaterializationError::from)
-                    .and_then(|bytes| decode_id(&bytes))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        block_ids
-    };
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM refs
-         WHERE source_page_id = ?1",
-            params![page.as_slice()],
-        )?);
-    if remove_incoming_page_references {
-        transaction.execute(
-            "DELETE FROM refs WHERE target_type = 0 AND target_id = ?1",
-            params![page.as_slice()],
-        )?;
-    }
-    for block_id in old_blocks {
-        if !retained_blocks.contains(&block_id) {
-            transaction.execute(
-                "DELETE FROM refs WHERE target_type = 1 AND target_id = ?1",
-                params![block_id.as_slice()],
-            )?;
-        }
     }
     instrumentation.owned_rows = instrumentation
         .owned_rows
@@ -2168,12 +1638,6 @@ fn insert_page(transaction: &Connection, page: &PhysicalPage) -> Result<(), Mate
             &page.searchable_text,
             &page.normalized_searchable_text,
         ],
-    )?;
-    insert_references(
-        transaction,
-        PhysicalEntityId::Page(page.page_id),
-        page.page_id,
-        &page.references,
     )?;
     insert_properties(
         transaction,
@@ -2289,7 +1753,6 @@ fn insert_block(
             &block.normalized_searchable_text, &block.query_visible],
     )?;
     let owner = PhysicalEntityId::Block(block.block_id);
-    insert_references(transaction, owner, page_id, &block.references)?;
     insert_properties(transaction, owner, page_id, &block.properties)?;
     insert_tags(transaction, owner, page_id, &block.tags)?;
     insert_property_atoms(transaction, owner, page_id, &block.property_atoms)?;
@@ -2436,16 +1899,6 @@ fn replacement_fts_rows(
     Ok(rows)
 }
 
-fn fts_build_phase(transaction: &Connection) -> Result<i64, MaterializationError> {
-    transaction
-        .query_row(
-            "SELECT phase FROM search_fts_build WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(Into::into)
-}
-
 fn delete_fts_entity(
     transaction: &Connection,
     entity_type: i64,
@@ -2474,59 +1927,13 @@ fn delete_fts_entity(
     Ok(true)
 }
 
-fn upsert_fts_outbox(
-    transaction: &Connection,
-    sequence: u64,
-    key: (i64, [u8; 16]),
-    after: Option<&FtsEntityRow>,
-) -> Result<(), MaterializationError> {
-    let sequence = i64::try_from(sequence)
-        .map_err(|_| MaterializationError::Corrupt("acceptance sequence exceeds SQLite".into()))?;
-    let (page_id, text, normalized_text, tombstone) = match after {
-        Some(row) => (
-            Some(row.page_id.to_vec()),
-            Some(row.text.as_str()),
-            Some(row.normalized_text.as_str()),
-            0_i64,
-        ),
-        None => (None, None, None, 1_i64),
-    };
-    transaction.execute(
-        "INSERT INTO search_fts_outbox (
-             entity_type, entity_id, acceptance_sequence, page_id,
-             text, normalized_text, tombstone
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT(entity_type, entity_id) DO UPDATE SET
-             acceptance_sequence = excluded.acceptance_sequence,
-             page_id = excluded.page_id,
-             text = excluded.text,
-             normalized_text = excluded.normalized_text,
-             tombstone = excluded.tombstone",
-        params![
-            key.0,
-            key.1.as_slice(),
-            sequence,
-            page_id,
-            text,
-            normalized_text,
-            tombstone,
-        ],
-    )?;
-    Ok(())
-}
-
 fn reconcile_fts_rows(
     transaction: &Connection,
     old: BTreeMap<(i64, [u8; 16]), FtsEntityRow>,
     new: BTreeMap<(i64, [u8; 16]), FtsEntityRow>,
-    acceptance_sequence: Option<u64>,
     instrumentation: &mut ApplyChangeInstrumentation,
     mut fts_instrumentation: Option<&mut FtsChangeInstrumentation>,
 ) -> Result<(), MaterializationError> {
-    let phase = fts_build_phase(transaction)?;
-    if phase == 2 {
-        return Ok(());
-    }
     let keys = old
         .keys()
         .chain(new.keys())
@@ -2546,15 +1953,6 @@ fn reconcile_fts_rows(
             }
             stats.standard_rows = stats.standard_rows.saturating_add(1);
             stats.substring_rows = stats.substring_rows.saturating_add(1);
-        }
-        if phase == 0 {
-            let sequence = acceptance_sequence.ok_or_else(|| {
-                MaterializationError::InvalidInput(
-                    "an FTS-building projection change requires an acceptance sequence".into(),
-                )
-            })?;
-            upsert_fts_outbox(transaction, sequence, key, after)?;
-            continue;
         }
         if delete_fts_entity(transaction, key.0, key.1)? {
             instrumentation.cleanup_fts_rowids =
@@ -2617,37 +2015,6 @@ fn insert_fts_row(
         "INSERT INTO search_substring_fts (rowid, normalized_text) VALUES (?1, ?2)",
         params![rowid, &row.normalized_text],
     )?;
-    Ok(())
-}
-
-fn insert_references(
-    transaction: &Connection,
-    source: PhysicalEntityId,
-    source_page_id: [u8; 16],
-    references: &[PhysicalReference],
-) -> Result<(), MaterializationError> {
-    let (source_type, source_id) = source.sql_parts();
-    for (ordinal, reference) in references.iter().enumerate() {
-        let (target_type, target_id) = reference.target.sql_parts();
-        execute_cached(
-            transaction,
-            "INSERT INTO refs (
-                 source_type, source_id, source_page_id, target_type, target_id,
-                 reference_kind, ordinal
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                source_type,
-                source_id.as_slice(),
-                source_page_id.as_slice(),
-                target_type,
-                target_id.as_slice(),
-                reference.kind,
-                i64::try_from(ordinal).map_err(|_| {
-                    MaterializationError::InvalidInput("reference ordinal overflowed".into())
-                })?,
-            ],
-        )?;
-    }
     Ok(())
 }
 
@@ -2887,9 +2254,7 @@ pub struct PhysicalTaskCandidateBlockRow {
 ///
 /// Unlike [`PhysicalTaskCandidateBlockRow`], this deliberately does not copy
 /// raw content or a public UUID across SQLite. Direct Files uses the page path
-/// and full structural order to recover the exact current `DocBlock`; managed
-/// storage, which has no parser cache at this boundary, keeps using the fuller
-/// row above.
+/// and full structural order to recover the exact current `DocBlock`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalTaskCandidateLocatorRow {
     pub block_id: [u8; 16],
@@ -3670,7 +3035,6 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         after: Option<[u8; 16]>,
         limit: usize,
     ) -> Result<Vec<PhysicalPlainTextCandidatePageRow>, MaterializationError> {
-        require_fts_ready(self.connection)?;
         let limit = checked_limit(limit)?;
         checked_query_text(normalized_phrase)?;
         if normalized_phrase.trim().is_empty()
@@ -3721,7 +3085,6 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         after: Option<[u8; 16]>,
         limit: usize,
     ) -> Result<Vec<PhysicalFuzzyCandidatePageRow>, MaterializationError> {
-        require_fts_ready(self.connection)?;
         let limit = checked_limit(limit)?;
         checked_query_text(normalized_needle)?;
         if normalized_needle.is_empty() {
@@ -4186,7 +3549,6 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         query: &str,
         limit: usize,
     ) -> Result<Vec<PhysicalSearchHit>, MaterializationError> {
-        require_fts_ready(self.connection)?;
         let limit = checked_limit(limit)?;
         checked_query_text(query)?;
         if query.trim().is_empty() {
@@ -4409,20 +3771,7 @@ pub enum MaterializationError {
     },
     InvalidInput(String),
     Incomplete(String),
-    Contradiction(String),
-    Stale {
-        materialized: u64,
-        frontier: u64,
-    },
     InvalidQuery(String),
-}
-
-const SEARCH_INDEX_BUILDING_PREFIX: &str = "search index building from projection frontier ";
-
-impl MaterializationError {
-    fn search_index_building(horizon_sequence: u64) -> Self {
-        Self::Incomplete(format!("{SEARCH_INDEX_BUILDING_PREFIX}{horizon_sequence}"))
-    }
 }
 
 impl fmt::Display for MaterializationError {
@@ -4431,11 +3780,16 @@ impl fmt::Display for MaterializationError {
             Self::Sqlite(error) => write!(f, "SQLite materialization error: {error}"),
             Self::Schema(error) => write!(f, "materialization schema mismatch: {error}"),
             Self::Corrupt(error) => write!(f, "corrupt materialization: {error}"),
-            Self::ResourceLimit { resource, found, maximum } => write!(f, "materialization {resource} {found} exceeds limit {maximum}"),
+            Self::ResourceLimit {
+                resource,
+                found,
+                maximum,
+            } => write!(
+                f,
+                "materialization {resource} {found} exceeds limit {maximum}"
+            ),
             Self::InvalidInput(error) => write!(f, "invalid materialization input: {error}"),
             Self::Incomplete(error) => write!(f, "incomplete materialization input: {error}"),
-            Self::Contradiction(error) => write!(f, "materialization contradicts accepted semantics: {error}"),
-            Self::Stale { materialized, frontier } => write!(f, "materialization frontier {materialized} is stale against accepted frontier {frontier}"),
             Self::InvalidQuery(error) => write!(f, "invalid materialization query: {error}"),
         }
     }
