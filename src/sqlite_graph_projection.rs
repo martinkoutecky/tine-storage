@@ -1113,6 +1113,7 @@ impl PhysicalGraphProjectionDatabase {
             &transaction,
             change,
             aliases,
+            deferred_indexes,
             None,
         )?;
         for path in &change.deletions {

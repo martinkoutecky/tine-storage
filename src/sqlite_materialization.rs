@@ -1145,7 +1145,7 @@ pub(crate) fn create_deferred_indexes(connection: &Connection) -> Result<(), Mat
 fn insert_reference_posting(
     transaction: &Connection,
     posting: &PhysicalReferencePosting,
-) -> Result<(), MaterializationError> {
+) -> Result<i64, MaterializationError> {
     let source_page_id = page_coordinate(transaction, &posting.source_page_path)?;
     let (source_entity_type, source_entity_id) =
         entity_coordinate(transaction, &posting.source_entity)?;
@@ -1188,7 +1188,7 @@ fn insert_reference_posting(
             raw_uuid_claim,
         ],
     )?;
-    Ok(())
+    Ok(transaction.last_insert_rowid())
 }
 
 fn insert_alias_declaration(
@@ -1339,6 +1339,7 @@ pub(crate) fn apply_graph_projection_rows(
     transaction: &Connection,
     change: &PhysicalGraphProjectionChange,
     aliases: &[PhysicalAliasDeclaration],
+    deferred_indexes: bool,
     fts_instrumentation: Option<&mut FtsChangeInstrumentation>,
 ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
     validate_change_ownership(change, aliases)?;
@@ -1447,13 +1448,28 @@ pub(crate) fn apply_graph_projection_rows(
         &block_ids,
         fts_instrumentation,
     )?;
+    let mut deferred_own_memberships =
+        deferred_indexes.then(|| DeferredOwnReferenceMemberships::new(&change.replacements));
     for posting in &change.reference_postings {
-        insert_reference_posting(transaction, posting)?;
+        let posting_id = insert_reference_posting(transaction, posting)?;
+        if let Some(memberships) = &mut deferred_own_memberships {
+            memberships.capture_first_occurrence(posting, posting_id);
+        }
     }
     for alias in aliases {
         insert_alias_declaration(transaction, alias)?;
     }
-    insert_own_reference_memberships(transaction, &change.replacements)?;
+    if let Some(memberships) = deferred_own_memberships {
+        insert_deferred_own_reference_memberships(
+            transaction,
+            &change.replacements,
+            &page_ids,
+            &block_ids,
+            &memberships,
+        )?;
+    } else {
+        insert_own_reference_memberships(transaction, &change.replacements)?;
+    }
     reclaim_affected_names(transaction, &affected_name_ids)?;
     Ok(instrumentation)
 }
@@ -1561,6 +1577,110 @@ fn reclaim_affected_names(
     Ok(())
 }
 
+const OWN_REFERENCE_OCCURRENCE_SQL: &str = "SELECT r.posting_id
+     FROM reference_postings AS r
+     JOIN names AS n ON n.name_id = r.target_name_id
+     WHERE r.source_page_id = ?1
+       AND r.source_entity_type = 1 AND r.source_entity_id = ?2
+       AND r.target_type = 0 AND r.reference_kind < 8
+       AND n.key = ?3 ORDER BY r.posting_id LIMIT 1";
+const MARK_OWN_REFERENCE_SQL: &str = "UPDATE reference_postings SET own = 1 WHERE posting_id = ?1";
+
+/// While a fresh build has its secondary indexes deferred, remember the first
+/// inserted occurrence for each parser-owned membership. This derives the
+/// answer from the current operation's rows instead of repeatedly scanning the
+/// ever-growing postings table before its source index exists.
+struct DeferredOwnReferenceMemberships<'a> {
+    membership_indexes: BTreeMap<&'a str, BTreeMap<&'a str, BTreeMap<&'a str, usize>>>,
+    first_occurrences: Vec<Option<i64>>,
+}
+
+impl<'a> DeferredOwnReferenceMemberships<'a> {
+    fn new(pages: &'a [PhysicalPage]) -> Self {
+        let mut membership_indexes =
+            BTreeMap::<&'a str, BTreeMap<&'a str, BTreeMap<&'a str, usize>>>::new();
+        let mut membership_count = 0;
+        for page in pages {
+            for block in &page.blocks {
+                let names = membership_indexes
+                    .entry(page.path.as_str())
+                    .or_default()
+                    .entry(block.result_id.as_str())
+                    .or_default();
+                for name in &block.own_refs {
+                    if !names.contains_key(name.key.as_str()) {
+                        names.insert(name.key.as_str(), membership_count);
+                        membership_count += 1;
+                    }
+                }
+            }
+        }
+        Self {
+            membership_indexes,
+            first_occurrences: vec![None; membership_count],
+        }
+    }
+
+    fn capture_first_occurrence(&mut self, posting: &PhysicalReferencePosting, posting_id: i64) {
+        let PhysicalEntityId::Block(block_id) = &posting.source_entity else {
+            return;
+        };
+        let PhysicalReferenceTarget::PageName {
+            normalized_name, ..
+        } = &posting.target
+        else {
+            return;
+        };
+        let membership = self
+            .membership_indexes
+            .get(posting.source_page_path.as_str())
+            .and_then(|blocks| blocks.get(block_id.as_str()))
+            .and_then(|names| names.get(normalized_name.as_str()));
+        if let Some(&membership) = membership {
+            self.first_occurrences[membership].get_or_insert(posting_id);
+        }
+    }
+
+    fn first_occurrence(&self, page: &str, block: &str, name: &str) -> Option<i64> {
+        self.membership_indexes
+            .get(page)
+            .and_then(|blocks| blocks.get(block))
+            .and_then(|names| names.get(name))
+            .and_then(|&membership| self.first_occurrences[membership])
+    }
+}
+
+fn insert_deferred_own_reference_memberships(
+    connection: &Connection,
+    pages: &[PhysicalPage],
+    page_ids: &BTreeMap<String, i64>,
+    block_ids: &BTreeMap<String, i64>,
+    memberships: &DeferredOwnReferenceMemberships<'_>,
+) -> Result<(), MaterializationError> {
+    for page in pages {
+        let page_id = page_ids[&page.path];
+        for block in &page.blocks {
+            let block_id = block_ids[&block.result_id];
+            let mut seen = BTreeSet::new();
+            for name in &block.own_refs {
+                if !seen.insert(name.key.as_str()) {
+                    continue;
+                }
+                if let Some(posting_id) = memberships.first_occurrence(
+                    page.path.as_str(),
+                    block.result_id.as_str(),
+                    name.key.as_str(),
+                ) {
+                    connection.execute(MARK_OWN_REFERENCE_SQL, params![posting_id])?;
+                } else {
+                    insert_synthetic_own_reference(connection, page_id, block_id, name)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn insert_own_reference_memberships(
     connection: &Connection,
     pages: &[PhysicalPage],
@@ -1580,34 +1700,37 @@ fn insert_own_reference_memberships(
                 }
                 let occurrence: Option<i64> = connection
                     .query_row(
-                        "SELECT r.posting_id FROM reference_postings AS r
-                     JOIN names AS n ON n.name_id = r.target_name_id
-                     WHERE r.source_entity_type = 1 AND r.source_entity_id = ?1
-                       AND r.target_type = 0 AND r.reference_kind < 8
-                       AND n.key = ?2 ORDER BY r.posting_id LIMIT 1",
-                        params![block_id, &name.key],
+                        OWN_REFERENCE_OCCURRENCE_SQL,
+                        params![page_id, block_id, &name.key],
                         |row| row.get(0),
                     )
                     .optional()?;
                 if let Some(posting_id) = occurrence {
-                    connection.execute(
-                        "UPDATE reference_postings SET own = 1 WHERE posting_id = ?1",
-                        params![posting_id],
-                    )?;
+                    connection.execute(MARK_OWN_REFERENCE_SQL, params![posting_id])?;
                 } else {
-                    let name_id = intern_name(connection, &name.key, &name.raw)?;
-                    connection.execute(
-                        "INSERT INTO reference_postings (
-                            source_page_id, source_entity_type, source_entity_id,
-                            source_locator, ordinal, reference_kind, target_type,
-                            target_name_id, raw_uuid_claim, own
-                         ) VALUES (?1, 1, ?2, NULL, NULL, 8, 0, ?3, NULL, 1)",
-                        params![page_id, block_id, name_id],
-                    )?;
+                    insert_synthetic_own_reference(connection, page_id, block_id, name)?;
                 }
             }
         }
     }
+    Ok(())
+}
+
+fn insert_synthetic_own_reference(
+    connection: &Connection,
+    page_id: i64,
+    block_id: i64,
+    name: &PhysicalName,
+) -> Result<(), MaterializationError> {
+    let name_id = intern_name(connection, &name.key, &name.raw)?;
+    connection.execute(
+        "INSERT INTO reference_postings (
+            source_page_id, source_entity_type, source_entity_id,
+            source_locator, ordinal, reference_kind, target_type,
+            target_name_id, raw_uuid_claim, own
+         ) VALUES (?1, 1, ?2, NULL, NULL, 8, 0, ?3, NULL, 1)",
+        params![page_id, block_id, name_id],
+    )?;
     Ok(())
 }
 
@@ -3690,6 +3813,241 @@ impl From<rusqlite::Error> for MaterializationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn own_membership_lookup_steps(unrelated_postings: i64) -> (i32, i32, i32, Vec<String>) {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_graph_projection_schema(&connection).unwrap();
+        connection
+            .execute(
+                "INSERT INTO names (name_id, key, raw) VALUES (1, 'target', 'Target')",
+                [],
+            )
+            .unwrap();
+        for id in 1..=unrelated_postings + 1 {
+            connection
+                .execute(
+                    "INSERT INTO pages (
+                         page_id, name_id, path, text_kind, journal_day, position,
+                         estimated_bytes, property_count
+                     ) VALUES (?1, 1, ?2, 0, NULL, NULL, 0, 0)",
+                    params![id, format!("pages/{id}.md")],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO blocks (
+                         block_id, page_id, result_id, parent_block_id, order_key,
+                         heading_level, collapsed, logseq_uuid, logseq_identity_origin,
+                         preorder, estimated_bytes, tag_count, property_count
+                     ) VALUES (?1, ?1, ?2, NULL, 'a', NULL, 0, NULL, NULL, 0, 0, 0, 0)",
+                    params![id, format!("block-{id}")],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO reference_postings (
+                         source_page_id, source_entity_type, source_entity_id,
+                         source_locator, ordinal, reference_kind, target_type,
+                         target_name_id, raw_uuid_claim, own
+                     ) VALUES (?1, 1, ?1, X'01', 0, 0, 0, 1, NULL, 0)",
+                    params![id],
+                )
+                .unwrap();
+        }
+        let owner = unrelated_postings + 1;
+        let plan = connection
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {OWN_REFERENCE_OCCURRENCE_SQL}"
+            ))
+            .unwrap()
+            .query_map(params![owner, owner, "target"], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap();
+        let mut statement = connection.prepare(OWN_REFERENCE_OCCURRENCE_SQL).unwrap();
+        let posting_id: i64 = statement
+            .query_row(params![owner, owner, "target"], |row| row.get(0))
+            .unwrap();
+        let lookup_steps = statement.get_status(rusqlite::StatementStatus::VmStep);
+        let fullscan_steps = statement.get_status(rusqlite::StatementStatus::FullscanStep);
+        let mut update = connection.prepare(MARK_OWN_REFERENCE_SQL).unwrap();
+        update.execute(params![posting_id]).unwrap();
+        let update_steps = update.get_status(rusqlite::StatementStatus::VmStep);
+        (lookup_steps, fullscan_steps, update_steps, plan)
+    }
+
+    fn own_membership_page() -> PhysicalPage {
+        PhysicalPage {
+            position: None,
+            name: "Owner".into(),
+            name_key: "owner".into(),
+            path: "pages/owner.md".into(),
+            text_kind: 0,
+            journal_day: None,
+            preamble: None,
+            search_tokens: String::new(),
+            properties: Vec::new(),
+            tags: Vec::new(),
+            property_atoms: Vec::new(),
+            blocks: vec![PhysicalBlock {
+                result_id: "owner-block".into(),
+                own_refs: vec![
+                    PhysicalName {
+                        raw: "Target".into(),
+                        key: "target".into(),
+                    },
+                    PhysicalName {
+                        raw: "TARGET".into(),
+                        key: "target".into(),
+                    },
+                ],
+                parent: None,
+                order: "a".into(),
+                content: String::new(),
+                search_tokens: String::new(),
+                heading_level: None,
+                collapsed: false,
+                logseq_uuid: None,
+                logseq_identity_origin: None,
+                properties: Vec::new(),
+                tags: Vec::new(),
+                task: None,
+                planning: None,
+                path_refs: Vec::new(),
+                property_atoms: Vec::new(),
+            }],
+        }
+    }
+
+    fn deferred_own_membership_write_steps(unrelated_postings: i64) -> (i32, i32) {
+        let connection = Connection::open_in_memory().unwrap();
+        initialize_graph_projection_schema(&connection).unwrap();
+        drop_deferred_indexes(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE name = 'reference_postings_source_idx'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        connection
+            .execute(
+                "INSERT INTO names (name_id, key, raw) VALUES (1, 'target', 'Target')",
+                [],
+            )
+            .unwrap();
+        let owner_page = own_membership_page();
+        let mut memberships =
+            DeferredOwnReferenceMemberships::new(std::slice::from_ref(&owner_page));
+        for id in 1..=unrelated_postings + 1 {
+            let owner = id == unrelated_postings + 1;
+            let path = if owner {
+                owner_page.path.clone()
+            } else {
+                format!("pages/{id}.md")
+            };
+            let block = if owner {
+                owner_page.blocks[0].result_id.clone()
+            } else {
+                format!("block-{id}")
+            };
+            connection
+                .execute(
+                    "INSERT INTO pages (
+                         page_id, name_id, path, text_kind, journal_day, position,
+                         estimated_bytes, property_count
+                     ) VALUES (?1, 1, ?2, 0, NULL, NULL, 0, 0)",
+                    params![id, &path],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO blocks (
+                         block_id, page_id, result_id, parent_block_id, order_key,
+                         heading_level, collapsed, logseq_uuid, logseq_identity_origin,
+                         preorder, estimated_bytes, tag_count, property_count
+                     ) VALUES (?1, ?1, ?2, NULL, 'a', NULL, 0, NULL, NULL, 0, 0, 0, 0)",
+                    params![id, &block],
+                )
+                .unwrap();
+            let posting = PhysicalReferencePosting {
+                source_page_path: path,
+                source_entity: PhysicalEntityId::Block(block),
+                source_locator: vec![1],
+                ordinal: 0,
+                kind: 0,
+                target: PhysicalReferenceTarget::PageName {
+                    raw_name: "Target".into(),
+                    normalized_name: "target".into(),
+                },
+            };
+            let posting_id = insert_reference_posting(&connection, &posting).unwrap();
+            memberships.capture_first_occurrence(&posting, posting_id);
+        }
+        assert_eq!(memberships.first_occurrences.len(), 1);
+        let posting_id = memberships
+            .first_occurrence("pages/owner.md", "owner-block", "target")
+            .unwrap();
+        let owner_id = unrelated_postings + 1;
+        insert_deferred_own_reference_memberships(
+            &connection,
+            std::slice::from_ref(&owner_page),
+            &BTreeMap::from([(owner_page.path.clone(), owner_id)]),
+            &BTreeMap::from([(owner_page.blocks[0].result_id.clone(), owner_id)]),
+            &memberships,
+        )
+        .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM reference_postings WHERE own = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        connection
+            .execute(
+                "UPDATE reference_postings SET own = 0 WHERE posting_id = ?1",
+                params![posting_id],
+            )
+            .unwrap();
+        let mut update = connection.prepare(MARK_OWN_REFERENCE_SQL).unwrap();
+        update.execute(params![posting_id]).unwrap();
+        (
+            update.get_status(rusqlite::StatementStatus::VmStep),
+            update.get_status(rusqlite::StatementStatus::FullscanStep),
+        )
+    }
+
+    #[test]
+    fn own_membership_lookup_and_write_ignore_unrelated_same_target_postings() {
+        let small = own_membership_lookup_steps(0);
+        let large = own_membership_lookup_steps(1_001);
+        assert!(large
+            .3
+            .iter()
+            .any(|step| step.contains("reference_postings_source_idx")));
+        assert!(large.3.iter().all(|step| !step.starts_with("SCAN r")));
+        assert_eq!(small.1, 0);
+        assert_eq!(large.1, 0);
+        assert_eq!(large.0, small.0, "small={small:?}, large={large:?}");
+        assert_eq!(large.2, small.2, "small={small:?}, large={large:?}");
+    }
+
+    #[test]
+    fn deferred_own_membership_write_ignores_unrelated_same_target_postings() {
+        let small = deferred_own_membership_write_steps(0);
+        let large = deferred_own_membership_write_steps(1_001);
+        assert_eq!(small.1, 0);
+        assert_eq!(large.1, 0);
+        assert_eq!(large.0, small.0, "small={small:?}, large={large:?}");
+    }
 
     #[test]
     fn query_preorder_rejects_incomplete_or_cyclic_trees() {
