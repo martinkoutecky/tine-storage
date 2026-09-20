@@ -71,10 +71,7 @@ mod compact_key_tests {
                 "a".into()
             },
             content: format!("content {id}"),
-            searchable_text: format!("content {id}"),
-            normalized_searchable_text: format!("content {id}"),
-            query_visible: format!("content {id}"),
-            query_visible_folded: format!("content {id}"),
+            search_tokens: format!("content {id}"),
             heading_level: None,
             collapsed: false,
             logseq_uuid: Some([7; 16]),
@@ -121,8 +118,7 @@ mod compact_key_tests {
             text_kind: 0,
             journal_day: None,
             preamble: None,
-            searchable_text: name.into(),
-            normalized_searchable_text: name.to_lowercase(),
+            search_tokens: name.to_lowercase(),
             properties: Vec::new(),
             tags: Vec::new(),
             property_atoms: Vec::new(),
@@ -157,6 +153,16 @@ mod compact_key_tests {
 
     fn scalar(db: &PhysicalGraphProjectionDatabase, sql: &str) -> i64 {
         db.connection.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    fn fts_rowids(db: &PhysicalGraphProjectionDatabase, expression: &str) -> Vec<i64> {
+        db.connection
+            .prepare("SELECT rowid FROM search_fts WHERE search_fts MATCH ?1 ORDER BY rowid")
+            .unwrap()
+            .query_map([expression], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
     }
 
     #[test]
@@ -298,18 +304,6 @@ mod compact_key_tests {
             1
         );
         assert_eq!(
-            read.plain_text_candidate_pages_after("content", None, 10)
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            read.fuzzy_subsequence_candidate_pages_after("cnt", None, 10)
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
             read.block_property_candidates_after("priority", None, 10)
                 .unwrap()
                 .len(),
@@ -347,7 +341,6 @@ mod compact_key_tests {
                 .len(),
             2
         );
-        assert_eq!(read.search("content", 10).unwrap().len(), 2);
         for plan in [
             read.query_plan(
                 "SELECT name_id FROM names WHERE key = ?1 AND raw = ?2",
@@ -475,12 +468,205 @@ mod compact_key_tests {
         .unwrap();
         assert_eq!(scalar(&db, "SELECT COUNT(*) FROM pages"), 0);
         assert_eq!(scalar(&db, "SELECT COUNT(*) FROM reference_postings"), 0);
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM search_fts"), 0);
         db.reset().unwrap();
         assert_eq!(scalar(&db, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM search_fts"), 0);
         assert_eq!(
             scalar(&db, "SELECT next_entity_id FROM query_projection_state"),
             1
         );
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn contentless_trigram_index_has_one_token_copy_and_transactional_lifecycle() {
+        let path = file("contentless-fts");
+        let mut db = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        db.initialize_schema().unwrap();
+        db.validate_schema().unwrap();
+
+        let old_tokens = "alpha oldneedle omega";
+        let mut original = page("pages/a.md", "A", vec![block("one", None)]);
+        original.search_tokens = old_tokens.into();
+        original.blocks[0].search_tokens = old_tokens.into();
+        db.apply_with_source_revisions_and_aliases(
+            &change(original, vec![]),
+            &[PhysicalGraphProjectionSourceRevision {
+                path: "pages/a.md".into(),
+                revision: "r1".into(),
+            }],
+            &[],
+        )
+        .unwrap();
+
+        let old_expression =
+            "\"old\" AND \"ldn\" AND \"dne\" AND \"nee\" AND \"eed\" AND \"edl\" AND \"dle\"";
+        assert_eq!(fts_rowids(&db, old_expression).len(), 2);
+        let stored_text: Option<String> = db
+            .connection
+            .query_row(
+                "SELECT normalized_text FROM search_fts LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored_text, None,
+            "a contentless FTS row must return NULL text"
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE name IN ('search_substring_fts', 'search_fts_owners')",
+            ),
+            0
+        );
+        for (table, expected) in [
+            ("page_text", vec!["page_id", "preamble"]),
+            ("block_text", vec!["block_id", "content"]),
+        ] {
+            let columns = db
+                .connection
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(columns, expected);
+        }
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT
+                    (SELECT COUNT(*) FROM pragma_table_info('page_text')
+                     WHERE name IN ('searchable_text', 'normalized_searchable_text'))
+                  + (SELECT COUNT(*) FROM pragma_table_info('block_text')
+                     WHERE name IN ('searchable_text', 'normalized_searchable_text', 'query_visible'))
+                  + (SELECT COUNT(*) FROM pragma_table_info('blocks')
+                     WHERE name = 'query_visible_folded')",
+            ),
+            0,
+            "raw/visible/fold text must not survive outside raw owners and token postings"
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM pages p JOIN blocks b ON b.block_id = p.page_id",
+            ),
+            0,
+            "page and block IDs share one disjoint scalar namespace"
+        );
+
+        let mut replacement = page("pages/a.md", "A", vec![block("two", None)]);
+        replacement.search_tokens = "alpha newneedle omega".into();
+        replacement.blocks[0].search_tokens = "alpha newneedle omega".into();
+        let failed = PhysicalGraphProjectionChange {
+            replacements: vec![replacement.clone()],
+            deletions: vec![],
+            reference_postings: vec![PhysicalReferencePosting {
+                source_page_path: "pages/a.md".into(),
+                source_entity: PhysicalEntityId::Block("missing".into()),
+                source_locator: b"content".to_vec(),
+                ordinal: 0,
+                kind: 0,
+                target: PhysicalReferenceTarget::PageName {
+                    raw_name: "Target".into(),
+                    normalized_name: "target".into(),
+                },
+            }],
+        };
+        assert!(db
+            .apply_with_source_revisions_and_aliases(
+                &failed,
+                &[PhysicalGraphProjectionSourceRevision {
+                    path: "pages/a.md".into(),
+                    revision: "r2".into(),
+                }],
+                &[],
+            )
+            .is_err());
+        assert_eq!(fts_rowids(&db, old_expression).len(), 2);
+        assert!(fts_rowids(
+            &db,
+            "\"new\" AND \"ewn\" AND \"wne\" AND \"nee\" AND \"eed\" AND \"edl\" AND \"dle\"",
+        )
+        .is_empty());
+        assert_eq!(
+            db.source_delta(&[PhysicalGraphProjectionSourceRevision {
+                path: "pages/a.md".into(),
+                revision: "r1".into(),
+            }])
+            .unwrap(),
+            PhysicalGraphProjectionSourceDelta::default()
+        );
+
+        let cleanup = db.apply(&change(replacement, vec![])).unwrap();
+        assert_eq!(cleanup.cleanup_fts_rowids, 2);
+        assert!(fts_rowids(&db, old_expression).is_empty());
+        assert_eq!(
+            fts_rowids(
+                &db,
+                "\"new\" AND \"ewn\" AND \"wne\" AND \"nee\" AND \"eed\" AND \"edl\" AND \"dle\"",
+            )
+            .len(),
+            2
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM search_fts f
+                 LEFT JOIN pages p ON p.page_id = f.rowid
+                 LEFT JOIN blocks b ON b.block_id = f.rowid
+                 WHERE p.page_id IS NULL AND b.block_id IS NULL",
+            ),
+            0
+        );
+
+        db.apply(&PhysicalGraphProjectionChange {
+            replacements: vec![],
+            deletions: vec!["pages/a.md".into()],
+            reference_postings: vec![],
+        })
+        .unwrap();
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM search_fts"), 0);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trigram_postings_admit_false_positives_and_sqlite_edge_inputs() {
+        let path = file("fts-edge-inputs");
+        let mut db = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        db.initialize_schema().unwrap();
+        let mut fixture = page("pages/edge.md", "Edge", vec![block("edge", None)]);
+        fixture.search_tokens = String::new();
+        fixture.blocks[0].content = "raw\0content".into();
+        fixture.blocks[0].search_tokens = "abc separated bcd\0xy".into();
+        let mut empty = block("empty", None);
+        empty.content.clear();
+        empty.search_tokens.clear();
+        fixture.blocks.push(empty);
+        let mut short = block("short", None);
+        short.content = "xy".into();
+        short.search_tokens = "xy".into();
+        fixture.blocks.push(short);
+        db.apply(&change(fixture, vec![])).unwrap();
+
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM search_fts"), 4);
+        assert_eq!(
+            fts_rowids(&db, "\"abc\" AND \"bcd\"").len(),
+            1,
+            "storage returns trigram candidates; exact verification rejects this false positive"
+        );
+        assert_eq!(
+            db.read().block("edge").unwrap().unwrap().content,
+            "raw\0content"
+        );
+        db.quick_check().unwrap();
         drop(db);
         let _ = std::fs::remove_file(path);
     }
@@ -1443,6 +1629,17 @@ mod tests {
             .unwrap()
     }
 
+    fn fts_rowids(database: &PhysicalGraphProjectionDatabase, expression: &str) -> Vec<i64> {
+        database
+            .connection
+            .prepare("SELECT rowid FROM search_fts WHERE search_fts MATCH ?1 ORDER BY rowid")
+            .unwrap()
+            .query_map([expression], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
     /// The GH #543 fixture shape: `pages` pages of 60 blocks, each block
     /// carrying one page link and one tag, exercising the same cardinality
     /// and secondary-index fanout as the reporter-scale build.
@@ -1502,10 +1699,7 @@ mod tests {
                     parent: None,
                     order: format!("{block:04}"),
                     content: content.clone(),
-                    searchable_text: content.clone(),
-                    normalized_searchable_text: content.to_lowercase(),
-                    query_visible: content.clone(),
-                    query_visible_folded: content.to_lowercase(),
+                    search_tokens: content.to_lowercase(),
                     heading_level: None,
                     collapsed: false,
                     logseq_uuid: None,
@@ -1539,8 +1733,7 @@ mod tests {
                 text_kind: 0,
                 journal_day: None,
                 preamble: None,
-                searchable_text: String::new(),
-                normalized_searchable_text: String::new(),
+                search_tokens: String::new(),
                 properties: Vec::new(),
                 tags: Vec::new(),
                 property_atoms: Vec::new(),
@@ -1594,7 +1787,7 @@ mod tests {
             .unwrap()
     }
 
-    /// GH #543: an apply into an empty projection builds the 32 secondary
+    /// GH #543: an apply into an empty projection builds the 33 secondary
     /// indexes once after its rows; the committed schema is the fresh schema
     /// byte for byte, and the next apply into the populated projection keeps
     /// every index live. A rollback restores the indexes too.
@@ -1607,7 +1800,7 @@ mod tests {
         let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
         database.initialize_schema().unwrap();
         let fresh_indexes = secondary_index_count(&database.connection);
-        assert_eq!(fresh_indexes, 34);
+        assert_eq!(fresh_indexes, 33);
         let (change, revisions, order) = gh543_snapshot(3);
 
         database
@@ -2153,8 +2346,7 @@ mod tests {
             text_kind: 0,
             journal_day: None,
             preamble: None,
-            searchable_text: content.into(),
-            normalized_searchable_text: content.to_lowercase(),
+            search_tokens: content.to_lowercase(),
             properties: Vec::new(),
             tags: Vec::new(),
             property_atoms: Vec::new(),
@@ -2164,10 +2356,7 @@ mod tests {
                 parent: None,
                 order: "0001".into(),
                 content: content.into(),
-                searchable_text: content.into(),
-                normalized_searchable_text: content.to_lowercase(),
-                query_visible: content.into(),
-                query_visible_folded: content.to_lowercase(),
+                search_tokens: content.to_lowercase(),
                 heading_level: None,
                 collapsed: false,
                 logseq_uuid: None,
@@ -2660,6 +2849,11 @@ mod tests {
                 &["pages/page-1.md".into(), "pages/page-2.md".into()],
             )
             .unwrap();
+        let before_expression = "\"bef\" AND \"efo\" AND \"for\" AND \"ore\"";
+        let after_expression = "\"aft\" AND \"fte\" AND \"ter\"";
+        let before_fts_rowids = fts_rowids(&database, before_expression);
+        assert_eq!(before_fts_rowids.len(), 4);
+        assert!(fts_rowids(&database, after_expression).is_empty());
         let before_projection_revision =
             scalar(&database, "SELECT revision FROM query_projection_state");
         database
@@ -2730,6 +2924,21 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(content, ["first before", "second before"]);
+        assert_eq!(fts_rowids(&database, before_expression), before_fts_rowids);
+        assert!(fts_rowids(&database, after_expression).is_empty());
+        assert_eq!(scalar(&database, "SELECT COUNT(*) FROM search_fts"), 4);
+        assert_eq!(
+            scalar(
+                &database,
+                "SELECT COUNT(*) FROM search_fts f
+                 LEFT JOIN pages p ON p.page_id = f.rowid
+                 LEFT JOIN blocks b ON b.block_id = f.rowid
+                 WHERE (p.page_id IS NULL AND b.block_id IS NULL)
+                    OR (p.page_id IS NOT NULL AND b.block_id IS NOT NULL)",
+            ),
+            0,
+            "each contentless FTS row must retain exactly one page or block owner"
+        );
         let source_revisions = database
             .connection
             .prepare("SELECT path, revision FROM direct_source_revisions ORDER BY path")
@@ -2883,7 +3092,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!(database.read().tasks(Some("TODO"), 10).unwrap().len(), 1);
-        assert_eq!(database.read().search("needle", 10).unwrap().len(), 2);
+        assert_eq!(
+            scalar(
+                &database,
+                "SELECT COUNT(*) FROM search_fts WHERE search_fts MATCH '\"nee\" AND \"eed\" AND \"edl\" AND \"dle\"'",
+            ),
+            2
+        );
 
         database
             .apply(&PhysicalGraphProjectionChange {
@@ -2903,7 +3118,13 @@ mod tests {
             })
             .unwrap();
         assert!(database.read().tasks(None, 10).unwrap().is_empty());
-        assert!(database.read().search("needle", 10).unwrap().is_empty());
+        assert_eq!(
+            scalar(
+                &database,
+                "SELECT COUNT(*) FROM search_fts WHERE search_fts MATCH '\"nee\" AND \"eed\" AND \"edl\" AND \"dle\"'",
+            ),
+            0
+        );
         database.quick_check().unwrap();
         drop(database);
         for suffix in ["", "-wal", "-shm"] {

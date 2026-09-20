@@ -13,6 +13,10 @@ second source of truth.
 Schema 30 is the single unreleased compact projection format: entity
 coordinates are monotonic integer rowids, public identity remains path/result
 ID, and reference/property/tag names are spelling-preserving dictionary rows.
+Page preamble and block source are the only stored raw document text. Search is
+one contentless, detail-free, case-sensitive trigram FTS5 table whose rowids are
+those same disjoint page/block coordinates; application-folded `search_tokens`
+are indexed but cannot be read back as text.
 
 The Managed Storage formats (oplog manifest/object protocol, local journal v1
 and v2, sealed accepted-history index, engine scratch, checkpoint fingerprints,

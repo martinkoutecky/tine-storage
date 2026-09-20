@@ -5,6 +5,32 @@ version describes its Rust API; persistent byte formats are versioned
 independently in `src/formats.rs` and summarized in
 `FORMAT-COMPATIBILITY.md`.
 
+## Unreleased
+
+### Changed
+
+- Schema 30 now keeps exactly one raw document-text copy: page preamble in
+  `page_text` and block source in `block_text`. `PhysicalPage` and
+  `PhysicalBlock` replace the persisted searchable/visible variants with one
+  ephemeral `search_tokens` input owned by the application.
+- Search postings now live in one contentless `search_fts` table keyed directly
+  by the projection's disjoint page/block scalar IDs. It uses case-sensitive
+  trigram tokenization with `detail=none`; replacement and deletion remove rows
+  by rowid without retaining old token bodies or an owner mapping table.
+
+### Removed
+
+- The unicode61 word index, legacy trigram substring index,
+  `search_fts_owners`, and the storage-owned plain-text, fuzzy-subsequence, and
+  ranked-search readers. Callers plan candidates through the read-only
+  projection query seam and perform exact matching in the application.
+- Derived `searchable_text` fields from page/block reads and the stored
+  `query_visible` / `query_visible_folded` columns.
+
+Schema identity remains 30 because this is the same unreleased private rebuild.
+Unit cost: one contentless posting delete/insert for each entity on a replaced
+page; no stored token text and no graph-wide reindex on edit.
+
 ## [0.26.0] - 2026-09-19
 
 Completes the compact-projection P1 deliverable: the public surface is what

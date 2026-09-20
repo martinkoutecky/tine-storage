@@ -161,6 +161,13 @@ finish promptly because SQLite cannot interrupt Rust code inside a callback.
 The ranking callback does not change authority formats. The current disposable
 projection schema and its rebuild behavior are documented in FORMAT-COMPATIBILITY.md.
 
+Schema 30 stores page preamble and block source once in their raw owner tables.
+The application supplies an ephemeral folded `search_tokens` value per page and
+block; storage writes it only to a contentless, detail-free trigram FTS5 table
+using the entity's existing scalar coordinate as rowid. Exact matching,
+fallback scans, ranking, and candidate windows remain application policy over
+the read-only projection query seam.
+
 `PhysicalProjectionQuerySnapshot::query_revision()` reads a local image counter
 from the pinned transaction. Pair it with the owner's projection-instance
 identity for result memoization; it does not certify coverage of a saved edit.

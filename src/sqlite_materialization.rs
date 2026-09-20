@@ -233,17 +233,9 @@ pub struct PhysicalBlock {
     pub parent: Option<String>,
     pub order: String,
     pub content: String,
-    pub searchable_text: String,
-    pub normalized_searchable_text: String,
-    /// The block's exact visible text -- `BlockProjection.visible` -- and that
-    /// text canonically folded, the two columns every content predicate reads
-    /// (SPEC §5.8, §5.10).
-    ///
-    /// Deliberately NOT `searchable_text`, which both producers collapse
-    /// whitespace in for the existing search consumers: a query for a phrase
-    /// with two spaces has to be able to tell those apart.
-    pub query_visible: String,
-    pub query_visible_folded: String,
+    /// Application-owned folded visible tokens. Storage feeds this ephemeral
+    /// value to the contentless search index and never persists it as text.
+    pub search_tokens: String,
     pub heading_level: Option<u8>,
     pub collapsed: bool,
     pub logseq_uuid: Option<[u8; 16]>,
@@ -272,8 +264,9 @@ pub struct PhysicalPage {
     /// graph's journal formats, else `None` (SPEC §3.2, §5.8).
     pub journal_day: Option<i64>,
     pub preamble: Option<String>,
-    pub searchable_text: String,
-    pub normalized_searchable_text: String,
+    /// Application-owned folded visible tokens. Storage feeds this ephemeral
+    /// value to the contentless search index and never persists it as text.
+    pub search_tokens: String,
     pub properties: Vec<PhysicalProperty>,
     pub tags: Vec<PhysicalTag>,
     pub property_atoms: Vec<PhysicalPropertyAtom>,
@@ -343,23 +336,6 @@ pub struct ApplyChangeInstrumentation {
 pub(crate) struct FtsChangeInstrumentation {
     page_rows: usize,
     block_rows: usize,
-    standard_rows: usize,
-    substring_rows: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct FtsEntityRow {
-    entity_type: i64,
-    entity_id: i64,
-    page_id: i64,
-    text: String,
-    normalized_text: String,
-}
-
-impl FtsEntityRow {
-    const fn key(&self) -> (i64, i64) {
-        (self.entity_type, self.entity_id)
-    }
 }
 
 pub const NAMES_DDL: &str = "CREATE TABLE names (
@@ -429,11 +405,7 @@ pub const PAGES_DDL: &str = "CREATE TABLE pages (
 const PAGE_TEXT_DDL: &str = "CREATE TABLE page_text (
     page_id INTEGER PRIMARY KEY
         REFERENCES pages(page_id) ON DELETE CASCADE,
-    preamble TEXT CHECK (preamble IS NULL OR length(CAST(preamble AS BLOB)) <= 16777216),
-    searchable_text TEXT NOT NULL CHECK (length(CAST(searchable_text AS BLOB)) <= 4194304),
-    normalized_searchable_text TEXT NOT NULL CHECK (
-        length(CAST(normalized_searchable_text AS BLOB)) <= 4194304
-    )
+    preamble TEXT CHECK (preamble IS NULL OR length(CAST(preamble AS BLOB)) <= 16777216)
 ) STRICT";
 pub const BLOCKS_DDL: &str = "CREATE TABLE blocks (
     block_id INTEGER PRIMARY KEY,
@@ -442,9 +414,6 @@ pub const BLOCKS_DDL: &str = "CREATE TABLE blocks (
     result_id TEXT NOT NULL UNIQUE CHECK (length(CAST(result_id AS BLOB)) > 0),
     parent_block_id INTEGER REFERENCES blocks(block_id),
     order_key TEXT NOT NULL CHECK (length(CAST(order_key AS BLOB)) BETWEEN 1 AND 4194304),
-    query_visible_folded TEXT NOT NULL CHECK (
-        length(CAST(query_visible_folded AS BLOB)) <= 4194304
-    ),
     heading_level INTEGER CHECK (
         heading_level IS NULL OR heading_level BETWEEN 1 AND 6
     ),
@@ -467,12 +436,7 @@ pub const BLOCKS_DDL: &str = "CREATE TABLE blocks (
 const BLOCK_TEXT_DDL: &str = "CREATE TABLE block_text (
     block_id INTEGER PRIMARY KEY
         REFERENCES blocks(block_id) ON DELETE CASCADE,
-    content TEXT NOT NULL CHECK (length(CAST(content AS BLOB)) <= 4194304),
-    searchable_text TEXT NOT NULL CHECK (length(CAST(searchable_text AS BLOB)) <= 4194304),
-    normalized_searchable_text TEXT NOT NULL CHECK (
-        length(CAST(normalized_searchable_text AS BLOB)) <= 4194304
-    ),
-    query_visible TEXT NOT NULL CHECK (length(CAST(query_visible AS BLOB)) <= 4194304)
+    content TEXT NOT NULL CHECK (length(CAST(content AS BLOB)) <= 4194304)
 ) STRICT";
 pub const PROPERTIES_DDL: &str = "CREATE TABLE properties (
     owner_type INTEGER NOT NULL CHECK (owner_type IN (0, 1)),
@@ -552,24 +516,12 @@ pub const PROPERTY_ATOMS_DDL: &str = "CREATE TABLE property_atoms (
     PRIMARY KEY (owner_type, owner_id, name_id, ordinal)
 ) WITHOUT ROWID, STRICT";
 pub const SEARCH_FTS_DDL: &str = "CREATE VIRTUAL TABLE search_fts USING fts5(
-    entity_type UNINDEXED,
-    entity_id UNINDEXED,
-    page_id UNINDEXED,
-    text UNINDEXED,
     normalized_text,
-    tokenize = 'unicode61 remove_diacritics 0'
+    content = '',
+    contentless_delete = 1,
+    detail = none,
+    tokenize = 'trigram case_sensitive 1 remove_diacritics 0'
 )";
-pub const SEARCH_SUBSTRING_FTS_DDL: &str = "CREATE VIRTUAL TABLE search_substring_fts USING fts5(
-    normalized_text,
-    tokenize = 'trigram'
-)";
-pub const SEARCH_FTS_OWNERS_DDL: &str = "CREATE TABLE search_fts_owners (
-    rowid INTEGER PRIMARY KEY,
-    entity_type INTEGER NOT NULL CHECK (entity_type IN (0, 1)),
-    entity_id INTEGER NOT NULL,
-    page_id INTEGER NOT NULL,
-    UNIQUE (entity_type, entity_id)
-) STRICT";
 
 pub const NAMES_RAW_KEY_INDEX_DDL: &str =
     "CREATE INDEX names_raw_key_idx ON names(raw, key, name_id)";
@@ -583,8 +535,6 @@ pub const BLOCKS_PARENT_PAGE_INDEX_DDL: &str = "CREATE INDEX blocks_parent_page_
     ON blocks(parent_block_id, page_id, block_id) WHERE parent_block_id IS NOT NULL";
 pub const BLOCKS_LOGSEQ_UUID_INDEX_DDL: &str = "CREATE INDEX blocks_logseq_uuid_idx
     ON blocks(logseq_uuid, block_id) WHERE logseq_uuid IS NOT NULL";
-pub const SEARCH_FTS_OWNERS_PAGE_INDEX_DDL: &str =
-    "CREATE INDEX search_fts_owners_page_idx ON search_fts_owners(page_id, rowid)";
 pub const REFERENCE_POSTINGS_SOURCE_INDEX_DDL: &str = "CREATE INDEX reference_postings_source_idx
     ON reference_postings(source_page_id, source_entity_type, source_entity_id, reference_kind, ordinal)";
 pub const REFERENCE_POSTINGS_TARGET_NAME_INDEX_DDL: &str =
@@ -663,10 +613,10 @@ pub const PROPERTY_ATOMS_PAGE_INDEX_DDL: &str = "CREATE INDEX property_atoms_pag
 // A terminal bootstrap candidate is a brand-new, unpublished database. Its
 // ordinary secondary indexes can be built once after the complete row set is
 // present instead of being maintained for every inserted row. The primary-key
-// indexes and both FTS virtual tables remain live throughout construction.
+// indexes and contentless FTS virtual table remain live throughout construction.
 // This list must reproduce the exact normal schema before the transaction can
 // commit.
-const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 34] = [
+const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 33] = [
     ("names_raw_key_idx", NAMES_RAW_KEY_INDEX_DDL),
     ("pages_name_idx", PAGES_NAME_INDEX_DDL),
     ("pages_journal_day_idx", PAGES_JOURNAL_DAY_INDEX_DDL),
@@ -674,10 +624,6 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 34] = [
     ("blocks_page_order_idx", BLOCKS_PAGE_ORDER_INDEX_DDL),
     ("blocks_parent_page_idx", BLOCKS_PARENT_PAGE_INDEX_DDL),
     ("blocks_logseq_uuid_idx", BLOCKS_LOGSEQ_UUID_INDEX_DDL),
-    (
-        "search_fts_owners_page_idx",
-        SEARCH_FTS_OWNERS_PAGE_INDEX_DDL,
-    ),
     (
         "reference_postings_source_idx",
         REFERENCE_POSTINGS_SOURCE_INDEX_DDL,
@@ -748,7 +694,7 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 34] = [
     ("property_atoms_page_idx", PROPERTY_ATOMS_PAGE_INDEX_DDL),
 ];
 
-const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 15] = [
+const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 14] = [
     ("names", &["name_id", "key", "raw"]),
     (
         "reference_postings",
@@ -790,25 +736,8 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 15] = [
             "property_count",
         ],
     ),
-    (
-        "page_text",
-        &[
-            "page_id",
-            "preamble",
-            "searchable_text",
-            "normalized_searchable_text",
-        ],
-    ),
-    (
-        "block_text",
-        &[
-            "block_id",
-            "content",
-            "searchable_text",
-            "normalized_searchable_text",
-            "query_visible",
-        ],
-    ),
+    ("page_text", &["page_id", "preamble"]),
+    ("block_text", &["block_id", "content"]),
     (
         "blocks",
         &[
@@ -817,7 +746,6 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 15] = [
             "result_id",
             "parent_block_id",
             "order_key",
-            "query_visible_folded",
             "heading_level",
             "collapsed",
             "logseq_uuid",
@@ -886,13 +814,9 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 15] = [
             "atom_day",
         ],
     ),
-    (
-        "search_fts_owners",
-        &["rowid", "entity_type", "entity_id", "page_id"],
-    ),
 ];
 
-const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 50] = [
+const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 47] = [
     ("table", "names", NAMES_DDL),
     ("table", "reference_postings", REFERENCE_POSTINGS_DDL),
     (
@@ -915,9 +839,7 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 50] = [
         QUERY_PROJECTION_STATE_DDL,
     ),
     ("table", "property_atoms", PROPERTY_ATOMS_DDL),
-    ("table", "search_fts_owners", SEARCH_FTS_OWNERS_DDL),
     ("table", "search_fts", SEARCH_FTS_DDL),
-    ("table", "search_substring_fts", SEARCH_SUBSTRING_FTS_DDL),
     ("index", "names_raw_key_idx", NAMES_RAW_KEY_INDEX_DDL),
     ("index", "pages_name_idx", PAGES_NAME_INDEX_DDL),
     (
@@ -940,11 +862,6 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 50] = [
         "index",
         "blocks_logseq_uuid_idx",
         BLOCKS_LOGSEQ_UUID_INDEX_DDL,
-    ),
-    (
-        "index",
-        "search_fts_owners_page_idx",
-        SEARCH_FTS_OWNERS_PAGE_INDEX_DDL,
     ),
     (
         "index",
@@ -1071,9 +988,7 @@ pub(crate) fn initialize_graph_projection_schema(
          {BLOCK_PATH_REFS_DDL};
          {QUERY_PROJECTION_STATE_DDL};
          {PROPERTY_ATOMS_DDL};
-         {SEARCH_FTS_OWNERS_DDL};
          {SEARCH_FTS_DDL};
-         {SEARCH_SUBSTRING_FTS_DDL};
          {NAMES_RAW_KEY_INDEX_DDL};
          {PAGES_NAME_INDEX_DDL};
          {PAGES_JOURNAL_DAY_INDEX_DDL};
@@ -1081,7 +996,6 @@ pub(crate) fn initialize_graph_projection_schema(
          {BLOCKS_PAGE_ORDER_INDEX_DDL};
          {BLOCKS_PARENT_PAGE_INDEX_DDL};
          {BLOCKS_LOGSEQ_UUID_INDEX_DDL};
-         {SEARCH_FTS_OWNERS_PAGE_INDEX_DDL};
          {REFERENCE_POSTINGS_SOURCE_INDEX_DDL};
          {REFERENCE_POSTINGS_TARGET_NAME_INDEX_DDL};
          {REFERENCE_POSTINGS_OCCURRENCE_INDEX_DDL};
@@ -1175,11 +1089,10 @@ fn canonical_sql(sql: &str) -> String {
 /// with those indexes dropped only while all of these are empty: the per-page
 /// cleanup and FTS lookups that precede insertion are full scans without their
 /// index — free on an empty table, quadratic on a populated one.
-const DEFERRED_INDEX_TABLES: [&str; 12] = [
+const DEFERRED_INDEX_TABLES: [&str; 11] = [
     "names",
     "pages",
     "blocks",
-    "search_fts_owners",
     "reference_postings",
     "reference_alias_declarations",
     "properties",
@@ -1500,7 +1413,6 @@ pub(crate) fn apply_graph_projection_rows(
     }
     let affected_pages = page_ids.values().copied().collect::<BTreeSet<_>>();
     let affected_name_ids = affected_name_ids(transaction, &affected_pages)?;
-    let old_fts = load_fts_source_rows(transaction, &affected_pages)?;
     let mut instrumentation = ApplyChangeInstrumentation::default();
     for path in &change.deletions {
         let cleanup = match page_ids.get(path) {
@@ -1528,6 +1440,13 @@ pub(crate) fn apply_graph_projection_rows(
             &block_ids,
         )?;
     }
+    insert_replacement_fts_rows(
+        transaction,
+        &change.replacements,
+        &page_ids,
+        &block_ids,
+        fts_instrumentation,
+    )?;
     for posting in &change.reference_postings {
         insert_reference_posting(transaction, posting)?;
     }
@@ -1536,14 +1455,6 @@ pub(crate) fn apply_graph_projection_rows(
     }
     insert_own_reference_memberships(transaction, &change.replacements)?;
     reclaim_affected_names(transaction, &affected_name_ids)?;
-    let new_fts = replacement_fts_rows(&change.replacements, &page_ids, &block_ids)?;
-    reconcile_fts_rows(
-        transaction,
-        old_fts,
-        new_fts,
-        &mut instrumentation,
-        fts_instrumentation,
-    )?;
     Ok(instrumentation)
 }
 
@@ -1705,9 +1616,7 @@ pub(crate) fn reset_graph_projection_rows(
 ) -> Result<(), MaterializationError> {
     advance_query_projection_revision(transaction)?;
     transaction.execute_batch(
-        "DELETE FROM search_substring_fts;
-         DELETE FROM search_fts;
-         DELETE FROM search_fts_owners;
+        "DELETE FROM search_fts;
          DELETE FROM property_atoms;
          DELETE FROM block_path_refs;
          DELETE FROM block_planning;
@@ -1747,6 +1656,15 @@ fn delete_page(
         existing_pages: usize::from(existing != 0),
         ..PageCleanupInstrumentation::default()
     };
+    let block_ids = transaction
+        .prepare_cached("SELECT block_id FROM blocks WHERE page_id = ?1 ORDER BY block_id")?
+        .query_map(params![page], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for rowid in std::iter::once(page_id).chain(block_ids) {
+        instrumentation.fts_rowids = instrumentation.fts_rowids.saturating_add(
+            transaction.execute("DELETE FROM search_fts WHERE rowid = ?1", params![rowid])?,
+        );
+    }
     for table in ["reference_postings", "reference_alias_declarations"] {
         instrumentation.owned_rows =
             instrumentation
@@ -1858,14 +1776,8 @@ fn insert_page(
     )?;
     execute_cached(
         transaction,
-        "INSERT INTO page_text (page_id, preamble, searchable_text, normalized_searchable_text)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![
-            page_id,
-            &page.preamble,
-            &page.searchable_text,
-            &page.normalized_searchable_text,
-        ],
+        "INSERT INTO page_text (page_id, preamble) VALUES (?1, ?2)",
+        params![page_id, &page.preamble],
     )?;
     insert_properties(
         transaction,
@@ -1949,17 +1861,15 @@ fn insert_block(
         transaction,
         "INSERT INTO blocks (
              block_id, page_id, result_id, parent_block_id, order_key,
-             query_visible_folded, heading_level,
-             collapsed, logseq_uuid, logseq_identity_origin, preorder,
-             estimated_bytes, tag_count, property_count
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             heading_level, collapsed, logseq_uuid, logseq_identity_origin,
+             preorder, estimated_bytes, tag_count, property_count
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             block_id,
             page_id,
             &block.result_id,
             parent_id,
             &block.order,
-            &block.query_visible_folded,
             block.heading_level.map(i64::from),
             i64::from(block.collapsed),
             logseq_uuid,
@@ -1980,10 +1890,8 @@ fn insert_block(
     )?;
     execute_cached(
         transaction,
-        "INSERT INTO block_text (block_id, content, searchable_text, normalized_searchable_text, query_visible)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![block_id, &block.content, &block.searchable_text,
-            &block.normalized_searchable_text, &block.query_visible],
+        "INSERT INTO block_text (block_id, content) VALUES (?1, ?2)",
+        params![block_id, &block.content],
     )?;
     let owner = PhysicalEntityCoordinate::Block(block_id);
     insert_properties(transaction, owner, page_id, &block.properties)?;
@@ -2036,158 +1944,27 @@ fn insert_block(
     Ok(())
 }
 
-fn load_fts_source_rows(
+fn insert_replacement_fts_rows(
     transaction: &Connection,
-    page_ids: &BTreeSet<i64>,
-) -> Result<BTreeMap<(i64, i64), FtsEntityRow>, MaterializationError> {
-    let mut rows = BTreeMap::new();
-    for page_id in page_ids {
-        let page = transaction
-            .query_row(
-                "SELECT searchable_text, normalized_searchable_text
-                 FROM pages LEFT JOIN page_text USING (page_id) WHERE page_id = ?1",
-                params![page_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()?;
-        if let Some((text, normalized_text)) = page {
-            let row = FtsEntityRow {
-                entity_type: 0,
-                entity_id: *page_id,
-                page_id: *page_id,
-                text,
-                normalized_text,
-            };
-            rows.insert(row.key(), row);
-        }
-        let mut statement = transaction.prepare(
-            "SELECT block_id, searchable_text, normalized_searchable_text
-             FROM blocks LEFT JOIN block_text USING (block_id) WHERE page_id = ?1 ORDER BY block_id",
-        )?;
-        let blocks = statement.query_map(params![page_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })?;
-        for block in blocks {
-            let (block_id, text, normalized_text) = block?;
-            let row = FtsEntityRow {
-                entity_type: 1,
-                entity_id: block_id,
-                page_id: *page_id,
-                text,
-                normalized_text,
-            };
-            if rows.insert(row.key(), row).is_some() {
-                return Err(MaterializationError::Corrupt(
-                    "duplicate FTS source entity in graph projection".into(),
-                ));
-            }
-        }
-    }
-    Ok(rows)
-}
-
-fn replacement_fts_rows(
     replacements: &[PhysicalPage],
     page_ids: &BTreeMap<String, i64>,
     block_ids: &BTreeMap<String, i64>,
-) -> Result<BTreeMap<(i64, i64), FtsEntityRow>, MaterializationError> {
-    let mut rows = BTreeMap::new();
+    mut instrumentation: Option<&mut FtsChangeInstrumentation>,
+) -> Result<(), MaterializationError> {
     for page in replacements {
-        let page_row = FtsEntityRow {
-            entity_type: 0,
-            entity_id: page_ids[&page.path],
-            page_id: page_ids[&page.path],
-            text: page.searchable_text.clone(),
-            normalized_text: page.normalized_searchable_text.clone(),
-        };
-        if rows.insert(page_row.key(), page_row).is_some() {
-            return Err(MaterializationError::InvalidInput(
-                "replacement pages contain a duplicate page ID".into(),
-            ));
+        insert_fts_row(transaction, page_ids[&page.path], &page.search_tokens)?;
+        if let Some(stats) = instrumentation.as_deref_mut() {
+            stats.page_rows = stats.page_rows.saturating_add(1);
         }
         for block in &page.blocks {
-            let block_row = FtsEntityRow {
-                entity_type: 1,
-                entity_id: block_ids[&block.result_id],
-                page_id: page_ids[&page.path],
-                text: block.searchable_text.clone(),
-                normalized_text: block.normalized_searchable_text.clone(),
-            };
-            if rows.insert(block_row.key(), block_row).is_some() {
-                return Err(MaterializationError::InvalidInput(
-                    "replacement pages contain a duplicate block ID".into(),
-                ));
-            }
-        }
-    }
-    Ok(rows)
-}
-
-fn delete_fts_entity(
-    transaction: &Connection,
-    entity_type: i64,
-    entity_id: i64,
-) -> Result<bool, MaterializationError> {
-    let rowid: Option<i64> = transaction
-        .query_row(
-            "SELECT rowid FROM search_fts_owners
-             WHERE entity_type = ?1 AND entity_id = ?2",
-            params![entity_type, entity_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(rowid) = rowid else {
-        return Ok(false);
-    };
-    transaction.execute(
-        "DELETE FROM search_substring_fts WHERE rowid = ?1",
-        params![rowid],
-    )?;
-    transaction.execute("DELETE FROM search_fts WHERE rowid = ?1", params![rowid])?;
-    transaction.execute(
-        "DELETE FROM search_fts_owners WHERE rowid = ?1",
-        params![rowid],
-    )?;
-    Ok(true)
-}
-
-fn reconcile_fts_rows(
-    transaction: &Connection,
-    old: BTreeMap<(i64, i64), FtsEntityRow>,
-    new: BTreeMap<(i64, i64), FtsEntityRow>,
-    instrumentation: &mut ApplyChangeInstrumentation,
-    mut fts_instrumentation: Option<&mut FtsChangeInstrumentation>,
-) -> Result<(), MaterializationError> {
-    let keys = old
-        .keys()
-        .chain(new.keys())
-        .copied()
-        .collect::<BTreeSet<_>>();
-    for key in keys {
-        let before = old.get(&key);
-        let after = new.get(&key);
-        if before == after {
-            continue;
-        }
-        if let Some(stats) = fts_instrumentation.as_deref_mut() {
-            if key.0 == 0 {
-                stats.page_rows = stats.page_rows.saturating_add(1);
-            } else {
+            insert_fts_row(
+                transaction,
+                block_ids[&block.result_id],
+                &block.search_tokens,
+            )?;
+            if let Some(stats) = instrumentation.as_deref_mut() {
                 stats.block_rows = stats.block_rows.saturating_add(1);
             }
-            stats.standard_rows = stats.standard_rows.saturating_add(1);
-            stats.substring_rows = stats.substring_rows.saturating_add(1);
-        }
-        if delete_fts_entity(transaction, key.0, key.1)? {
-            instrumentation.cleanup_fts_rowids =
-                instrumentation.cleanup_fts_rowids.saturating_add(1);
-        }
-        if let Some(after) = after {
-            insert_fts_row(transaction, after)?;
         }
     }
     Ok(())
@@ -2195,46 +1972,20 @@ fn reconcile_fts_rows(
 
 fn insert_fts_row(
     transaction: &Connection,
-    row: &FtsEntityRow,
+    rowid: i64,
+    search_tokens: &str,
 ) -> Result<(), MaterializationError> {
-    if row.normalized_text.len() > MAX_MATERIALIZATION_FIELD_BYTES {
+    if search_tokens.len() > MAX_MATERIALIZATION_FIELD_BYTES {
         return Err(resource_limit(
-            "normalized searchable text bytes",
-            row.normalized_text.len(),
+            "search token bytes",
+            search_tokens.len(),
             MAX_MATERIALIZATION_FIELD_BYTES,
         ));
     }
-    let entity_type = match row.entity_type {
-        0 => "page",
-        1 => "block",
-        _ => {
-            return Err(MaterializationError::InvalidInput(
-                "unknown FTS entity type".into(),
-            ));
-        }
-    };
-    let rowid = row.entity_id;
-    execute_cached(transaction,
-        "INSERT INTO search_fts_owners (rowid, entity_type, entity_id, page_id) VALUES (?1, ?2, ?3, ?4)",
-        params![rowid, row.entity_type, row.entity_id, row.page_id])?;
     execute_cached(
         transaction,
-        "INSERT INTO search_fts (
-             rowid, entity_type, entity_id, page_id, text, normalized_text
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            rowid,
-            entity_type,
-            row.entity_id.to_string(),
-            row.page_id.to_string(),
-            &row.text,
-            &row.normalized_text,
-        ],
-    )?;
-    execute_cached(
-        transaction,
-        "INSERT INTO search_substring_fts (rowid, normalized_text) VALUES (?1, ?2)",
-        params![rowid, &row.normalized_text],
+        "INSERT INTO search_fts (rowid, normalized_text) VALUES (?1, ?2)",
+        params![rowid, search_tokens],
     )?;
     Ok(())
 }
@@ -2352,7 +2103,6 @@ pub struct PhysicalPageRow {
     pub path: String,
     pub text_kind: i64,
     pub preamble: Option<String>,
-    pub searchable_text: String,
 }
 
 /// Lightweight page row for navigation/autocomplete.  It deliberately omits
@@ -2396,7 +2146,6 @@ pub struct PhysicalBlockRow {
     pub parent: Option<String>,
     pub order: String,
     pub content: String,
-    pub searchable_text: String,
     pub heading_level: Option<u8>,
     pub collapsed: bool,
     pub logseq_uuid: Option<[u8; 16]>,
@@ -2423,18 +2172,6 @@ pub struct PhysicalPageReferrerCandidateRow {
     pub source: PhysicalEntityId,
     pub page_cursor: i64,
     pub entity_cursor: i64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PhysicalPlainTextCandidatePageRow {
-    pub page_path: String,
-    pub cursor: i64,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PhysicalFuzzyCandidatePageRow {
-    pub cursor: i64,
-    pub path: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2525,14 +2262,6 @@ pub struct PhysicalTaskRow {
     pub deadline: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct PhysicalSearchHit {
-    pub entity: PhysicalEntityId,
-    pub page_path: String,
-    pub text: String,
-    pub rank: f64,
-}
-
 #[derive(Default)]
 pub(crate) struct MaterializationReadBudget {
     bytes: usize,
@@ -2585,7 +2314,6 @@ fn page_row_output_bytes(row: &PhysicalPageRow) -> Result<usize, Materialization
             Some(row.name_key.as_str()),
             Some(row.path.as_str()),
             row.preamble.as_deref(),
-            Some(row.searchable_text.as_str()),
         ],
     )
 }
@@ -2639,7 +2367,6 @@ fn block_row_output_bytes(row: &PhysicalBlockRow) -> Result<usize, Materializati
             row.parent.as_deref(),
             Some(row.order.as_str()),
             Some(row.content.as_str()),
-            Some(row.searchable_text.as_str()),
         ],
     )
 }
@@ -2708,17 +2435,6 @@ fn task_row_output_bytes(row: &PhysicalTaskRow) -> Result<usize, Materialization
             row.priority.as_deref(),
             row.scheduled.as_deref(),
             row.deadline.as_deref(),
-        ],
-    )
-}
-
-fn search_hit_output_bytes(row: &PhysicalSearchHit) -> Result<usize, MaterializationError> {
-    checked_output_bytes(
-        72,
-        [
-            Some(public_entity_id(&row.entity)),
-            Some(row.page_path.as_str()),
-            Some(row.text.as_str()),
         ],
     )
 }
@@ -2909,7 +2625,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         let page = self
             .connection
             .query_row(
-                "SELECT n.raw, n.key, p.path, p.text_kind, t.preamble, t.searchable_text
+                "SELECT n.raw, n.key, p.path, p.text_kind, t.preamble
                  FROM pages AS p JOIN names AS n ON n.name_id = p.name_id
                  LEFT JOIN page_text AS t USING (page_id) WHERE p.path = ?1",
                 params![path],
@@ -2930,7 +2646,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
             .connection
             .query_row(
                 "SELECT b.result_id, p.path, parent.result_id, b.order_key,
-                        bt.content, bt.searchable_text, b.heading_level,
+                        bt.content, b.heading_level,
                         b.collapsed, b.logseq_uuid, b.logseq_identity_origin
                  FROM blocks AS b JOIN pages AS p ON p.page_id = b.page_id
                  LEFT JOIN blocks AS parent ON parent.block_id = b.parent_block_id
@@ -2961,7 +2677,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         let limit = checked_limit(limit)?;
         let mut statement = self.connection.prepare(
             "SELECT b.result_id, p.path, parent.result_id, b.order_key,
-                    bt.content, bt.searchable_text, b.heading_level,
+                    bt.content, b.heading_level,
                     b.collapsed, b.logseq_uuid, b.logseq_identity_origin
              FROM blocks AS b JOIN pages AS p ON p.page_id = b.page_id
              LEFT JOIN blocks AS parent ON parent.block_id = b.parent_block_id
@@ -2995,13 +2711,13 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         let limit = checked_limit(limit)?;
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = match kind {
             Some(kind) => (
-                "SELECT n.raw, n.key, p.path, p.text_kind, t.preamble, t.searchable_text
+                "SELECT n.raw, n.key, p.path, p.text_kind, t.preamble
                  FROM pages AS p JOIN names AS n ON n.name_id = p.name_id
                  LEFT JOIN page_text AS t USING (page_id) WHERE p.text_kind = ?1 ORDER BY p.path, p.page_id LIMIT ?2",
                 vec![kind.into(), limit.into()],
             ),
             None => (
-                "SELECT n.raw, n.key, p.path, p.text_kind, t.preamble, t.searchable_text
+                "SELECT n.raw, n.key, p.path, p.text_kind, t.preamble
                  FROM pages AS p JOIN names AS n ON n.name_id = p.name_id
                  LEFT JOIN page_text AS t USING (page_id) ORDER BY p.path, p.page_id LIMIT ?1",
                 vec![limit.into()],
@@ -3339,118 +3055,6 @@ impl<'a> SqliteGraphProjectionRead<'a> {
             },
         );
         collect_read_rows(rows, page_referrer_candidate_row_output_bytes)
-    }
-
-    /// Page-level candidates for one normalized literal phrase under the
-    /// indexed `unicode61` token contract. Punctuation may make this
-    /// overinclusive; the application parser decides exact membership.
-    pub fn plain_text_candidate_pages_after(
-        &self,
-        normalized_phrase: &str,
-        after: Option<i64>,
-        limit: usize,
-    ) -> Result<Vec<PhysicalPlainTextCandidatePageRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        checked_query_text(normalized_phrase)?;
-        if normalized_phrase.trim().is_empty()
-            || !normalized_phrase.chars().any(char::is_alphanumeric)
-        {
-            return Err(MaterializationError::InvalidQuery(
-                "normalized literal phrase has no unicode61 word token".into(),
-            ));
-        }
-        let phrase = format!("\"{}\"", normalized_phrase.replace('"', "\"\""));
-        let (sql, args): (&str, Vec<rusqlite::types::Value>) = match after {
-            None => (
-                "SELECT DISTINCT owner.page_id, pages.path
-                 FROM search_fts
-                 JOIN search_fts_owners owner ON owner.rowid = search_fts.rowid
-                 JOIN pages ON pages.page_id = owner.page_id
-                 WHERE normalized_text MATCH ?1
-                 ORDER BY owner.page_id LIMIT ?2",
-                vec![phrase.into(), limit.into()],
-            ),
-            Some(page_id) => (
-                "SELECT DISTINCT owner.page_id, pages.path
-                 FROM search_fts
-                 JOIN search_fts_owners owner ON owner.rowid = search_fts.rowid
-                 JOIN pages ON pages.page_id = owner.page_id
-                 WHERE normalized_text MATCH ?1 AND owner.page_id > ?2
-                 ORDER BY owner.page_id LIMIT ?3",
-                vec![phrase.into(), page_id.into(), limit.into()],
-            ),
-        };
-        let mut statement = self.connection.prepare(sql)?;
-        let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
-            Ok(PhysicalPlainTextCandidatePageRow {
-                cursor: row.get(0)?,
-                page_path: row.get(1)?,
-            })
-        })?;
-        collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from)),
-            |row| checked_output_bytes(16, [Some(row.page_path.as_str())]),
-        )
-    }
-
-    /// Page-level candidates for the legacy ordered-subsequence matcher.
-    /// Stored text is already application-normalized, so SQLite only selects
-    /// pages; the parser-owned matcher still ranks blocks and produces evidence.
-    pub fn fuzzy_subsequence_candidate_pages_after(
-        &self,
-        normalized_needle: &str,
-        after: Option<i64>,
-        limit: usize,
-    ) -> Result<Vec<PhysicalFuzzyCandidatePageRow>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        checked_query_text(normalized_needle)?;
-        if normalized_needle.is_empty() {
-            return Err(MaterializationError::InvalidQuery(
-                "normalized fuzzy needle must be non-empty".into(),
-            ));
-        }
-        let mut pattern = String::with_capacity(normalized_needle.len().saturating_mul(2) + 1);
-        pattern.push('%');
-        for character in normalized_needle.chars() {
-            if matches!(character, '%' | '_' | '\\') {
-                pattern.push('\\');
-            }
-            pattern.push(character);
-            pattern.push('%');
-        }
-        checked_query_text(&pattern)?;
-        let (sql, args): (&str, Vec<rusqlite::types::Value>) = match after {
-            None => (
-                "SELECT DISTINCT owner.page_id, pages.path
-                 FROM search_substring_fts AS substring
-                 JOIN search_fts_owners AS owner ON owner.rowid = substring.rowid
-                 JOIN pages ON pages.page_id = owner.page_id
-                 WHERE substring.normalized_text LIKE ?1 ESCAPE '\\'
-                 ORDER BY owner.page_id LIMIT ?2",
-                vec![pattern.into(), limit.into()],
-            ),
-            Some(page_id) => (
-                "SELECT DISTINCT owner.page_id, pages.path
-                 FROM search_substring_fts AS substring
-                 JOIN search_fts_owners AS owner ON owner.rowid = substring.rowid
-                 JOIN pages ON pages.page_id = owner.page_id
-                 WHERE substring.normalized_text LIKE ?1 ESCAPE '\\'
-                   AND owner.page_id > ?2
-                 ORDER BY owner.page_id LIMIT ?3",
-                vec![pattern.into(), page_id.into(), limit.into()],
-            ),
-        };
-        let mut statement = self.connection.prepare(sql)?;
-        let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
-            Ok(PhysicalFuzzyCandidatePageRow {
-                cursor: row.get(0)?,
-                path: row.get(1)?,
-            })
-        })?;
-        collect_read_rows(
-            rows.map(|row| row.map_err(MaterializationError::from)),
-            |row| checked_output_bytes(16, [Some(row.path.as_str())]),
-        )
     }
 
     /// Stable block owners for one canonical property key. Rows are candidates:
@@ -3892,49 +3496,6 @@ impl<'a> SqliteGraphProjectionRead<'a> {
             task_candidate_locator_row_output_bytes,
         )
     }
-
-    pub fn search(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<PhysicalSearchHit>, MaterializationError> {
-        let limit = checked_limit(limit)?;
-        checked_query_text(query)?;
-        if query.trim().is_empty() {
-            return Err(MaterializationError::InvalidQuery(
-                "FTS query must be non-empty".into(),
-            ));
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT owner.entity_type,
-                    CASE owner.entity_type WHEN 0 THEN p.path ELSE b.result_id END,
-                    p.path, search_fts.text, bm25(search_fts)
-             FROM search_fts JOIN search_fts_owners owner ON owner.rowid = search_fts.rowid
-             JOIN pages p ON p.page_id = owner.page_id
-             LEFT JOIN blocks b ON owner.entity_type = 1 AND b.block_id = owner.entity_id
-             WHERE search_fts MATCH ?1
-             ORDER BY bm25(search_fts), owner.entity_type, owner.entity_id LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![query, limit], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, f64>(4)?,
-            ))
-        })?;
-        let rows = rows.map(|row| {
-            let (entity_type, entity_id, page_path, text, rank) = row?;
-            Ok(PhysicalSearchHit {
-                entity: public_entity(entity_type, entity_id)?,
-                page_path,
-                text,
-                rank,
-            })
-        });
-        collect_read_rows(rows, search_hit_output_bytes)
-    }
 }
 
 fn page_row_with_header_validation(
@@ -3952,7 +3513,6 @@ fn page_row_with_header_validation(
         path,
         text_kind: kind,
         preamble: row.get(4)?,
-        searchable_text: row.get(5)?,
     }))
 }
 
@@ -3980,20 +3540,19 @@ fn navigation_page_row_with_header_validation(
 }
 
 fn block_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhysicalBlockRow> {
-    let heading_level: Option<i64> = row.get(6)?;
-    let logseq_uuid: Option<Vec<u8>> = row.get(8)?;
-    let origin: Option<i64> = row.get(9)?;
+    let heading_level: Option<i64> = row.get(5)?;
+    let logseq_uuid: Option<Vec<u8>> = row.get(7)?;
+    let origin: Option<i64> = row.get(8)?;
     Ok(PhysicalBlockRow {
         result_id: row.get(0)?,
         page_path: row.get(1)?,
         parent: row.get(2)?,
         order: row.get(3)?,
         content: row.get(4)?,
-        searchable_text: row.get(5)?,
         heading_level: heading_level
             .map(|value| u8::try_from(value).map_err(sql_decode_error))
             .transpose()?,
-        collapsed: row.get::<_, i64>(7)? != 0,
+        collapsed: row.get::<_, i64>(6)? != 0,
         logseq_uuid: logseq_uuid.as_deref().map(decode_id_sql).transpose()?,
         logseq_identity_origin: origin,
     })
