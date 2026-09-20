@@ -19,6 +19,30 @@ frontier-stamped SQLite database and its file set) was deleted after Tine
 removed Managed Storage (Tine ADR 0066); it lives in git history up to
 v0.24.0. Nothing here reads or writes its formats.
 
+## Disposable projection build and publication
+
+`PhysicalGraphProjectionDatabase::create_fresh_build` exclusively creates a
+new unpublished SQLite file with `journal_mode=OFF` and `synchronous=OFF`.
+Callers populate it through the ordinary schema and apply methods, run
+`optimize`, close it, drain the active projection's readers and writer, resolve
+the old WAL and sidecars, then publish it with
+`DurableDirectoryPublication::replace_from_staged_regular_single_writer`.
+
+The publication operation accepts only two safe names in one retained
+directory and only regular no-follow files. It flushes and closes the staged
+file, performs the platform's existing native atomic replacement, applies the
+existing directory/write-through durability policy, and verifies that the
+staged file identity is installed. It neither loads nor copies the database
+bytes. The caller must hold the exclusive writer lease; the filesystem API does
+not manage SQLite handles or sidecars.
+
+Journal-OFF staging has no rollback guarantee. Any failed staging write
+invalidates the whole unpublished image, which must be closed and discarded.
+Published and incrementally updated projections continue to use
+`open_writable` with WAL/NORMAL. If publication reports an error after the
+native replacement, it leaves the destination untouched for reopen validation
+or cache rebuild and never guesses that rollback is possible.
+
 ## Immutable package publication
 
 `publish_package_noclobber`, `retire_package`, and `recover_package_store`

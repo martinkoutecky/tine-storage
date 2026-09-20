@@ -8,12 +8,7 @@ use std::fs;
 use std::io::{self, ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "android",
-    all(test, unix)
-))]
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
@@ -358,6 +353,59 @@ impl DurableDirectoryPublication {
         }
     }
 
+    /// Atomically install a caller-owned staged cache file under an active
+    /// name in this retained directory, creating or replacing one regular
+    /// destination file.
+    ///
+    /// The caller must hold the namespace's exclusive writer lease. For a
+    /// SQLite projection it must also drain readers and writers, checkpoint
+    /// the old WAL, close every conflicting handle, and resolve sidecars
+    /// before this call; this filesystem operation does not manage SQLite
+    /// state. The staged file is flushed, closed, moved without reading or
+    /// copying its contents, and the published regular-file identity is
+    /// verified. Source and destination are single entry names and may not be
+    /// equal; symlinks and other non-regular entries are refused.
+    ///
+    /// An error after the native replacement can mean the staged identity is
+    /// already installed. This method deliberately does not delete the
+    /// destination on any error; the caller must reopen and validate or rebuild
+    /// the disposable cache.
+    pub fn replace_from_staged_regular_single_writer(
+        &self,
+        source_name: &str,
+        destination_name: &str,
+    ) -> Result<(), FilesystemError> {
+        validate_single_entry_name(source_name)?;
+        validate_single_entry_name(destination_name)?;
+        if source_name == destination_name {
+            return Err(FilesystemError::UnsafeEntry(
+                "source and destination names must differ".into(),
+            ));
+        }
+        validate_staged_regular_replacement_entries(&self.dir, source_name, destination_name)?;
+
+        #[cfg(windows)]
+        {
+            self.windows.validate()?;
+            return self.windows.replace_from_staged_regular_single_writer(
+                &self.dir,
+                source_name,
+                destination_name,
+            );
+        }
+        #[cfg(unix)]
+        {
+            replace_from_staged_regular_unix(&self.dir, source_name, destination_name)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (source_name, destination_name);
+            Err(FilesystemError::DurableNameOperationUnavailable(
+                "staged regular-file replacement is unsupported on this target".into(),
+            ))
+        }
+    }
+
     /// Retire an authority by a no-replace same-directory rename to a fresh
     /// name outside that authority's selector grammar.
     ///
@@ -381,6 +429,140 @@ fn validate_single_entry_name(name: &str) -> Result<(), FilesystemError> {
         )));
     }
     Ok(())
+}
+
+fn validate_staged_regular_replacement_entries(
+    dir: &Dir,
+    source_name: &str,
+    destination_name: &str,
+) -> Result<(), FilesystemError> {
+    let source = dir
+        .symlink_metadata(source_name)
+        .map_err(FilesystemError::from)?;
+    if source.file_type().is_symlink() || !source.is_file() {
+        return Err(FilesystemError::UnsafeEntry(format!(
+            "staged source is not a regular no-follow file: {source_name}"
+        )));
+    }
+    match dir.symlink_metadata(destination_name) {
+        Ok(destination) if destination.file_type().is_symlink() || !destination.is_file() => {
+            Err(FilesystemError::UnsafeEntry(format!(
+                "publication destination is not a regular no-follow file: {destination_name}"
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+type UnixFileIdentity = (u64, u64);
+
+#[cfg(unix)]
+fn open_flushed_staged_regular_unix(
+    dir: &Dir,
+    name: &str,
+) -> Result<(fs::File, UnixFileIdentity), FilesystemError> {
+    let name_c = CString::new(name)
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid staged filename"))?;
+    // SAFETY: `name_c` and the retained directory descriptor remain live for
+    // the call. O_NOFOLLOW binds regular-file validation and flushing to the
+    // exact staged identity which will be renamed after this handle closes.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_fd().as_raw_fd(),
+            name_c.as_ptr(),
+            libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: openat returned one newly owned descriptor.
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(FilesystemError::UnsafeEntry(format!(
+            "staged source is not a regular no-follow file: {name}"
+        )));
+    }
+    file.sync_all()?;
+    Ok((file, (metadata.dev(), metadata.ino())))
+}
+
+#[cfg(unix)]
+fn verify_unix_regular_identity(
+    dir: &Dir,
+    name: &str,
+    expected: UnixFileIdentity,
+) -> Result<(), FilesystemError> {
+    let file = open_file_nofollow(dir, name)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || (metadata.dev(), metadata.ino()) != expected {
+        return Err(FilesystemError::ByteCollision);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+fn finish_staged_regular_replacement_sync(
+    dir: &Dir,
+    destination_name: &str,
+    expected: UnixFileIdentity,
+    result: io::Result<()>,
+) -> Result<(), FilesystemError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) if android_durability_capability_refusal(&error) => {
+            verify_unix_regular_identity(dir, destination_name, expected)?;
+            let (published, identity) = open_flushed_staged_regular_unix(dir, destination_name)?;
+            drop(published);
+            if identity != expected {
+                return Err(FilesystemError::ByteCollision);
+            }
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(all(unix, not(target_os = "android")))]
+fn finish_staged_regular_replacement_sync(
+    _dir: &Dir,
+    _destination_name: &str,
+    _expected: UnixFileIdentity,
+    result: io::Result<()>,
+) -> Result<(), FilesystemError> {
+    result.map_err(Into::into)
+}
+
+#[cfg(unix)]
+fn replace_from_staged_regular_unix(
+    dir: &Dir,
+    source_name: &str,
+    destination_name: &str,
+) -> Result<(), FilesystemError> {
+    let publication_sync = ValidatedDirectorySync::open(dir)?;
+    publication_sync.preflight()?;
+    let (source, source_identity) = open_flushed_staged_regular_unix(dir, source_name)?;
+    drop(source);
+
+    // This is the same cap-std native same-directory replacement already used
+    // by replace_regular_exact_unix; no second OS rename implementation exists.
+    dir.rename(source_name, dir, destination_name)?;
+    finish_staged_regular_replacement_sync(
+        dir,
+        destination_name,
+        source_identity,
+        publication_sync.sync(),
+    )?;
+    verify_unix_regular_identity(dir, destination_name, source_identity)?;
+    match dir.symlink_metadata(source_name) {
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(FilesystemError::ByteCollision),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[cfg(not(windows))]
@@ -729,6 +911,36 @@ impl WindowsWriteThroughDirectory {
             }
         }
     }
+
+    fn replace_from_staged_regular_single_writer(
+        &self,
+        dir: &Dir,
+        source_name: &str,
+        destination_name: &str,
+    ) -> Result<(), FilesystemError> {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).follow(FollowSymlinks::No);
+        let source = dir.open_with(source_name, &options)?.into_std();
+        reject_windows_reparse(&source, source_name)?;
+        let metadata = source.metadata()?;
+        if !metadata.is_file() {
+            return Err(FilesystemError::UnsafeEntry(format!(
+                "staged source is not a regular no-follow file: {source_name}"
+            )));
+        }
+        source.sync_all()?;
+        let source_identity = windows_file_identity(&source)?;
+        drop(source);
+
+        validate_windows_existing_regular_destination(dir, destination_name)?;
+        self.move_write_through(source_name, destination_name, true)?;
+        verify_windows_regular_identity(dir, destination_name, source_identity)?;
+        match dir.symlink_metadata(source_name) {
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+            Ok(_) => Err(FilesystemError::ByteCollision),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -940,6 +1152,20 @@ fn verify_windows_regular_exact(
     Ok(())
 }
 
+#[cfg(windows)]
+fn verify_windows_regular_identity(
+    dir: &Dir,
+    name: &str,
+    expected_identity: WindowsFileIdentity,
+) -> Result<(), FilesystemError> {
+    let file = open_file_nofollow(dir, name)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || windows_file_identity(&file)? != expected_identity {
+        return Err(FilesystemError::ByteCollision);
+    }
+    Ok(())
+}
+
 pub fn ensure_directory_nofollow(root: &Dir, name: &str) -> Result<(), FilesystemError> {
     match root.symlink_metadata(name) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -1051,7 +1277,33 @@ pub fn open_dir_nofollow(dir: &Dir, path: &str) -> Result<Dir, FilesystemError> 
 fn reject_windows_reparse(file: &fs::File, path: &str) -> io::Result<()> {
     use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
-    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+    reject_windows_reparse_classification(
+        file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+        path,
+    )
+}
+
+#[cfg(windows)]
+fn validate_windows_existing_regular_destination(
+    dir: &Dir,
+    path: &str,
+) -> Result<(), FilesystemError> {
+    let destination = match open_file_nofollow(dir, path) {
+        Ok(destination) => destination,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !destination.metadata()?.is_file() {
+        return Err(FilesystemError::UnsafeEntry(format!(
+            "publication destination is not a regular no-follow file: {path}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(test, windows))]
+fn reject_windows_reparse_classification(is_reparse: bool, path: &str) -> io::Result<()> {
+    if is_reparse {
         return Err(io::Error::new(
             ErrorKind::InvalidData,
             format!("opened path is a reparse point: {path}"),
@@ -1307,6 +1559,10 @@ fn verify_existing(dir: &Dir, filename: &str, expected: &[u8]) -> Result<(), Fil
 
 #[cfg(test)]
 const RENAME_NOREPLACE_SUPPORTED_TARGETS: &[&str] =
+    &["linux", "macos", "ios", "android", "windows"];
+
+#[cfg(test)]
+const STAGED_REGULAR_REPLACEMENT_SUPPORTED_TARGETS: &[&str] =
     &["linux", "macos", "ios", "android", "windows"];
 
 #[cfg(test)]
@@ -1605,6 +1861,17 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn test_file_identity(dir: &Dir, name: &str) -> (u64, u64) {
+        let metadata = open_file_nofollow(dir, name).unwrap().metadata().unwrap();
+        (metadata.dev(), metadata.ino())
+    }
+
+    #[cfg(windows)]
+    fn test_file_identity(dir: &Dir, name: &str) -> WindowsFileIdentity {
+        windows_file_identity(&open_file_nofollow(dir, name).unwrap()).unwrap()
+    }
+
     #[cfg(not(windows))]
     fn temporary_entries(dir: &Dir) -> Vec<String> {
         dir.entries()
@@ -1814,6 +2081,111 @@ mod tests {
     }
 
     #[test]
+    fn staged_regular_publication_creates_or_replaces_by_atomic_identity() {
+        let fixture = TestDirectory::new("staged-regular-replacement");
+        let publication = DurableDirectoryPublication::open(&fixture.dir).unwrap();
+
+        fixture.dir.write("staged-new", b"new bytes").unwrap();
+        let new_identity = test_file_identity(&fixture.dir, "staged-new");
+        publication
+            .replace_from_staged_regular_single_writer("staged-new", "active-new")
+            .unwrap();
+        assert!(fixture.dir.symlink_metadata("staged-new").is_err());
+        assert_eq!(fixture.dir.read("active-new").unwrap(), b"new bytes");
+        assert_eq!(test_file_identity(&fixture.dir, "active-new"), new_identity);
+
+        fixture.dir.write("active", b"old bytes").unwrap();
+        let old_identity = test_file_identity(&fixture.dir, "active");
+        fixture.dir.write("staged", b"replacement bytes").unwrap();
+        let staged_identity = test_file_identity(&fixture.dir, "staged");
+        publication
+            .replace_from_staged_regular_single_writer("staged", "active")
+            .unwrap();
+        assert!(fixture.dir.symlink_metadata("staged").is_err());
+        assert_eq!(fixture.dir.read("active").unwrap(), b"replacement bytes");
+        assert_eq!(test_file_identity(&fixture.dir, "active"), staged_identity);
+        assert_ne!(test_file_identity(&fixture.dir, "active"), old_identity);
+    }
+
+    #[test]
+    fn staged_regular_publication_refuses_invalid_entries_without_clobbering() {
+        let fixture = TestDirectory::new("staged-regular-refusals");
+        let publication = DurableDirectoryPublication::open(&fixture.dir).unwrap();
+        fixture.dir.write("active", b"old bytes").unwrap();
+        fixture.dir.write("staged", b"replacement bytes").unwrap();
+
+        for (source, destination) in [
+            ("../staged", "active"),
+            ("staged", "../active"),
+            ("staged", "staged"),
+            ("missing", "active"),
+        ] {
+            assert!(publication
+                .replace_from_staged_regular_single_writer(source, destination)
+                .is_err());
+            assert_eq!(fixture.dir.read("active").unwrap(), b"old bytes");
+            assert_eq!(fixture.dir.read("staged").unwrap(), b"replacement bytes");
+        }
+
+        fixture.dir.create_dir("directory").unwrap();
+        assert!(publication
+            .replace_from_staged_regular_single_writer("staged", "directory")
+            .is_err());
+        assert_eq!(fixture.dir.read("active").unwrap(), b"old bytes");
+        assert_eq!(fixture.dir.read("staged").unwrap(), b"replacement bytes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_regular_publication_refuses_symlinks_without_touching_targets() {
+        let fixture = TestDirectory::new("staged-regular-symlinks");
+        let publication = DurableDirectoryPublication::open(&fixture.dir).unwrap();
+        fixture.dir.write("target", b"target bytes").unwrap();
+        fixture.dir.write("staged", b"replacement bytes").unwrap();
+        fixture.dir.symlink("target", "destination-link").unwrap();
+        fixture.dir.symlink("target", "source-link").unwrap();
+
+        assert!(publication
+            .replace_from_staged_regular_single_writer("staged", "destination-link")
+            .is_err());
+        assert!(publication
+            .replace_from_staged_regular_single_writer("source-link", "active")
+            .is_err());
+        assert_eq!(fixture.dir.read("target").unwrap(), b"target bytes");
+        assert_eq!(fixture.dir.read("staged").unwrap(), b"replacement bytes");
+        assert!(fixture.dir.symlink_metadata("active").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_regular_publication_preserves_installed_identity_on_post_rename_sync_error() {
+        let fixture = TestDirectory::new("staged-regular-post-rename-sync-error");
+        fixture.dir.write("active", b"old bytes").unwrap();
+        fixture.dir.write("staged", b"replacement bytes").unwrap();
+        let staged_identity = test_file_identity(&fixture.dir, "staged");
+
+        fixture
+            .dir
+            .rename("staged", &fixture.dir, "active")
+            .unwrap();
+        let error = finish_staged_regular_replacement_sync(
+            &fixture.dir,
+            "active",
+            staged_identity,
+            Err(io::Error::from_raw_os_error(libc::EIO)),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            FilesystemError::Io(error) if error.raw_os_error() == Some(libc::EIO)
+        ));
+        assert!(fixture.dir.symlink_metadata("staged").is_err());
+        assert_eq!(fixture.dir.read("active").unwrap(), b"replacement bytes");
+        assert_eq!(test_file_identity(&fixture.dir, "active"), staged_identity);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn interrupted_hard_link_move_finishes_only_for_the_same_exact_inode() {
         let fixture = TestDirectory::new("interrupted-hard-link-move");
@@ -1978,9 +2350,24 @@ mod tests {
     }
 
     #[test]
+    fn windows_existing_destination_rejects_honest_provider_reparse_file() {
+        let error = reject_windows_reparse_classification(true, "active").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert!(reject_windows_reparse_classification(false, "active").is_ok());
+    }
+
+    #[test]
     fn no_replace_supported_target_set_is_pinned() {
         assert_eq!(
             RENAME_NOREPLACE_SUPPORTED_TARGETS,
+            ["linux", "macos", "ios", "android", "windows"]
+        );
+    }
+
+    #[test]
+    fn staged_regular_replacement_supported_target_set_is_pinned() {
+        assert_eq!(
+            STAGED_REGULAR_REPLACEMENT_SUPPORTED_TARGETS,
             ["linux", "macos", "ios", "android", "windows"]
         );
     }

@@ -130,6 +130,20 @@ fn standalone_graph_projection_is_usable_without_managed_storage_types() {
     }
 }
 
+#[test]
+fn fresh_projection_build_is_usable_from_the_public_api() {
+    let path = std::env::temp_dir().join(format!(
+        "tine-storage-public-fresh-projection-{}.sqlite",
+        Uuid::new_v4()
+    ));
+    let database = PhysicalGraphProjectionDatabase::create_fresh_build(&path).unwrap();
+    database.initialize_schema().unwrap();
+    database.optimize().unwrap();
+    database.quick_check().unwrap();
+    drop(database);
+    std::fs::remove_file(path).unwrap();
+}
+
 /// The whole point of `formats`: a release or pin receipt is *generated* from
 /// the manifest by someone outside this crate. If the manifest's row type is
 /// not fully public, that consumer has to hand-transcribe values instead —
@@ -170,7 +184,7 @@ fn a_receipt_can_be_generated_from_the_public_manifest() {
 
 #[test]
 #[cfg(any(unix, windows))]
-fn durable_publication_exposes_create_replace_move_and_retire_to_a_consumer() {
+fn durable_publication_exposes_create_replace_staged_move_and_retire_to_a_consumer() {
     let root = std::env::temp_dir().join(format!("tine-storage-public-durable-{}", Uuid::new_v4()));
     std::fs::create_dir(&root).unwrap();
     let dir = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
@@ -188,6 +202,10 @@ fn durable_publication_exposes_create_replace_move_and_retire_to_a_consumer() {
     publication
         .move_exact_no_replace("staged", "published", b"staged")
         .unwrap();
+    dir.write("staged-cache", b"cache replacement").unwrap();
+    publication
+        .replace_from_staged_regular_single_writer("staged-cache", "published")
+        .unwrap();
     publication
         .retire_exact("schema-2-anchor", ".retired-schema-2-anchor", b"new")
         .unwrap();
@@ -200,7 +218,10 @@ fn durable_publication_exposes_create_replace_move_and_retire_to_a_consumer() {
         std::fs::read(root.join("private-schema-2-anchor")).unwrap(),
         b"private"
     );
-    assert_eq!(std::fs::read(root.join("published")).unwrap(), b"staged");
+    assert_eq!(
+        std::fs::read(root.join("published")).unwrap(),
+        b"cache replacement"
+    );
     drop(publication);
     drop(dir);
     std::fs::remove_dir_all(root).unwrap();

@@ -18,6 +18,12 @@ one contentless, detail-free, case-sensitive trigram FTS5 table whose rowids are
 those same disjoint page/block coordinates; application-folded `search_tokens`
 are indexed but cannot be read back as text.
 
+Fresh projection construction may use an unpublished journal-OFF staging file
+which is atomically installed only after completion. That changes build and
+publication mechanics, not schema 30 or its compatibility identity. Ordinary
+published writers reopen the installed file in WAL/NORMAL mode; a failed
+staging write is discarded rather than recovered or interpreted as authority.
+
 The Managed Storage formats (oplog manifest/object protocol, local journal v1
 and v2, sealed accepted-history index, engine scratch, checkpoint fingerprints,
 and the managed on-disk layout vocabulary) were deleted in 0.25.0 together

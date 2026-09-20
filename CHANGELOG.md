@@ -7,6 +7,24 @@ independently in `src/formats.rs` and summarized in
 
 ## Unreleased
 
+### Added
+
+- `PhysicalGraphProjectionDatabase::create_fresh_build` exclusively creates an
+  unpublished projection with journal and synchronous writes disabled, and
+  `optimize` completes SQLite's bounded post-build maintenance. Any failed
+  staged write invalidates that disposable image; normal published writers
+  remain WAL/NORMAL with transactional rollback.
+- `DurableDirectoryPublication::replace_from_staged_regular_single_writer`
+  flushes and atomically installs a same-directory staged regular cache file,
+  creating or replacing a regular destination through the existing native
+  name-operation and durability policy. It preserves file identity without a
+  whole-database byte load or second copy and never removes an installed
+  destination on an outcome-ambiguous error.
+
+Unit cost: none per edit. The new path applies only to a whole-projection
+rebuild and writes the staged SQLite image once; publication is a metadata
+replacement with no reserialization or retained snapshot.
+
 ### Changed
 
 - Schema 30 now keeps exactly one raw document-text copy: page preamble in

@@ -166,6 +166,64 @@ mod compact_key_tests {
     }
 
     #[test]
+    fn fresh_build_is_off_only_refuses_reuse_and_reopens_in_wal() {
+        let path = file("fresh-build");
+        let mut db = PhysicalGraphProjectionDatabase::create_fresh_build(&path).unwrap();
+        assert_eq!(
+            db.connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "off"
+        );
+        assert_eq!(
+            db.connection
+                .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        db.initialize_schema().unwrap();
+        db.apply(&change(
+            page("pages/a.md", "A", vec![block("b-a", None)]),
+            Vec::new(),
+        ))
+        .unwrap();
+        db.optimize().unwrap();
+        db.quick_check().unwrap();
+        drop(db);
+
+        assert!(PhysicalGraphProjectionDatabase::create_fresh_build(&path).is_err());
+        let reopened = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        assert_eq!(
+            reopened
+                .connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "wal"
+        );
+        assert_eq!(
+            reopened
+                .connection
+                .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(reopened.read().block("b-a").unwrap().is_some());
+        drop(reopened);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    #[test]
+    fn fresh_build_refuses_an_unrelated_preexisting_file_without_changing_it() {
+        let path = file("fresh-build-collision");
+        std::fs::write(&path, b"not a projection").unwrap();
+        assert!(PhysicalGraphProjectionDatabase::create_fresh_build(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a projection");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn integer_coordinates_names_and_one_postings_representation() {
         let path = file("shape");
         let mut db = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
@@ -743,6 +801,60 @@ pub struct PhysicalGraphProjectionDatabase {
 pub const MIN_PAGE_CACHE_BUDGET_BYTES: u64 = 2 * 1024 * 1024;
 
 impl PhysicalGraphProjectionDatabase {
+    /// Create a disposable, unpublished projection build at a path that must
+    /// not already exist.
+    ///
+    /// This connection uses `journal_mode=OFF` and `synchronous=OFF` to avoid
+    /// writing a second copy of a fresh cache image. Those settings are safe
+    /// only because the file is staging state and cannot be observed as the
+    /// active projection. **Any write error invalidates the entire staging
+    /// image:** the caller must close and discard it, must not continue using
+    /// it, and must not rely on transaction rollback in OFF mode. Complete the
+    /// build, call [`Self::optimize`], close the connection, then publish it
+    /// through the storage-owned staged-file publication primitive.
+    ///
+    /// Ordinary active databases must use [`Self::open_writable`], which keeps
+    /// WAL/NORMAL transaction and rollback behavior.
+    pub fn create_fresh_build(path: &Path) -> Result<Self, MaterializationError> {
+        let staging_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    MaterializationError::InvalidInput(format!(
+                        "fresh projection staging path already exists: {}",
+                        path.display()
+                    ))
+                } else {
+                    MaterializationError::Sqlite(format!(
+                        "could not create fresh projection staging file {}: {error}",
+                        path.display()
+                    ))
+                }
+            })?;
+        drop(staging_file);
+
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_STATEMENTS);
+        connection.execute_batch(
+            "PRAGMA journal_mode = OFF;
+             PRAGMA synchronous = OFF;
+             PRAGMA foreign_keys = ON;
+             PRAGMA trusted_schema = OFF;",
+        )?;
+        Ok(Self {
+            connection,
+            last_apply_deferred_indexes: std::cell::Cell::new(false),
+        })
+    }
+
     pub fn open_writable(path: &Path) -> Result<Self, MaterializationError> {
         let connection = Connection::open_with_flags(
             path,
@@ -1102,6 +1214,13 @@ impl PhysicalGraphProjectionDatabase {
     pub fn checkpoint_truncate(&self) -> Result<(), MaterializationError> {
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+        Ok(())
+    }
+
+    /// Let SQLite finalize planner statistics and other bounded maintenance
+    /// after a complete projection build.
+    pub fn optimize(&self) -> Result<(), MaterializationError> {
+        self.connection.execute_batch("PRAGMA optimize")?;
         Ok(())
     }
 }
