@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
+#[cfg(test)]
 use cap_std::fs::Dir;
 
 use crate::sqlite_materialization::{
