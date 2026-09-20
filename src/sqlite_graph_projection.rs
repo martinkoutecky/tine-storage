@@ -303,6 +303,7 @@ mod compact_key_tests {
             !unrelated_root.join("projection.sqlite").exists(),
             "a mismatched directory reported false publication success"
         );
+        drop(unrelated_dir);
         std::fs::remove_dir_all(root).unwrap();
     }
 
