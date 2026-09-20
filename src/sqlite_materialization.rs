@@ -973,6 +973,17 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 47] = [
 pub(crate) fn initialize_graph_projection_schema(
     connection: &Connection,
 ) -> Result<(), MaterializationError> {
+    initialize_graph_projection_schema_without_secondary_indexes(connection)?;
+    create_deferred_indexes(connection)?;
+    Ok(())
+}
+
+/// Initialize the tables, primary-key indexes, and contentless FTS table used
+/// by a brand-new unpublished build. Ordinary secondary indexes are omitted so
+/// the fresh-build transaction can create them once after all streamed rows.
+pub(crate) fn initialize_graph_projection_schema_without_secondary_indexes(
+    connection: &Connection,
+) -> Result<(), MaterializationError> {
     connection.execute_batch(&format!(
         "{NAMES_DDL};
          {PAGES_DDL};
@@ -988,40 +999,7 @@ pub(crate) fn initialize_graph_projection_schema(
          {BLOCK_PATH_REFS_DDL};
          {QUERY_PROJECTION_STATE_DDL};
          {PROPERTY_ATOMS_DDL};
-         {SEARCH_FTS_DDL};
-         {NAMES_RAW_KEY_INDEX_DDL};
-         {PAGES_NAME_INDEX_DDL};
-         {PAGES_JOURNAL_DAY_INDEX_DDL};
-         {PAGES_PATH_INDEX_DDL};
-         {BLOCKS_PAGE_ORDER_INDEX_DDL};
-         {BLOCKS_PARENT_PAGE_INDEX_DDL};
-         {BLOCKS_LOGSEQ_UUID_INDEX_DDL};
-         {REFERENCE_POSTINGS_SOURCE_INDEX_DDL};
-         {REFERENCE_POSTINGS_TARGET_NAME_INDEX_DDL};
-         {REFERENCE_POSTINGS_OCCURRENCE_INDEX_DDL};
-         {REFERENCE_POSTINGS_OWN_INDEX_DDL};
-         {REFERENCE_POSTINGS_RAW_UUID_INDEX_DDL};
-         {REFERENCE_POSTINGS_NAVIGATION_NAMES_INDEX_DDL};
-         {REFERENCE_ALIAS_DECLARATIONS_SOURCE_INDEX_DDL};
-         {REFERENCE_ALIAS_DECLARATIONS_NAME_INDEX_DDL};
-         {PROPERTIES_LOOKUP_INDEX_DDL};
-         {PROPERTIES_PAGE_INDEX_DDL};
-         {TAGS_LOOKUP_INDEX_DDL};
-         {TAGS_PAGE_INDEX_DDL};
-         {TASKS_MARKER_INDEX_DDL};
-         {TASKS_DEADLINE_INDEX_DDL};
-         {TASKS_PAGE_INDEX_DDL};
-         {BLOCK_PLANNING_PRIORITY_INDEX_DDL};
-         {BLOCK_PLANNING_SCHEDULED_DAY_INDEX_DDL};
-         {BLOCK_PLANNING_DEADLINE_DAY_INDEX_DDL};
-         {BLOCK_PLANNING_SCHEDULED_INDEX_DDL};
-         {BLOCK_PLANNING_DEADLINE_INDEX_DDL};
-         {BLOCK_PATH_REFS_LOOKUP_INDEX_DDL};
-         {BLOCK_PATH_REFS_PAGE_INDEX_DDL};
-         {PROPERTY_ATOMS_KEY_INDEX_DDL};
-         {PROPERTY_ATOMS_NUM_INDEX_DDL};
-         {PROPERTY_ATOMS_DAY_INDEX_DDL};
-         {PROPERTY_ATOMS_PAGE_INDEX_DDL};"
+         {SEARCH_FTS_DDL};"
     ))?;
     connection.execute("INSERT INTO query_projection_state VALUES (1, 0, 1)", [])?;
     Ok(())
@@ -1472,6 +1450,129 @@ pub(crate) fn apply_graph_projection_rows(
     }
     reclaim_affected_names(transaction, &affected_name_ids)?;
     Ok(instrumentation)
+}
+
+/// Append one bounded chunk to a brand-new unpublished projection whose
+/// ordinary secondary indexes have not been created yet.
+///
+/// This deliberately shares every row-level insertion helper with ordinary
+/// apply, but omits replacement cleanup and name reclamation: every page and
+/// block must be new for the lifetime of the build transaction. The schema's
+/// unique constraints are the final guard, while the explicit checks make a
+/// repeated chunk a typed input error rather than an accidental replacement.
+pub(crate) fn append_fresh_graph_projection_rows(
+    connection: &Connection,
+    change: &PhysicalGraphProjectionChange,
+    aliases: &[PhysicalAliasDeclaration],
+) -> Result<ApplyChangeInstrumentation, MaterializationError> {
+    validate_change_ownership(change, aliases)?;
+    if !change.deletions.is_empty() {
+        return Err(MaterializationError::InvalidInput(
+            "fresh projection append cannot delete pages".into(),
+        ));
+    }
+
+    let replacement_paths = change
+        .replacements
+        .iter()
+        .map(|page| page.path.as_str())
+        .collect::<BTreeSet<_>>();
+    if replacement_paths.len() != change.replacements.len() {
+        return Err(MaterializationError::InvalidInput(
+            "fresh projection append contains a duplicate page path".into(),
+        ));
+    }
+    for path in &replacement_paths {
+        let exists: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pages WHERE path = ?1)",
+            params![path],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Err(MaterializationError::InvalidInput(format!(
+                "fresh projection append repeats page path {path:?}"
+            )));
+        }
+    }
+
+    let block_count = change
+        .replacements
+        .iter()
+        .map(|page| page.blocks.len())
+        .sum::<usize>();
+    let allocated = allocate_entity_coordinates(
+        connection,
+        change.replacements.len().saturating_add(block_count),
+    )?;
+    let mut next = allocated.into_iter();
+    let page_ids = change
+        .replacements
+        .iter()
+        .map(|page| {
+            (
+                page.path.clone(),
+                next.next().expect("allocated fresh page coordinate"),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut block_ids = BTreeMap::new();
+    for page in &change.replacements {
+        for block in &page.blocks {
+            if block.result_id.is_empty() || block_ids.contains_key(&block.result_id) {
+                return Err(MaterializationError::InvalidInput(
+                    "fresh projection blocks contain an empty or duplicate result ID".into(),
+                ));
+            }
+            let exists: bool = connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM blocks WHERE result_id = ?1)",
+                params![&block.result_id],
+                |row| row.get(0),
+            )?;
+            if exists {
+                return Err(MaterializationError::InvalidInput(format!(
+                    "fresh projection append repeats block result ID {:?}",
+                    block.result_id
+                )));
+            }
+            block_ids.insert(
+                block.result_id.clone(),
+                next.next().expect("allocated fresh block coordinate"),
+            );
+        }
+    }
+
+    if !change.replacements.is_empty()
+        || !change.reference_postings.is_empty()
+        || !aliases.is_empty()
+    {
+        advance_query_projection_revision(connection)?;
+    }
+    for page in &change.replacements {
+        insert_page(connection, page, page_ids[&page.path], None, &block_ids)?;
+    }
+    insert_replacement_fts_rows(
+        connection,
+        &change.replacements,
+        &page_ids,
+        &block_ids,
+        None,
+    )?;
+    let mut own_memberships = DeferredOwnReferenceMemberships::new(&change.replacements);
+    for posting in &change.reference_postings {
+        let posting_id = insert_reference_posting(connection, posting)?;
+        own_memberships.capture_first_occurrence(posting, posting_id);
+    }
+    for alias in aliases {
+        insert_alias_declaration(connection, alias)?;
+    }
+    insert_deferred_own_reference_memberships(
+        connection,
+        &change.replacements,
+        &page_ids,
+        &block_ids,
+        &own_memberships,
+    )?;
+    Ok(ApplyChangeInstrumentation::default())
 }
 
 fn validate_change_ownership(

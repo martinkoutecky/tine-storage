@@ -132,16 +132,37 @@ fn standalone_graph_projection_is_usable_without_managed_storage_types() {
 
 #[test]
 fn fresh_projection_build_is_usable_from_the_public_api() {
-    let path = std::env::temp_dir().join(format!(
-        "tine-storage-public-fresh-projection-{}.sqlite",
+    let root = std::env::temp_dir().join(format!(
+        "tine-storage-public-fresh-projection-{}",
         Uuid::new_v4()
     ));
-    let database = PhysicalGraphProjectionDatabase::create_fresh_build(&path).unwrap();
-    database.initialize_schema().unwrap();
-    database.optimize().unwrap();
+    std::fs::create_dir(&root).unwrap();
+    let stage = root.join("stage.sqlite");
+    let dir = cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+    let publication = DurableDirectoryPublication::open(&dir).unwrap();
+    let build = PhysicalGraphProjectionDatabase::create_fresh_build(&stage, publication).unwrap();
+    let finalized = build
+        .finish(
+            &PhysicalGraphProjectionChange {
+                replacements: Vec::new(),
+                deletions: Vec::new(),
+                reference_postings: Vec::new(),
+            },
+            &[],
+            &[],
+            &[],
+        )
+        .unwrap();
+    finalized
+        .publish_replace_single_writer("projection.sqlite")
+        .unwrap();
+    let database =
+        PhysicalGraphProjectionDatabase::open_writable(&root.join("projection.sqlite")).unwrap();
+    database.validate_schema().unwrap();
     database.quick_check().unwrap();
     drop(database);
-    std::fs::remove_file(path).unwrap();
+    drop(dir);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// The whole point of `formats`: a release or pin receipt is *generated* from

@@ -23,10 +23,18 @@ v0.24.0. Nothing here reads or writes its formats.
 
 `PhysicalGraphProjectionDatabase::create_fresh_build` exclusively creates a
 new unpublished SQLite file with `journal_mode=OFF` and `synchronous=OFF`.
-Callers populate it through the ordinary schema and apply methods, run
-`optimize`, close it, drain the active projection's readers and writer, resolve
-the old WAL and sidecars, then publish it with
-`DurableDirectoryPublication::replace_from_staged_regular_single_writer`.
+It returns a `PhysicalGraphProjectionFreshBuild`: callers stream bounded,
+disjoint page chunks through one transaction while ordinary secondary indexes
+remain absent. Storage reuses the ordinary row insertion, name interning, FTS,
+reference, alias and integer-coordinate machinery, but the append-only path
+does no replacement cleanup or name reclamation. `finish` creates the indexes
+once, applies captured tail changes with those indexes live, reconciles final
+page order, optimizes, commits, checks and closes the file. Construction binds
+the ambient SQLite path to the exact regular-file identity in one retained
+`DurableDirectoryPublication`; a same-basename file in another directory is
+refused. `finish` returns the only token that can publish through that bound
+existing replacement primitive after the caller drains the active projection's
+readers and writer and resolves the old WAL/sidecars.
 
 The publication operation accepts only two safe names in one retained
 directory and only regular no-follow files. It flushes and closes the staged
@@ -36,8 +44,10 @@ staged file identity is installed. It neither loads nor copies the database
 bytes. The caller must hold the exclusive writer lease; the filesystem API does
 not manage SQLite handles or sidecars.
 
-Journal-OFF staging has no rollback guarantee. Any failed staging write
-invalidates the whole unpublished image, which must be closed and discarded.
+Journal-OFF staging has no rollback guarantee. Any failed append or finish, or
+dropping either the active build or its finalized token before publication,
+closes and discards the whole unpublished image. Repeated page paths and block
+IDs across chunks are errors; they are never interpreted as replacements.
 Published and incrementally updated projections continue to use
 `open_writable` with WAL/NORMAL. If publication reports an error after the
 native replacement, it leaves the destination untouched for reopen validation

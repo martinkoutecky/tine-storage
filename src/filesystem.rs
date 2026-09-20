@@ -9,13 +9,14 @@ use std::io::{self, ErrorKind, Read, Write};
 #[cfg(unix)]
 use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 #[cfg(windows)]
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 #[cfg(windows)]
 use std::os::windows::fs::MetadataExt as _;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle as _;
+use std::path::Path;
 #[cfg(windows)]
 use std::path::PathBuf;
 #[cfg(windows)]
@@ -402,6 +403,76 @@ impl DurableDirectoryPublication {
             let _ = (source_name, destination_name);
             Err(FilesystemError::DurableNameOperationUnavailable(
                 "staged regular-file replacement is unsupported on this target".into(),
+            ))
+        }
+    }
+
+    /// Prove that an ambient staging path and one name in this retained
+    /// publication directory identify the same regular file.
+    ///
+    /// This is crate-private lifecycle binding for SQLite construction: the
+    /// database library needs an ambient path, while durable publication uses
+    /// a retained directory capability. It prevents a finalized stage token
+    /// from later being paired with a same-basename file in another directory.
+    pub(crate) fn verify_staged_regular_path(
+        &self,
+        source_name: &str,
+        source_path: &Path,
+    ) -> Result<(), FilesystemError> {
+        validate_single_entry_name(source_name)?;
+
+        #[cfg(unix)]
+        {
+            let ambient = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(source_path)?;
+            let ambient_metadata = ambient.metadata()?;
+            let bound = open_file_nofollow(&self.dir, source_name)?;
+            let bound_metadata = bound.metadata()?;
+            if !ambient_metadata.is_file()
+                || !bound_metadata.is_file()
+                || (ambient_metadata.dev(), ambient_metadata.ino())
+                    != (bound_metadata.dev(), bound_metadata.ino())
+            {
+                return Err(FilesystemError::ByteCollision);
+            }
+            return Ok(());
+        }
+
+        #[cfg(windows)]
+        {
+            let mut ambient_options = fs::OpenOptions::new();
+            ambient_options.read(true).write(true);
+            let ambient = ambient_options.open(source_path)?;
+            reject_windows_reparse(&ambient, &source_path.display().to_string())?;
+            let ambient_metadata = ambient.metadata()?;
+            if !ambient_metadata.is_file() {
+                return Err(FilesystemError::UnsafeEntry(format!(
+                    "staged source is not a regular no-follow file: {}",
+                    source_path.display()
+                )));
+            }
+            let ambient_identity = windows_file_identity(&ambient)?;
+
+            let mut bound_options = OpenOptions::new();
+            bound_options
+                .read(true)
+                .write(true)
+                .follow(FollowSymlinks::No);
+            let bound = self.dir.open_with(source_name, &bound_options)?.into_std();
+            reject_windows_reparse(&bound, source_name)?;
+            if !bound.metadata()?.is_file() || windows_file_identity(&bound)? != ambient_identity {
+                return Err(FilesystemError::ByteCollision);
+            }
+            return Ok(());
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (source_name, source_path);
+            Err(FilesystemError::DurableNameOperationUnavailable(
+                "staged regular-file identity binding is unsupported on this target".into(),
             ))
         }
     }

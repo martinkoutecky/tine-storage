@@ -5,17 +5,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::ControlFlow;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 
+use cap_std::fs::Dir;
+
 use crate::sqlite_materialization::{
     self, ApplyChangeInstrumentation, MaterializationError, PhysicalAliasDeclaration,
     PhysicalGraphProjectionChange, SqliteGraphProjectionRead,
 };
+use crate::{DurableDirectoryPublication, FilesystemError};
 const PREPARED_STATEMENT_CACHE_STATEMENTS: usize = 64;
 const SOURCE_REVISION_MAX_BYTES: usize = 4096;
 const SOURCE_REVISIONS_DDL: &str = "CREATE TABLE direct_source_revisions (
@@ -45,6 +48,13 @@ mod compact_key_tests {
             "tine-storage-p3-{name}-{}.sqlite",
             uuid::Uuid::new_v4()
         ))
+    }
+
+    fn fresh_build(path: &Path) -> Result<PhysicalGraphProjectionFreshBuild, MaterializationError> {
+        let directory =
+            Dir::open_ambient_dir(path.parent().unwrap(), cap_std::ambient_authority()).unwrap();
+        let publication = DurableDirectoryPublication::open(&directory).unwrap();
+        PhysicalGraphProjectionDatabase::create_fresh_build(path, publication)
     }
 
     fn block(id: &str, parent: Option<&str>) -> PhysicalBlock {
@@ -166,32 +176,66 @@ mod compact_key_tests {
     }
 
     #[test]
-    fn fresh_build_is_off_only_refuses_reuse_and_reopens_in_wal() {
+    fn fresh_build_is_one_transaction_refuses_reuse_and_reopens_in_wal() {
         let path = file("fresh-build");
-        let mut db = PhysicalGraphProjectionDatabase::create_fresh_build(&path).unwrap();
+        let mut build = fresh_build(&path).unwrap();
+        let connection = &build.database.as_ref().unwrap().connection;
         assert_eq!(
-            db.connection
+            connection
                 .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
                 .unwrap(),
             "off"
         );
         assert_eq!(
-            db.connection
+            connection
                 .query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             0
         );
-        db.initialize_schema().unwrap();
-        db.apply(&change(
+        assert!(!connection.is_autocommit());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        let change = change(
             page("pages/a.md", "A", vec![block("b-a", None)]),
             Vec::new(),
-        ))
-        .unwrap();
-        db.optimize().unwrap();
-        db.quick_check().unwrap();
-        drop(db);
+        );
+        build
+            .append_with_source_revisions_and_aliases(
+                &change,
+                &[PhysicalGraphProjectionSourceRevision {
+                    path: "pages/a.md".into(),
+                    revision: "one".into(),
+                }],
+                &[],
+            )
+            .unwrap();
+        assert!(
+            !build.database.as_ref().unwrap().connection.is_autocommit(),
+            "a streamed chunk must not commit the build transaction"
+        );
+        let finalized = build
+            .finish(
+                &PhysicalGraphProjectionChange {
+                    replacements: Vec::new(),
+                    deletions: Vec::new(),
+                    reference_postings: Vec::new(),
+                },
+                &[],
+                &[],
+                &["pages/a.md".into()],
+            )
+            .unwrap();
 
-        assert!(PhysicalGraphProjectionDatabase::create_fresh_build(&path).is_err());
+        assert!(fresh_build(&path).is_err());
         let reopened = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
         assert_eq!(
             reopened
@@ -209,18 +253,304 @@ mod compact_key_tests {
         );
         assert!(reopened.read().block("b-a").unwrap().is_some());
         drop(reopened);
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
+        drop(finalized);
+        assert!(
+            !path.exists(),
+            "an unpublished finalized stage is reclaimed"
+        );
     }
 
     #[test]
     fn fresh_build_refuses_an_unrelated_preexisting_file_without_changing_it() {
         let path = file("fresh-build-collision");
         std::fs::write(&path, b"not a projection").unwrap();
-        assert!(PhysicalGraphProjectionDatabase::create_fresh_build(&path).is_err());
+        assert!(fresh_build(&path).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"not a projection");
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn fresh_build_refuses_a_same_basename_in_an_unrelated_publication_directory() {
+        let root =
+            std::env::temp_dir().join(format!("tine-storage-bound-stage-{}", uuid::Uuid::new_v4()));
+        let actual_root = root.join("actual");
+        let unrelated_root = root.join("unrelated");
+        std::fs::create_dir_all(&actual_root).unwrap();
+        std::fs::create_dir_all(&unrelated_root).unwrap();
+        let actual_stage = actual_root.join("stage.sqlite");
+        let unrelated_stage = unrelated_root.join("stage.sqlite");
+        std::fs::write(&unrelated_stage, b"unrelated bytes").unwrap();
+        let unrelated_dir =
+            Dir::open_ambient_dir(&unrelated_root, cap_std::ambient_authority()).unwrap();
+        let unrelated_publication = DurableDirectoryPublication::open(&unrelated_dir).unwrap();
+
+        assert!(PhysicalGraphProjectionDatabase::create_fresh_build(
+            &actual_stage,
+            unrelated_publication,
+        )
+        .is_err());
+        assert!(
+            !actual_stage.exists(),
+            "a stage with a mismatched publication directory was retained"
+        );
+        assert_eq!(
+            std::fs::read(&unrelated_stage).unwrap(),
+            b"unrelated bytes",
+            "binding the stage touched the unrelated same-basename file"
+        );
+        assert!(
+            !unrelated_root.join("projection.sqlite").exists(),
+            "a mismatched directory reported false publication success"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn semantic_projection_rows(database: &PhysicalGraphProjectionDatabase) -> Vec<String> {
+        let sql = "SELECT 'page|' || p.path || '|' || n.key || '|' || n.raw || '|' ||
+                          COALESCE(CAST(p.position AS TEXT), 'null')
+                   FROM pages p JOIN names n ON n.name_id = p.name_id
+                   UNION ALL
+                   SELECT 'block|' || p.path || '|' || b.result_id || '|' ||
+                          COALESCE(parent.result_id, 'root') || '|' || b.order_key
+                   FROM blocks b JOIN pages p ON p.page_id = b.page_id
+                   LEFT JOIN blocks parent ON parent.block_id = b.parent_block_id
+                   UNION ALL
+                   SELECT 'name|' || key || '|' || raw FROM names
+                   UNION ALL
+                   SELECT 'ref|' || p.path || '|' ||
+                          CASE r.source_entity_type WHEN 0 THEN p.path ELSE b.result_id END || '|' ||
+                          CAST(r.reference_kind AS TEXT) || '|' ||
+                          COALESCE(n.key, hex(r.raw_uuid_claim)) || '|' || CAST(r.own AS TEXT)
+                   FROM reference_postings r
+                   JOIN pages p ON p.page_id = r.source_page_id
+                   LEFT JOIN blocks b ON r.source_entity_type = 1 AND b.block_id = r.source_entity_id
+                   LEFT JOIN names n ON n.name_id = r.target_name_id
+                   UNION ALL
+                   SELECT 'alias|' || p.path || '|' ||
+                          CASE d.source_entity_type WHEN 0 THEN p.path ELSE b.result_id END || '|' ||
+                          n.key
+                   FROM reference_alias_declarations d
+                   JOIN pages p ON p.page_id = d.source_page_id
+                   LEFT JOIN blocks b ON d.source_entity_type = 1 AND b.block_id = d.source_entity_id
+                   JOIN names n ON n.name_id = d.alias_name_id
+                   UNION ALL
+                   SELECT 'source|' || path || '|' || revision FROM direct_source_revisions
+                   ORDER BY 1";
+        database
+            .connection
+            .prepare(sql)
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap()
+    }
+
+    fn search_entities(database: &PhysicalGraphProjectionDatabase, token: &str) -> Vec<String> {
+        database
+            .connection
+            .prepare(
+                "SELECT COALESCE(p.path, b.result_id)
+                 FROM search_fts
+                 LEFT JOIN pages p ON p.page_id = search_fts.rowid
+                 LEFT JOIN blocks b ON b.block_id = search_fts.rowid
+                 WHERE search_fts MATCH ?1 ORDER BY 1",
+            )
+            .unwrap()
+            .query_map([token], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn streamed_fresh_chunks_match_ordinary_apply_with_one_commit_and_one_index_build() {
+        let ordinary_path = file("stream-ordinary");
+        let fresh_path = file("stream-fresh");
+        let paths = ["pages/a.md".to_owned(), "pages/b.md".to_owned()];
+        let pages = [
+            page(&paths[0], "A", vec![block("b-a", None)]),
+            page(&paths[1], "B", vec![block("b-b", None)]),
+        ];
+        let postings = [
+            posting(&paths[0], "b-a", "Foo"),
+            posting(&paths[1], "b-b", "FOO"),
+        ];
+        let aliases = [
+            PhysicalAliasDeclaration {
+                source_page_path: paths[0].clone(),
+                source_entity: PhysicalEntityId::Block("b-a".into()),
+                source_locator: b"properties".to_vec(),
+                ordinal: 0,
+                raw_alias: "Shared Alias".into(),
+                normalized_alias: "shared alias".into(),
+            },
+            PhysicalAliasDeclaration {
+                source_page_path: paths[1].clone(),
+                source_entity: PhysicalEntityId::Block("b-b".into()),
+                source_locator: b"properties".to_vec(),
+                ordinal: 0,
+                raw_alias: "Second Alias".into(),
+                normalized_alias: "second alias".into(),
+            },
+        ];
+        let revisions = [
+            PhysicalGraphProjectionSourceRevision {
+                path: paths[0].clone(),
+                revision: "revision-a".into(),
+            },
+            PhysicalGraphProjectionSourceRevision {
+                path: paths[1].clone(),
+                revision: "revision-b".into(),
+            },
+        ];
+
+        let mut ordinary = PhysicalGraphProjectionDatabase::open_writable(&ordinary_path).unwrap();
+        ordinary.initialize_schema().unwrap();
+        ordinary
+            .apply_with_source_revisions_aliases_and_page_order(
+                &PhysicalGraphProjectionChange {
+                    replacements: pages.to_vec(),
+                    deletions: Vec::new(),
+                    reference_postings: postings.to_vec(),
+                },
+                &revisions,
+                &aliases,
+                &paths,
+            )
+            .unwrap();
+
+        let mut fresh = fresh_build(&fresh_path).unwrap();
+        let commit_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        fresh
+            .database
+            .as_ref()
+            .unwrap()
+            .connection
+            .commit_hook(Some({
+                let commit_count = Arc::clone(&commit_count);
+                move || {
+                    commit_count.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+            }));
+        for index in 0..2 {
+            fresh
+                .append_with_source_revisions_and_aliases(
+                    &PhysicalGraphProjectionChange {
+                        replacements: vec![pages[index].clone()],
+                        deletions: Vec::new(),
+                        reference_postings: vec![postings[index].clone()],
+                    },
+                    std::slice::from_ref(&revisions[index]),
+                    std::slice::from_ref(&aliases[index]),
+                )
+                .unwrap();
+            let connection = &fresh.database.as_ref().unwrap().connection;
+            assert!(
+                !connection.is_autocommit(),
+                "chunk {index} committed before the whole build finished"
+            );
+            let secondary_indexes: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type = 'index' AND name NOT LIKE 'sqlite_autoindex_%'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                secondary_indexes, 0,
+                "chunk {index} rebuilt secondary indexes before finalization"
+            );
+        }
+        let finalized = fresh
+            .finish(
+                &PhysicalGraphProjectionChange {
+                    replacements: Vec::new(),
+                    deletions: Vec::new(),
+                    reference_postings: Vec::new(),
+                },
+                &[],
+                &[],
+                &paths,
+            )
+            .unwrap();
+        assert_eq!(
+            commit_count.load(Ordering::Relaxed),
+            1,
+            "the streamed build crossed more than one SQLite commit boundary"
+        );
+        let streamed = PhysicalGraphProjectionDatabase::open_read_only(&fresh_path).unwrap();
+        streamed.validate_schema().unwrap();
+        assert_eq!(
+            semantic_projection_rows(&streamed),
+            semantic_projection_rows(&ordinary)
+        );
+        let content_expression = "\"con\" AND \"ont\" AND \"nte\" AND \"ten\" AND \"ent\"";
+        assert_eq!(
+            search_entities(&streamed, content_expression),
+            search_entities(&ordinary, content_expression)
+        );
+        let (entities, distinct_entities): (i64, i64) = streamed
+            .connection
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT entity_id) FROM (
+                     SELECT page_id AS entity_id FROM pages
+                     UNION ALL SELECT block_id FROM blocks
+                 )",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            entities, distinct_entities,
+            "page and block integer coordinates collided across chunks"
+        );
+
+        drop(streamed);
+        drop(ordinary);
+        drop(finalized);
+        for path in [ordinary_path, fresh_path] {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        }
+    }
+
+    #[test]
+    fn failed_or_abandoned_fresh_append_removes_the_off_mode_stage() {
+        let repeated_path = file("stream-repeat");
+        let page_change = change(
+            page("pages/a.md", "A", vec![block("b-a", None)]),
+            Vec::new(),
+        );
+        let revision = [PhysicalGraphProjectionSourceRevision {
+            path: "pages/a.md".into(),
+            revision: "one".into(),
+        }];
+        let mut repeated = fresh_build(&repeated_path).unwrap();
+        repeated
+            .append_with_source_revisions_and_aliases(&page_change, &revision, &[])
+            .unwrap();
+        repeated
+            .append_with_source_revisions_and_aliases(&page_change, &revision, &[])
+            .unwrap_err();
+        assert!(
+            !repeated_path.exists(),
+            "a failed OFF-mode stage remained publishable"
+        );
+
+        let abandoned_path = file("stream-abandon");
+        let mut abandoned = fresh_build(&abandoned_path).unwrap();
+        abandoned
+            .append_with_source_revisions_and_aliases(&page_change, &revision, &[])
+            .unwrap();
+        drop(abandoned);
+        assert!(
+            !abandoned_path.exists(),
+            "dropping a cancelled OFF-mode stage did not discard it"
+        );
     }
 
     #[test]
@@ -796,26 +1126,60 @@ pub struct PhysicalGraphProjectionDatabase {
     last_apply_deferred_indexes: std::cell::Cell<bool>,
 }
 
+/// One unpublished graph projection under construction in a single SQLite
+/// transaction.
+///
+/// Bounded chunks may be appended without retaining the graph in storage. The
+/// ordinary secondary indexes do not exist until [`Self::finish`], which then
+/// applies any captured tail changes with those indexes live, reconciles the
+/// final inventory, optimizes, commits once, checks, and closes the file. Any
+/// error or a dropped unfinished value invalidates and removes the OFF-mode
+/// stage.
+pub struct PhysicalGraphProjectionFreshBuild {
+    database: Option<PhysicalGraphProjectionDatabase>,
+    publication: Option<DurableDirectoryPublication>,
+    stage_path: PathBuf,
+    remove_stage_on_drop: bool,
+}
+
+/// A closed and checked fresh projection stage.
+///
+/// The only consuming operation publishes it through the existing audited
+/// directory primitive. Dropping it before publication removes the owned
+/// stage, so an unfinalized or abandoned OFF-mode image cannot survive as a
+/// publication candidate.
+pub struct FinalizedPhysicalGraphProjection {
+    publication: Option<DurableDirectoryPublication>,
+    stage_path: Option<PathBuf>,
+}
+
 /// The smallest page-cache ceiling [`PhysicalGraphProjectionDatabase::set_page_cache_budget`]
 /// accepts; below SQLite's own ~2 MiB default a budget is a slowdown, never a saving.
 pub const MIN_PAGE_CACHE_BUDGET_BYTES: u64 = 2 * 1024 * 1024;
 
 impl PhysicalGraphProjectionDatabase {
-    /// Create a disposable, unpublished projection build at a path that must
+    /// Begin a disposable, unpublished projection build at a path that must
     /// not already exist.
     ///
     /// This connection uses `journal_mode=OFF` and `synchronous=OFF` to avoid
     /// writing a second copy of a fresh cache image. Those settings are safe
     /// only because the file is staging state and cannot be observed as the
     /// active projection. **Any write error invalidates the entire staging
-    /// image:** the caller must close and discard it, must not continue using
-    /// it, and must not rely on transaction rollback in OFF mode. Complete the
-    /// build, call [`Self::optimize`], close the connection, then publish it
-    /// through the storage-owned staged-file publication primitive.
+    /// image:** [`PhysicalGraphProjectionFreshBuild`] owns invalidation and
+    /// removal if an append fails or the build is dropped. Only its finalized,
+    /// closed token can publish through the storage-owned staged-file
+    /// publication primitive.
     ///
     /// Ordinary active databases must use [`Self::open_writable`], which keeps
     /// WAL/NORMAL transaction and rollback behavior.
-    pub fn create_fresh_build(path: &Path) -> Result<Self, MaterializationError> {
+    pub fn create_fresh_build(
+        path: &Path,
+        publication: DurableDirectoryPublication,
+    ) -> Result<PhysicalGraphProjectionFreshBuild, MaterializationError> {
+        PhysicalGraphProjectionFreshBuild::create(path, publication)
+    }
+
+    fn create_uninitialized_fresh_build(path: &Path) -> Result<Self, MaterializationError> {
         let staging_file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -835,24 +1199,30 @@ impl PhysicalGraphProjectionDatabase {
             })?;
         drop(staging_file);
 
-        let connection = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-        )?;
-        connection.busy_timeout(Duration::from_secs(5))?;
-        connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_STATEMENTS);
-        connection.execute_batch(
-            "PRAGMA journal_mode = OFF;
-             PRAGMA synchronous = OFF;
-             PRAGMA foreign_keys = ON;
-             PRAGMA trusted_schema = OFF;",
-        )?;
-        Ok(Self {
-            connection,
-            last_apply_deferred_indexes: std::cell::Cell::new(false),
-        })
+        let result = (|| {
+            let connection = Connection::open_with_flags(
+                path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            )?;
+            connection.busy_timeout(Duration::from_secs(5))?;
+            connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_STATEMENTS);
+            connection.execute_batch(
+                "PRAGMA journal_mode = OFF;
+                 PRAGMA synchronous = OFF;
+                 PRAGMA foreign_keys = ON;
+                 PRAGMA trusted_schema = OFF;",
+            )?;
+            Ok(Self {
+                connection,
+                last_apply_deferred_indexes: std::cell::Cell::new(false),
+            })
+        })();
+        if result.is_err() {
+            remove_fresh_stage_artifacts(path);
+        }
+        result
     }
 
     pub fn open_writable(path: &Path) -> Result<Self, MaterializationError> {
@@ -1038,94 +1408,18 @@ impl PhysicalGraphProjectionDatabase {
         aliases: &[PhysicalAliasDeclaration],
         page_order: Option<&[String]>,
     ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
-        let replacement_ids = change
-            .replacements
-            .iter()
-            .map(|page| page.path.clone())
-            .collect::<BTreeSet<_>>();
-        if let Some(revisions) = revisions {
-            let revision_ids = validated_source_revisions(revisions)?
-                .into_keys()
-                .collect::<BTreeSet<_>>();
-            if replacement_ids != revision_ids {
-                return Err(MaterializationError::InvalidInput(
-                    "source revisions must exactly cover replacement pages".into(),
-                ));
-            }
-        }
+        validate_replacement_revisions(change, revisions)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let page_order_plan = page_order
-            .map(|order| prepare_query_page_order(&transaction, change, order))
-            .transpose()?;
-        let order_changed = page_order_plan
-            .as_ref()
-            .is_some_and(|plan| !plan.mismatched.is_empty());
-        if !change.replacements.is_empty()
-            || !change.deletions.is_empty()
-            || !change.reference_postings.is_empty()
-            || !aliases.is_empty()
-            || order_changed
-        {
-            sqlite_materialization::advance_query_projection_revision(&transaction)?;
-        }
-        if let Some(plan) = &page_order_plan {
-            plan.clear_insert_collisions(&transaction)?;
-        }
-        // Fresh-build route (GH #543): maintaining every secondary index once
-        // per inserted fact makes a graph-sized build touch the whole index
-        // set page by page and, past the page-cache ceiling, spill and re-read
-        // it. Building the indexes once after the rows is an external sort.
-        // Readers on this WAL file see the old snapshot until the
-        // commit, and a rollback restores the indexes, so the route is
-        // invisible outside this transaction. It is taken only while the
-        // covered tables are empty: without indexes the per-page cleanup
-        // lookups below are full scans, free here and quadratic otherwise.
-        let deferred_indexes = !change.replacements.is_empty()
-            && sqlite_materialization::deferred_index_tables_are_empty(&transaction)?;
-        if deferred_indexes {
-            sqlite_materialization::drop_deferred_indexes(&transaction)?;
-        }
-        let instrumentation = sqlite_materialization::apply_graph_projection_rows(
+        let (instrumentation, deferred_indexes) = apply_projection_change_in_transaction(
             &transaction,
             change,
+            revisions,
             aliases,
-            deferred_indexes,
-            None,
+            page_order,
+            true,
         )?;
-        for path in &change.deletions {
-            transaction.execute(
-                "DELETE FROM direct_source_revisions WHERE path = ?1",
-                rusqlite::params![path],
-            )?;
-        }
-        match revisions {
-            Some(revisions) => {
-                for revision in revisions {
-                    transaction.execute(
-                        "INSERT INTO direct_source_revisions (path, revision)
-                         VALUES (?1, ?2)
-                         ON CONFLICT(path) DO UPDATE SET revision = excluded.revision",
-                        rusqlite::params![&revision.path, &revision.revision],
-                    )?;
-                }
-            }
-            None => {
-                for page in &change.replacements {
-                    transaction.execute(
-                        "DELETE FROM direct_source_revisions WHERE path = ?1",
-                        rusqlite::params![&page.path],
-                    )?;
-                }
-            }
-        }
-        if let Some(plan) = &page_order_plan {
-            plan.reconcile(&transaction)?;
-        }
-        if deferred_indexes {
-            sqlite_materialization::create_deferred_indexes(&transaction)?;
-        }
         transaction.commit()?;
         self.last_apply_deferred_indexes.set(deferred_indexes);
         Ok(instrumentation)
@@ -1202,6 +1496,325 @@ impl PhysicalGraphProjectionDatabase {
         self.connection.execute_batch("PRAGMA optimize")?;
         Ok(())
     }
+}
+
+impl PhysicalGraphProjectionFreshBuild {
+    fn create(
+        path: &Path,
+        publication: DurableDirectoryPublication,
+    ) -> Result<Self, MaterializationError> {
+        let database = PhysicalGraphProjectionDatabase::create_uninitialized_fresh_build(path)?;
+        let mut build = Self {
+            database: Some(database),
+            publication: Some(publication),
+            stage_path: path.to_path_buf(),
+            remove_stage_on_drop: true,
+        };
+        let setup = (|| {
+            build.verify_publication_binding()?;
+            let connection = &build
+                .database
+                .as_ref()
+                .expect("fresh build database")
+                .connection;
+            connection.execute_batch("BEGIN IMMEDIATE")?;
+            sqlite_materialization::initialize_graph_projection_schema_without_secondary_indexes(
+                connection,
+            )?;
+            connection.execute_batch(&format!("{SOURCE_REVISIONS_DDL};"))?;
+            Ok(())
+        })();
+        if let Err(error) = setup {
+            build.invalidate();
+            return Err(error);
+        }
+        Ok(build)
+    }
+
+    /// Apply the existing cache-budget formula to the one live build
+    /// connection. A failure invalidates the OFF-mode stage.
+    pub fn set_page_cache_budget(&mut self, bytes: u64) -> Result<(), MaterializationError> {
+        let result = self
+            .database
+            .as_ref()
+            .ok_or_else(fresh_build_invalidated)
+            .and_then(|database| database.set_page_cache_budget(bytes));
+        if result.is_err() {
+            self.invalidate();
+        }
+        result
+    }
+
+    /// Append one bounded, disjoint page chunk to the build transaction.
+    /// Names and scalar coordinates are shared across calls through SQLite;
+    /// storage retains no graph-sized identity map between chunks.
+    pub fn append_with_source_revisions_and_aliases(
+        &mut self,
+        change: &PhysicalGraphProjectionChange,
+        revisions: &[PhysicalGraphProjectionSourceRevision],
+        aliases: &[PhysicalAliasDeclaration],
+    ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
+        let result = (|| {
+            validate_replacement_revisions(change, Some(revisions))?;
+            let connection = &self
+                .database
+                .as_ref()
+                .ok_or_else(fresh_build_invalidated)?
+                .connection;
+            let instrumentation = sqlite_materialization::append_fresh_graph_projection_rows(
+                connection, change, aliases,
+            )?;
+            insert_source_revisions(connection, revisions)?;
+            Ok(instrumentation)
+        })();
+        if result.is_err() {
+            self.invalidate();
+        }
+        result
+    }
+
+    /// Restore the normal indexes, apply changes captured while the base
+    /// snapshot streamed, reconcile and optimize, commit the one build
+    /// transaction, check it, then close the staging file.
+    pub fn finish(
+        mut self,
+        tail_change: &PhysicalGraphProjectionChange,
+        tail_revisions: &[PhysicalGraphProjectionSourceRevision],
+        tail_aliases: &[PhysicalAliasDeclaration],
+        page_order: &[String],
+    ) -> Result<FinalizedPhysicalGraphProjection, MaterializationError> {
+        validate_replacement_revisions(tail_change, Some(tail_revisions))?;
+        let result = (|| {
+            let database = self.database.as_ref().ok_or_else(fresh_build_invalidated)?;
+            sqlite_materialization::create_deferred_indexes(&database.connection)?;
+            apply_projection_change_in_transaction(
+                &database.connection,
+                tail_change,
+                Some(tail_revisions),
+                tail_aliases,
+                Some(page_order),
+                false,
+            )?;
+            database.optimize()?;
+            database.validate_schema()?;
+            database.connection.execute_batch("COMMIT")?;
+            database.quick_check()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.invalidate();
+            return Err(error);
+        }
+        drop(self.database.take());
+        self.verify_publication_binding()?;
+        self.remove_stage_on_drop = false;
+        Ok(FinalizedPhysicalGraphProjection {
+            publication: self.publication.take(),
+            stage_path: Some(self.stage_path.clone()),
+        })
+    }
+
+    fn invalidate(&mut self) {
+        if let Some(database) = self.database.take() {
+            let _ = database.connection.execute_batch("ROLLBACK");
+            drop(database);
+        }
+        if self.remove_stage_on_drop {
+            remove_fresh_stage_artifacts(&self.stage_path);
+            self.remove_stage_on_drop = false;
+        }
+    }
+
+    fn verify_publication_binding(&self) -> Result<(), MaterializationError> {
+        let stage_name = fresh_stage_name(&self.stage_path)?;
+        self.publication
+            .as_ref()
+            .ok_or_else(fresh_build_invalidated)?
+            .verify_staged_regular_path(stage_name, &self.stage_path)
+            .map_err(|error| {
+                MaterializationError::InvalidInput(format!(
+                    "fresh projection stage is not in its publication directory: {error}"
+                ))
+            })
+    }
+}
+
+impl Drop for PhysicalGraphProjectionFreshBuild {
+    fn drop(&mut self) {
+        self.invalidate();
+    }
+}
+
+impl FinalizedPhysicalGraphProjection {
+    /// Publish this exact closed stage through the existing audited
+    /// single-writer replacement primitive. On any failure the destination is
+    /// left to the primitive's documented reopen/rebuild rule and only the
+    /// still-present stage name is reclaimed.
+    pub fn publish_replace_single_writer(
+        mut self,
+        destination_name: &str,
+    ) -> Result<(), FilesystemError> {
+        let stage_path = self.stage_path.as_ref().expect("finalized stage path");
+        let stage_name = stage_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                FilesystemError::UnsafeEntry(
+                    "fresh projection staging filename is not UTF-8".into(),
+                )
+            })?;
+        let result = self
+            .publication
+            .as_ref()
+            .expect("finalized publication directory")
+            .replace_from_staged_regular_single_writer(stage_name, destination_name);
+        if result.is_ok() {
+            self.stage_path = None;
+            self.publication = None;
+        }
+        result
+    }
+}
+
+impl Drop for FinalizedPhysicalGraphProjection {
+    fn drop(&mut self) {
+        if let Some(path) = self.stage_path.take() {
+            remove_fresh_stage_artifacts(&path);
+        }
+    }
+}
+
+fn fresh_build_invalidated() -> MaterializationError {
+    MaterializationError::InvalidInput("fresh projection build is invalidated".into())
+}
+
+fn fresh_stage_name(path: &Path) -> Result<&str, MaterializationError> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            MaterializationError::InvalidInput(
+                "fresh projection staging filename is not UTF-8".into(),
+            )
+        })
+}
+
+fn remove_fresh_stage_artifacts(path: &Path) {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let candidate = if suffix.is_empty() {
+            path.to_path_buf()
+        } else {
+            let mut name = path.as_os_str().to_os_string();
+            name.push(suffix);
+            PathBuf::from(name)
+        };
+        let _ = std::fs::remove_file(candidate);
+    }
+}
+
+fn validate_replacement_revisions(
+    change: &PhysicalGraphProjectionChange,
+    revisions: Option<&[PhysicalGraphProjectionSourceRevision]>,
+) -> Result<(), MaterializationError> {
+    let Some(revisions) = revisions else {
+        return Ok(());
+    };
+    let replacement_ids = change
+        .replacements
+        .iter()
+        .map(|page| page.path.clone())
+        .collect::<BTreeSet<_>>();
+    let revision_ids = validated_source_revisions(revisions)?
+        .into_keys()
+        .collect::<BTreeSet<_>>();
+    if replacement_ids != revision_ids {
+        return Err(MaterializationError::InvalidInput(
+            "source revisions must exactly cover replacement pages".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_projection_change_in_transaction(
+    transaction: &Connection,
+    change: &PhysicalGraphProjectionChange,
+    revisions: Option<&[PhysicalGraphProjectionSourceRevision]>,
+    aliases: &[PhysicalAliasDeclaration],
+    page_order: Option<&[String]>,
+    allow_terminal_index_deferral: bool,
+) -> Result<(ApplyChangeInstrumentation, bool), MaterializationError> {
+    let page_order_plan = page_order
+        .map(|order| prepare_query_page_order(transaction, change, order))
+        .transpose()?;
+    let order_changed = page_order_plan
+        .as_ref()
+        .is_some_and(|plan| !plan.mismatched.is_empty());
+    if !change.replacements.is_empty()
+        || !change.deletions.is_empty()
+        || !change.reference_postings.is_empty()
+        || !aliases.is_empty()
+        || order_changed
+    {
+        sqlite_materialization::advance_query_projection_revision(transaction)?;
+    }
+    if let Some(plan) = &page_order_plan {
+        plan.clear_insert_collisions(transaction)?;
+    }
+    // Ordinary apply retains the existing empty-database optimization. The
+    // dedicated fresh builder passes `false` here because it has already
+    // streamed every base row without secondary indexes and recreates them
+    // exactly once before applying captured tail changes.
+    let deferred_indexes = allow_terminal_index_deferral
+        && !change.replacements.is_empty()
+        && sqlite_materialization::deferred_index_tables_are_empty(transaction)?;
+    if deferred_indexes {
+        sqlite_materialization::drop_deferred_indexes(transaction)?;
+    }
+    let instrumentation = sqlite_materialization::apply_graph_projection_rows(
+        transaction,
+        change,
+        aliases,
+        deferred_indexes,
+        None,
+    )?;
+    for path in &change.deletions {
+        transaction.execute(
+            "DELETE FROM direct_source_revisions WHERE path = ?1",
+            rusqlite::params![path],
+        )?;
+    }
+    match revisions {
+        Some(revisions) => insert_source_revisions(transaction, revisions)?,
+        None => {
+            for page in &change.replacements {
+                transaction.execute(
+                    "DELETE FROM direct_source_revisions WHERE path = ?1",
+                    rusqlite::params![&page.path],
+                )?;
+            }
+        }
+    }
+    if let Some(plan) = &page_order_plan {
+        plan.reconcile(transaction)?;
+    }
+    if deferred_indexes {
+        sqlite_materialization::create_deferred_indexes(transaction)?;
+    }
+    Ok((instrumentation, deferred_indexes))
+}
+
+fn insert_source_revisions(
+    connection: &Connection,
+    revisions: &[PhysicalGraphProjectionSourceRevision],
+) -> Result<(), MaterializationError> {
+    for revision in revisions {
+        connection.execute(
+            "INSERT INTO direct_source_revisions (path, revision)
+             VALUES (?1, ?2)
+             ON CONFLICT(path) DO UPDATE SET revision = excluded.revision",
+            rusqlite::params![&revision.path, &revision.revision],
+        )?;
+    }
+    Ok(())
 }
 
 struct QueryPageOrderPlan {

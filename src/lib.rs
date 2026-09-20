@@ -43,7 +43,8 @@ mod sqlite_materialization;
 /// which owns every value a reader must agree with a writer about.
 pub mod sqlite {
     pub use crate::sqlite_graph_projection::{
-        PhysicalGraphProjectionDatabase, PhysicalGraphProjectionSourceDelta,
+        FinalizedPhysicalGraphProjection, PhysicalGraphProjectionDatabase,
+        PhysicalGraphProjectionFreshBuild, PhysicalGraphProjectionSourceDelta,
         PhysicalGraphProjectionSourceRevision, PhysicalProjectionQueryCancellation,
         PhysicalProjectionQueryReader, PhysicalProjectionQuerySnapshot, PhysicalQueryValue,
     };
