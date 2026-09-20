@@ -7,6 +7,12 @@ independently in `src/formats.rs` and summarized in
 
 ## Unreleased
 
+## [0.27.0] - 2026-09-20
+
+Completes the compact-projection storage work: schema 30 stores one raw text
+copy, fresh rebuilds use an unpublished staged database, and publication moves
+the completed file into place without copying its bytes.
+
 ### Added
 
 - `PhysicalGraphProjectionDatabase::create_fresh_build` exclusively creates an
@@ -38,6 +44,9 @@ replacement with no reserialization or retained snapshot.
 
 ### Removed
 
+- **Breaking.** `PhysicalGraphProjectionDatabase::set_build_durability`; active projections
+  remain WAL/NORMAL, while relaxed durability is confined by construction to
+  the unpublished database returned by `create_fresh_build`.
 - The unicode61 word index, legacy trigram substring index,
   `search_fts_owners`, and the storage-owned plain-text, fuzzy-subsequence, and
   ranked-search readers. Callers plan candidates through the read-only
@@ -912,7 +921,9 @@ Patch line from v0.20.0, the revision Tine pins; the sealed-history work on
 - Generated public-API inventory and a production/test-support boundary gate.
 - Machine-readable persistent-format manifest.
 
-[Unreleased]: https://github.com/martinkoutecky/tine-storage/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/martinkoutecky/tine-storage/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/martinkoutecky/tine-storage/compare/v0.26.0...v0.27.0
+[0.26.0]: https://github.com/martinkoutecky/tine-storage/compare/v0.25.0...v0.26.0
 [0.10.0]: https://github.com/martinkoutecky/tine-storage/compare/v0.9.2...v0.10.0
 [0.9.2]: https://github.com/martinkoutecky/tine-storage/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/martinkoutecky/tine-storage/compare/v0.9.0...v0.9.1

@@ -917,28 +917,6 @@ impl PhysicalGraphProjectionDatabase {
         Ok(())
     }
 
-    /// Relax (`true`) or restore (`false`) this writer's commit durability
-    /// for a bulk build: `PRAGMA synchronous = OFF` skips the fsync at each
-    /// commit and each WAL checkpoint; `NORMAL` is the ordinary setting
-    /// [`open_writable`](Self::open_writable) applies.
-    ///
-    /// The projection is a disposable cache rebuilt from the graph files, so
-    /// the only thing a missing fsync can cost is the build's own progress.
-    /// An application crash leaves WAL mode consistent either way; a power
-    /// loss can tear the file, which `quick_check` catches at the next open
-    /// and the caller rebuilds. A streaming build commits per batch, and at
-    /// GH tine#543's 10,000-page graph that is hundreds of commits and
-    /// checkpoints whose fsyncs are pure waiting on Windows. The caller
-    /// restores durability before the build's last commit is relied on.
-    pub fn set_build_durability(&self, relaxed: bool) -> Result<(), MaterializationError> {
-        self.connection.pragma_update(
-            None,
-            "synchronous",
-            if relaxed { "OFF" } else { "NORMAL" },
-        )?;
-        Ok(())
-    }
-
     /// The page-cache ceiling currently in force, in bytes.
     pub fn page_cache_budget(&self) -> Result<u64, MaterializationError> {
         let cache_size: i64 = self
