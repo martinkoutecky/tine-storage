@@ -10,6 +10,10 @@ second source of truth.
 | --- | --- | --- |
 | SQLite projection | application ID `0x54494e45`; schema 30 | SQLite is disposable. A file whose `user_version` differs is rebuilt from the graph's Markdown/Org files, never reinterpreted under a new schema. |
 
+Schema 30 is the single unreleased compact projection format: entity
+coordinates are monotonic integer rowids, public identity remains path/result
+ID, and reference/property/tag names are spelling-preserving dictionary rows.
+
 The Managed Storage formats (oplog manifest/object protocol, local journal v1
 and v2, sealed accepted-history index, engine scratch, checkpoint fingerprints,
 and the managed on-disk layout vocabulary) were deleted in 0.25.0 together

@@ -41,18 +41,26 @@ fn resource_limit(resource: &'static str, found: usize, maximum: usize) -> Mater
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum PhysicalEntityId {
-    Page([u8; 16]),
-    Block([u8; 16]),
+pub enum PhysicalEntityCoordinate {
+    Page(i64),
+    Block(i64),
 }
 
-impl PhysicalEntityId {
-    fn sql_parts(self) -> (i64, [u8; 16]) {
+impl PhysicalEntityCoordinate {
+    const fn sql_parts(self) -> (i64, i64) {
         match self {
             Self::Page(id) => (0, id),
             Self::Block(id) => (1, id),
         }
     }
+}
+
+/// Public identity at the storage boundary. Page identity is its relative
+/// path; block identity is the live result ID supplied by the application.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum PhysicalEntityId {
+    Page(String),
+    Block(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,11 +70,18 @@ pub struct PhysicalProperty {
     pub value: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalName {
+    pub raw: String,
+    pub key: String,
+}
+
 /// One atom of one property element (SPEC §3.3), already flattened and
 /// renumbered by the single tine-core producer. The physical layer stores what
 /// it is handed; it never atomizes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalPropertyAtom {
+    pub name: String,
     pub normalized_name: String,
     pub ordinal: u32,
     pub atom: String,
@@ -132,7 +147,7 @@ pub fn query_page_result_estimated_bytes<'a>(
 /// input indices and one-based depths, so producers can share ordering without
 /// allocating document payload. Equal orders use block ID.
 pub(crate) fn query_block_preorder<'a>(
-    blocks: impl IntoIterator<Item = ([u8; 16], Option<[u8; 16]>, &'a str)>,
+    blocks: impl IntoIterator<Item = (&'a str, Option<&'a str>, &'a str)>,
 ) -> Result<Vec<(usize, usize)>, MaterializationError> {
     let blocks = blocks.into_iter().collect::<Vec<_>>();
     let ids = blocks.iter().map(|row| row.0).collect::<BTreeSet<_>>();
@@ -141,7 +156,7 @@ pub(crate) fn query_block_preorder<'a>(
             "duplicate query block identity".into(),
         ));
     }
-    let mut children = BTreeMap::<Option<[u8; 16]>, Vec<usize>>::new();
+    let mut children = BTreeMap::<Option<&str>, Vec<usize>>::new();
     for (index, (_, parent, _)) in blocks.iter().enumerate() {
         if parent.is_some_and(|id| !ids.contains(&id)) {
             return Err(MaterializationError::InvalidInput(
@@ -207,14 +222,15 @@ pub struct PhysicalPlanning {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalBlock {
-    pub block_id: [u8; 16],
     /// Public query identity assigned by the application's current session.
-    /// The disposable physical UUID is not a substitute.
-    pub query_result_id: String,
-    /// Own normalized reference names, before ancestor/page closure expansion.
-    pub own_refs: Vec<String>,
-    pub home_document_id: [u8; 16],
-    pub parent: Option<[u8; 16]>,
+    pub result_id: String,
+    /// Own normalized reference set, before ancestor/page closure expansion.
+    ///
+    /// `raw` is retained for the synthetic-membership case, but membership is
+    /// keyed by `key`: normalize-equivalent spellings are one parser-owned set
+    /// member. Raw reference occurrences remain separate posting rows.
+    pub own_refs: Vec<PhysicalName>,
+    pub parent: Option<String>,
     pub order: String,
     pub content: String,
     pub searchable_text: String,
@@ -239,17 +255,15 @@ pub struct PhysicalBlock {
     /// This block's `:block/path-refs` closure -- its own normalized refs, every
     /// ancestor's, and its page's -- as the ONE tine-core closure function
     /// emitted it (SPEC §5.8 K22). Sorted and de-duplicated by that producer.
-    pub path_refs: Vec<String>,
+    pub path_refs: Vec<PhysicalName>,
     pub property_atoms: Vec<PhysicalPropertyAtom>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalPage {
-    pub page_id: [u8; 16],
     /// Direct's current session inventory position. This is rebuildable
     /// metadata, never identity authority.
-    pub query_page_order: Option<u64>,
-    pub home_document_id: [u8; 16],
+    pub position: Option<u64>,
     pub name: String,
     pub name_key: String,
     pub path: String,
@@ -271,17 +285,15 @@ pub enum PhysicalReferenceTarget {
     PageName {
         raw_name: String,
         normalized_name: String,
-        resolved_page_id: Option<[u8; 16]>,
     },
     ExternalUuid {
         raw_claim: [u8; 16],
-        resolved_block_id: Option<[u8; 16]>,
     },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalReferencePosting {
-    pub source_page_id: [u8; 16],
+    pub source_page_path: String,
     pub source_entity: PhysicalEntityId,
     pub source_locator: Vec<u8>,
     pub ordinal: u32,
@@ -291,7 +303,7 @@ pub struct PhysicalReferencePosting {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalAliasDeclaration {
-    pub source_page_id: [u8; 16],
+    pub source_page_path: String,
     pub source_entity: PhysicalEntityId,
     pub source_locator: Vec<u8>,
     pub ordinal: u32,
@@ -307,7 +319,7 @@ pub struct PhysicalAliasDeclaration {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalGraphProjectionChange {
     pub replacements: Vec<PhysicalPage>,
-    pub deletions: Vec<[u8; 16]>,
+    pub deletions: Vec<String>,
     /// Parser-derived reference spellings owned by replacement pages.
     ///
     /// Both storage regimes obtain these rows directly from the parser
@@ -338,82 +350,84 @@ pub(crate) struct FtsChangeInstrumentation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FtsEntityRow {
     entity_type: i64,
-    entity_id: [u8; 16],
-    page_id: [u8; 16],
+    entity_id: i64,
+    page_id: i64,
     text: String,
     normalized_text: String,
 }
 
 impl FtsEntityRow {
-    const fn key(&self) -> (i64, [u8; 16]) {
+    const fn key(&self) -> (i64, i64) {
         (self.entity_type, self.entity_id)
     }
 }
 
+pub const NAMES_DDL: &str = "CREATE TABLE names (
+    name_id INTEGER PRIMARY KEY,
+    key TEXT NOT NULL CHECK (length(CAST(key AS BLOB)) BETWEEN 1 AND 4194304),
+    raw TEXT NOT NULL CHECK (length(CAST(raw AS BLOB)) BETWEEN 1 AND 4194304),
+    UNIQUE (key, raw)
+) STRICT";
 pub const REFERENCE_POSTINGS_DDL: &str = "CREATE TABLE reference_postings (
-    source_page_id BLOB NOT NULL CHECK (length(source_page_id) = 16),
+    posting_id INTEGER PRIMARY KEY,
+    source_page_id INTEGER NOT NULL REFERENCES pages(page_id) ON DELETE CASCADE,
     source_entity_type INTEGER NOT NULL CHECK (source_entity_type IN (0, 1)),
-    source_entity_id BLOB NOT NULL CHECK (length(source_entity_id) = 16),
-    source_locator BLOB NOT NULL CHECK (length(source_locator) BETWEEN 1 AND 4194304),
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    reference_kind INTEGER NOT NULL CHECK (reference_kind BETWEEN 0 AND 7),
+    source_entity_id INTEGER NOT NULL,
+    source_locator BLOB CHECK (
+        source_locator IS NULL OR length(source_locator) BETWEEN 1 AND 4194304
+    ),
+    ordinal INTEGER CHECK (ordinal IS NULL OR ordinal >= 0),
+    reference_kind INTEGER NOT NULL CHECK (reference_kind BETWEEN 0 AND 8),
     target_type INTEGER NOT NULL CHECK (target_type IN (0, 1)),
-    raw_name TEXT CHECK (
-        raw_name IS NULL OR length(CAST(raw_name AS BLOB)) BETWEEN 1 AND 4194304
-    ),
-    normalized_name TEXT CHECK (
-        normalized_name IS NULL OR length(CAST(normalized_name AS BLOB)) BETWEEN 1 AND 4194304
-    ),
+    target_name_id INTEGER REFERENCES names(name_id),
     raw_uuid_claim BLOB CHECK (
         raw_uuid_claim IS NULL OR length(raw_uuid_claim) = 16
     ),
-    resolved_page_id BLOB CHECK (
-        resolved_page_id IS NULL OR length(resolved_page_id) = 16
-    ),
-    resolved_block_id BLOB CHECK (
-        resolved_block_id IS NULL OR length(resolved_block_id) = 16
-    ),
+    own INTEGER NOT NULL CHECK (own IN (0, 1)),
     CHECK (
         (reference_kind BETWEEN 0 AND 5 AND target_type = 0)
         OR
         (reference_kind IN (6, 7) AND target_type = 1)
+        OR
+        (reference_kind = 8 AND target_type = 0)
     ),
     CHECK (
-        (target_type = 0 AND raw_name IS NOT NULL AND normalized_name IS NOT NULL
-         AND raw_uuid_claim IS NULL AND resolved_block_id IS NULL)
+        (target_type = 0 AND target_name_id IS NOT NULL
+         AND raw_uuid_claim IS NULL)
         OR
-        (target_type = 1 AND raw_name IS NULL AND normalized_name IS NULL
-         AND raw_uuid_claim IS NOT NULL AND resolved_page_id IS NULL)
+        (target_type = 1 AND target_name_id IS NULL
+         AND raw_uuid_claim IS NOT NULL)
     ),
-    PRIMARY KEY (
-        source_page_id, source_entity_type, source_entity_id, source_locator, ordinal
+    CHECK (
+        (reference_kind = 8 AND source_entity_type = 1 AND source_locator IS NULL
+         AND ordinal IS NULL AND own = 1)
+        OR
+        (reference_kind < 8 AND source_locator IS NOT NULL AND ordinal IS NOT NULL)
     )
-) WITHOUT ROWID, STRICT";
+) STRICT";
 pub const REFERENCE_ALIAS_DECLARATIONS_DDL: &str = "CREATE TABLE reference_alias_declarations (
-    source_page_id BLOB NOT NULL CHECK (length(source_page_id) = 16),
+    source_page_id INTEGER NOT NULL REFERENCES pages(page_id) ON DELETE CASCADE,
     source_entity_type INTEGER NOT NULL CHECK (source_entity_type IN (0, 1)),
-    source_entity_id BLOB NOT NULL CHECK (length(source_entity_id) = 16),
+    source_entity_id INTEGER NOT NULL,
     source_locator BLOB NOT NULL CHECK (length(source_locator) BETWEEN 1 AND 4194304),
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    raw_alias TEXT NOT NULL CHECK (length(CAST(raw_alias AS BLOB)) BETWEEN 1 AND 4194304),
-    normalized_alias TEXT NOT NULL CHECK (
-        length(CAST(normalized_alias AS BLOB)) BETWEEN 1 AND 4194304
-    ),
+    alias_name_id INTEGER NOT NULL REFERENCES names(name_id),
     PRIMARY KEY (
         source_page_id, source_entity_type, source_entity_id, source_locator, ordinal
     )
 ) WITHOUT ROWID, STRICT";
 pub const PAGES_DDL: &str = "CREATE TABLE pages (
-    page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16),
-    home_document_id BLOB NOT NULL CHECK (length(home_document_id) = 16),
-    name TEXT NOT NULL CHECK (length(CAST(name AS BLOB)) BETWEEN 1 AND 4194304),
-    name_key TEXT NOT NULL CHECK (length(CAST(name_key AS BLOB)) BETWEEN 1 AND 4194304),
-    path TEXT NOT NULL CHECK (length(CAST(path AS BLOB)) BETWEEN 1 AND 4194304),
+    page_id INTEGER PRIMARY KEY,
+    name_id INTEGER NOT NULL REFERENCES names(name_id),
+    path TEXT NOT NULL UNIQUE CHECK (length(CAST(path AS BLOB)) BETWEEN 1 AND 4194304),
     text_kind INTEGER NOT NULL CHECK (text_kind IN (0, 1)),
-    journal_day INTEGER
+    journal_day INTEGER,
+    position INTEGER UNIQUE CHECK (position IS NULL OR position >= 0),
+    estimated_bytes INTEGER NOT NULL CHECK (estimated_bytes >= 0),
+    property_count INTEGER NOT NULL CHECK (property_count >= 0)
 ) STRICT";
 const PAGE_TEXT_DDL: &str = "CREATE TABLE page_text (
-    page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16)
+    page_id INTEGER PRIMARY KEY
         REFERENCES pages(page_id) ON DELETE CASCADE,
     preamble TEXT CHECK (preamble IS NULL OR length(CAST(preamble AS BLOB)) <= 16777216),
     searchable_text TEXT NOT NULL CHECK (length(CAST(searchable_text AS BLOB)) <= 4194304),
@@ -422,13 +436,11 @@ const PAGE_TEXT_DDL: &str = "CREATE TABLE page_text (
     )
 ) STRICT";
 pub const BLOCKS_DDL: &str = "CREATE TABLE blocks (
-    block_id BLOB PRIMARY KEY CHECK (length(block_id) = 16),
-    page_id BLOB NOT NULL CHECK (length(page_id) = 16)
+    block_id INTEGER PRIMARY KEY,
+    page_id INTEGER NOT NULL
         REFERENCES pages(page_id) ON DELETE CASCADE,
-    home_document_id BLOB NOT NULL CHECK (length(home_document_id) = 16),
-    parent_block_id BLOB CHECK (
-        parent_block_id IS NULL OR length(parent_block_id) = 16
-    ),
+    result_id TEXT NOT NULL UNIQUE CHECK (length(CAST(result_id AS BLOB)) > 0),
+    parent_block_id INTEGER REFERENCES blocks(block_id),
     order_key TEXT NOT NULL CHECK (length(CAST(order_key AS BLOB)) BETWEEN 1 AND 4194304),
     query_visible_folded TEXT NOT NULL CHECK (
         length(CAST(query_visible_folded AS BLOB)) <= 4194304
@@ -442,13 +454,18 @@ pub const BLOCKS_DDL: &str = "CREATE TABLE blocks (
         logseq_identity_origin IS NULL
         OR logseq_identity_origin BETWEEN 0 AND 4
     ),
+    preorder INTEGER NOT NULL CHECK (preorder >= 0),
+    estimated_bytes INTEGER NOT NULL CHECK (estimated_bytes >= 0),
+    tag_count INTEGER NOT NULL CHECK (tag_count >= 0),
+    property_count INTEGER NOT NULL CHECK (property_count >= 0),
+    UNIQUE (page_id, preorder),
     CHECK (
         (logseq_uuid IS NULL AND logseq_identity_origin IS NULL)
         OR (logseq_uuid IS NOT NULL AND logseq_identity_origin IS NOT NULL)
     )
 ) STRICT";
 const BLOCK_TEXT_DDL: &str = "CREATE TABLE block_text (
-    block_id BLOB PRIMARY KEY CHECK (length(block_id) = 16)
+    block_id INTEGER PRIMARY KEY
         REFERENCES blocks(block_id) ON DELETE CASCADE,
     content TEXT NOT NULL CHECK (length(CAST(content AS BLOB)) <= 4194304),
     searchable_text TEXT NOT NULL CHECK (length(CAST(searchable_text AS BLOB)) <= 4194304),
@@ -459,28 +476,24 @@ const BLOCK_TEXT_DDL: &str = "CREATE TABLE block_text (
 ) STRICT";
 pub const PROPERTIES_DDL: &str = "CREATE TABLE properties (
     owner_type INTEGER NOT NULL CHECK (owner_type IN (0, 1)),
-    owner_id BLOB NOT NULL CHECK (length(owner_id) = 16),
-    page_id BLOB NOT NULL CHECK (length(page_id) = 16),
-    name TEXT NOT NULL CHECK (length(CAST(name AS BLOB)) BETWEEN 1 AND 4194304),
-    normalized_name TEXT NOT NULL CHECK (
-        length(CAST(normalized_name AS BLOB)) BETWEEN 1 AND 4194304
-    ),
+    owner_id INTEGER NOT NULL,
+    page_id INTEGER NOT NULL REFERENCES pages(page_id) ON DELETE CASCADE,
+    name_id INTEGER NOT NULL REFERENCES names(name_id),
     value TEXT NOT NULL CHECK (length(CAST(value AS BLOB)) <= 4194304),
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    PRIMARY KEY (owner_type, owner_id, name, ordinal)
+    PRIMARY KEY (owner_type, owner_id, name_id, ordinal)
 ) WITHOUT ROWID, STRICT";
 pub const TAGS_DDL: &str = "CREATE TABLE tags (
     owner_type INTEGER NOT NULL CHECK (owner_type IN (0, 1)),
-    owner_id BLOB NOT NULL CHECK (length(owner_id) = 16),
-    page_id BLOB NOT NULL CHECK (length(page_id) = 16),
-    tag TEXT NOT NULL CHECK (length(CAST(tag AS BLOB)) BETWEEN 1 AND 4194304),
-    tag_key TEXT NOT NULL CHECK (length(CAST(tag_key AS BLOB)) BETWEEN 1 AND 4194304),
+    owner_id INTEGER NOT NULL,
+    page_id INTEGER NOT NULL REFERENCES pages(page_id) ON DELETE CASCADE,
+    name_id INTEGER NOT NULL REFERENCES names(name_id),
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
     PRIMARY KEY (owner_type, owner_id, ordinal)
 ) WITHOUT ROWID, STRICT";
 pub const TASKS_DDL: &str = "CREATE TABLE tasks (
-    block_id BLOB PRIMARY KEY CHECK (length(block_id) = 16),
-    page_id BLOB NOT NULL CHECK (length(page_id) = 16),
+    block_id INTEGER PRIMARY KEY REFERENCES blocks(block_id) ON DELETE CASCADE,
+    page_id INTEGER NOT NULL REFERENCES pages(page_id) ON DELETE CASCADE,
     marker TEXT NOT NULL CHECK (length(CAST(marker AS BLOB)) BETWEEN 1 AND 4194304),
     priority TEXT CHECK (priority IS NULL OR length(CAST(priority AS BLOB)) <= 4194304),
     scheduled TEXT CHECK (scheduled IS NULL OR length(CAST(scheduled AS BLOB)) <= 4194304),
@@ -497,8 +510,8 @@ pub const TASKS_DDL: &str = "CREATE TABLE tasks (
 /// day -- so presence (`scheduled IS NOT NULL`) survives a malformed date that
 /// has no day at all (E1).
 pub const BLOCK_PLANNING_DDL: &str = "CREATE TABLE block_planning (
-    block_id BLOB PRIMARY KEY CHECK (length(block_id) = 16),
-    page_id BLOB NOT NULL CHECK (length(page_id) = 16),
+    block_id INTEGER PRIMARY KEY REFERENCES blocks(block_id) ON DELETE CASCADE,
+    page_id INTEGER NOT NULL REFERENCES pages(page_id) ON DELETE CASCADE,
     priority TEXT CHECK (priority IS NULL OR length(CAST(priority AS BLOB)) <= 4194304),
     scheduled TEXT CHECK (scheduled IS NULL OR length(CAST(scheduled AS BLOB)) <= 4194304),
     scheduled_day INTEGER,
@@ -512,66 +525,31 @@ pub const BLOCK_PLANNING_DDL: &str = "CREATE TABLE block_planning (
 /// in the block's ancestor closure. The rows come from the ONE tine-core
 /// closure function; nothing here recomputes them (SPEC §5.8).
 pub const BLOCK_PATH_REFS_DDL: &str = "CREATE TABLE block_path_refs (
-    block_id BLOB NOT NULL CHECK (length(block_id) = 16),
-    page_id BLOB NOT NULL CHECK (length(page_id) = 16),
-    normalized_name TEXT NOT NULL CHECK (
-        length(CAST(normalized_name AS BLOB)) BETWEEN 1 AND 4194304
-    ),
-    PRIMARY KEY (block_id, normalized_name)
+    block_id INTEGER NOT NULL REFERENCES blocks(block_id) ON DELETE CASCADE,
+    page_id INTEGER NOT NULL REFERENCES pages(page_id) ON DELETE CASCADE,
+    name_id INTEGER NOT NULL REFERENCES names(name_id),
+    PRIMARY KEY (block_id, name_id)
 ) WITHOUT ROWID, STRICT";
 /// The atoms of every property element (SPEC §3.3, §5.8). `properties` keeps
 /// the unsplit source value for presence, autocomplete and display; this table
 /// carries the flattened, renumbered atom list a value comparison searches.
-pub const QUERY_BLOCK_RESULTS_DDL: &str = "CREATE TABLE query_block_results (
-    block_id BLOB PRIMARY KEY CHECK (length(block_id) = 16)
-        REFERENCES blocks(block_id) ON DELETE CASCADE,
-    page_id BLOB NOT NULL CHECK (length(page_id) = 16)
-        REFERENCES pages(page_id) ON DELETE CASCADE,
-    preorder INTEGER NOT NULL CHECK (preorder >= 0),
-    result_id TEXT NOT NULL CHECK (length(CAST(result_id AS BLOB)) > 0),
-    estimated_bytes INTEGER NOT NULL CHECK (estimated_bytes >= 0),
-    tag_count INTEGER NOT NULL CHECK (tag_count >= 0),
-    property_count INTEGER NOT NULL CHECK (property_count >= 0),
-    UNIQUE (page_id, preorder)
-) STRICT";
-pub const QUERY_PAGE_ORDER_DDL: &str = "CREATE TABLE query_page_order (
-    page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16)
-        REFERENCES pages(page_id) ON DELETE CASCADE,
-    position INTEGER NOT NULL UNIQUE CHECK (position >= 0)
-) STRICT";
 const QUERY_PROJECTION_STATE_DDL: &str = "CREATE TABLE query_projection_state (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    revision INTEGER NOT NULL CHECK (revision >= 0)
+    revision INTEGER NOT NULL CHECK (revision >= 0),
+    next_entity_id INTEGER NOT NULL CHECK (next_entity_id > 0)
 ) STRICT";
-
-pub const QUERY_PAGE_RESULTS_DDL: &str = "CREATE TABLE query_page_results (
-    page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16)
-        REFERENCES pages(page_id) ON DELETE CASCADE,
-    estimated_bytes INTEGER NOT NULL CHECK (estimated_bytes >= 0),
-    property_count INTEGER NOT NULL CHECK (property_count >= 0)
-) STRICT";
-pub const BLOCK_OWN_REFS_DDL: &str = "CREATE TABLE block_own_refs (
-    block_id BLOB NOT NULL CHECK (length(block_id) = 16)
-        REFERENCES blocks(block_id) ON DELETE CASCADE,
-    page_id BLOB NOT NULL CHECK (length(page_id) = 16)
-        REFERENCES pages(page_id) ON DELETE CASCADE,
-    normalized_name TEXT NOT NULL CHECK (length(CAST(normalized_name AS BLOB)) BETWEEN 1 AND 4194304),
-    PRIMARY KEY (block_id, normalized_name)
-) WITHOUT ROWID, STRICT";
 pub const PROPERTY_ATOMS_DDL: &str = "CREATE TABLE property_atoms (
     owner_type INTEGER NOT NULL CHECK (owner_type IN (0, 1)),
-    owner_id BLOB NOT NULL CHECK (length(owner_id) = 16),
-    page_id BLOB NOT NULL CHECK (length(page_id) = 16),
-    normalized_name TEXT NOT NULL CHECK (
-        length(CAST(normalized_name AS BLOB)) BETWEEN 1 AND 4194304
-    ),
+    owner_id INTEGER NOT NULL,
+    page_id INTEGER NOT NULL REFERENCES pages(page_id) ON DELETE CASCADE,
+    name_id INTEGER NOT NULL REFERENCES names(name_id),
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
     atom TEXT NOT NULL CHECK (length(CAST(atom AS BLOB)) <= 4194304),
     atom_key TEXT NOT NULL CHECK (length(CAST(atom_key AS BLOB)) <= 4194304),
     origin INTEGER NOT NULL CHECK (origin IN (0, 1)),
     atom_num REAL,
     atom_day INTEGER,
-    PRIMARY KEY (owner_type, owner_id, normalized_name, ordinal)
+    PRIMARY KEY (owner_type, owner_id, name_id, ordinal)
 ) WITHOUT ROWID, STRICT";
 pub const SEARCH_FTS_DDL: &str = "CREATE VIRTUAL TABLE search_fts USING fts5(
     entity_type UNINDEXED,
@@ -588,19 +566,17 @@ pub const SEARCH_SUBSTRING_FTS_DDL: &str = "CREATE VIRTUAL TABLE search_substrin
 pub const SEARCH_FTS_OWNERS_DDL: &str = "CREATE TABLE search_fts_owners (
     rowid INTEGER PRIMARY KEY,
     entity_type INTEGER NOT NULL CHECK (entity_type IN (0, 1)),
-    entity_id BLOB NOT NULL CHECK (length(entity_id) = 16),
-    page_id BLOB NOT NULL CHECK (length(page_id) = 16),
+    entity_id INTEGER NOT NULL,
+    page_id INTEGER NOT NULL,
     UNIQUE (entity_type, entity_id)
 ) STRICT";
 
-pub const PAGES_NAME_INDEX_DDL: &str = "CREATE INDEX pages_name_idx ON pages(name, page_id)";
-pub const PAGES_NAME_KEY_INDEX_DDL: &str =
-    "CREATE INDEX pages_name_key_idx ON pages(name_key, page_id)";
+pub const NAMES_RAW_KEY_INDEX_DDL: &str =
+    "CREATE INDEX names_raw_key_idx ON names(raw, key, name_id)";
+pub const PAGES_NAME_INDEX_DDL: &str = "CREATE INDEX pages_name_idx ON pages(name_id, page_id)";
 pub const PAGES_JOURNAL_DAY_INDEX_DDL: &str =
     "CREATE INDEX pages_journal_day_idx ON pages(journal_day, page_id)";
 pub const PAGES_PATH_INDEX_DDL: &str = "CREATE INDEX pages_path_idx ON pages(path, page_id)";
-pub const PAGES_HOME_DOCUMENT_ID_INDEX_DDL: &str =
-    "CREATE INDEX pages_home_document_id_idx ON pages(home_document_id, page_id)";
 pub const BLOCKS_PAGE_ORDER_INDEX_DDL: &str =
     "CREATE INDEX blocks_page_order_idx ON blocks(page_id, order_key, block_id)";
 pub const BLOCKS_PARENT_PAGE_INDEX_DDL: &str = "CREATE INDEX blocks_parent_page_idx
@@ -610,11 +586,18 @@ pub const BLOCKS_LOGSEQ_UUID_INDEX_DDL: &str = "CREATE INDEX blocks_logseq_uuid_
 pub const SEARCH_FTS_OWNERS_PAGE_INDEX_DDL: &str =
     "CREATE INDEX search_fts_owners_page_idx ON search_fts_owners(page_id, rowid)";
 pub const REFERENCE_POSTINGS_SOURCE_INDEX_DDL: &str = "CREATE INDEX reference_postings_source_idx
-    ON reference_postings(source_page_id, source_entity_type, source_entity_id, ordinal)";
-pub const REFERENCE_POSTINGS_NORMALIZED_NAME_INDEX_DDL: &str =
-    "CREATE INDEX reference_postings_normalized_name_idx
-    ON reference_postings(normalized_name, source_page_id, source_entity_type, source_entity_id, ordinal)
+    ON reference_postings(source_page_id, source_entity_type, source_entity_id, reference_kind, ordinal)";
+pub const REFERENCE_POSTINGS_TARGET_NAME_INDEX_DDL: &str =
+    "CREATE INDEX reference_postings_target_name_idx
+    ON reference_postings(target_name_id, source_page_id, source_entity_type, source_entity_id, reference_kind, ordinal)
     WHERE target_type = 0";
+pub const REFERENCE_POSTINGS_OCCURRENCE_INDEX_DDL: &str =
+    "CREATE UNIQUE INDEX reference_postings_occurrence_idx
+    ON reference_postings(source_page_id, source_entity_type, source_entity_id, source_locator, ordinal)
+    WHERE reference_kind < 8";
+pub const REFERENCE_POSTINGS_OWN_INDEX_DDL: &str = "CREATE UNIQUE INDEX reference_postings_own_idx
+    ON reference_postings(source_entity_id, target_name_id)
+    WHERE source_entity_type = 1 AND target_type = 0 AND own = 1";
 pub const REFERENCE_POSTINGS_RAW_UUID_INDEX_DDL: &str = "CREATE INDEX reference_postings_raw_uuid_idx
     ON reference_postings(raw_uuid_claim, source_page_id, source_entity_type, source_entity_id, ordinal)
     WHERE target_type = 1";
@@ -623,26 +606,25 @@ pub const REFERENCE_POSTINGS_RAW_UUID_INDEX_DDL: &str = "CREATE INDEX reference_
 /// `<= 4` filter is answered from the index too. Nothing in
 /// `NAVIGATION_REFERENCE_NAMES_*_SQL` needs the table.
 ///
-/// `reference_postings_normalized_name_idx` cannot serve this read: it lacks
-/// `raw_name`, so each row fell back to the table, and its key order forces a
-/// temp B-tree for the `DISTINCT`. Measured on a 10,000-page graph (1.2M
-/// postings), draining every distinct spelling went 1.276 s -> 0.022 s and
-/// 110,000 rows -> 10,010. Column order is load-bearing: putting
-/// `reference_kind` FIRST (a range predicate ahead of the sort keys) makes
-/// SQLite sort instead, measuring 1.765 s — slower than no index at all.
+/// The dictionary supplies spelling/key pairs once; this postings index keeps
+/// the navigation read bounded to referenced name IDs without copying either
+/// string into every occurrence row.
 pub const REFERENCE_POSTINGS_NAVIGATION_NAMES_INDEX_DDL: &str =
     "CREATE INDEX reference_postings_navigation_names_idx
-    ON reference_postings(normalized_name, raw_name, reference_kind)
+    ON reference_postings(target_name_id, reference_kind)
     WHERE target_type = 0";
 pub const REFERENCE_ALIAS_DECLARATIONS_SOURCE_INDEX_DDL: &str =
     "CREATE INDEX reference_alias_declarations_source_idx
-    ON reference_alias_declarations(source_page_id, source_entity_type, source_entity_id, ordinal)";
+    ON reference_alias_declarations(source_page_id, alias_name_id, source_entity_type, source_entity_id, ordinal)";
+pub const REFERENCE_ALIAS_DECLARATIONS_NAME_INDEX_DDL: &str =
+    "CREATE INDEX reference_alias_declarations_name_idx
+    ON reference_alias_declarations(alias_name_id, source_page_id, source_entity_type, source_entity_id)";
 pub const PROPERTIES_LOOKUP_INDEX_DDL: &str = "CREATE INDEX properties_lookup_idx
-    ON properties(normalized_name, value, page_id, owner_type, owner_id)";
+    ON properties(name_id, value, page_id, owner_type, owner_id)";
 pub const PROPERTIES_PAGE_INDEX_DDL: &str = "CREATE INDEX properties_page_idx
-    ON properties(page_id, owner_type, owner_id, name, ordinal)";
+    ON properties(page_id, owner_type, owner_id, name_id, ordinal)";
 pub const TAGS_LOOKUP_INDEX_DDL: &str =
-    "CREATE INDEX tags_lookup_idx ON tags(tag_key, page_id, owner_type, owner_id)";
+    "CREATE INDEX tags_lookup_idx ON tags(name_id, page_id, owner_type, owner_id)";
 pub const TAGS_PAGE_INDEX_DDL: &str =
     "CREATE INDEX tags_page_idx ON tags(page_id, owner_type, owner_id, ordinal)";
 pub const TASKS_MARKER_INDEX_DDL: &str =
@@ -666,17 +648,17 @@ pub const BLOCK_PLANNING_SCHEDULED_INDEX_DDL: &str =
 pub const BLOCK_PLANNING_DEADLINE_INDEX_DDL: &str =
     "CREATE INDEX block_planning_deadline_idx ON block_planning(deadline, page_id, block_id)";
 pub const BLOCK_PATH_REFS_LOOKUP_INDEX_DDL: &str = "CREATE INDEX block_path_refs_lookup_idx
-    ON block_path_refs(normalized_name, page_id, block_id)";
+    ON block_path_refs(name_id, page_id, block_id)";
 pub const BLOCK_PATH_REFS_PAGE_INDEX_DDL: &str = "CREATE INDEX block_path_refs_page_idx
-    ON block_path_refs(page_id, block_id, normalized_name)";
+    ON block_path_refs(page_id, block_id, name_id)";
 pub const PROPERTY_ATOMS_KEY_INDEX_DDL: &str = "CREATE INDEX property_atoms_key_idx
-    ON property_atoms(normalized_name, atom_key, page_id, owner_type, owner_id)";
+    ON property_atoms(name_id, atom_key, page_id, owner_type, owner_id)";
 pub const PROPERTY_ATOMS_NUM_INDEX_DDL: &str = "CREATE INDEX property_atoms_num_idx
-    ON property_atoms(normalized_name, atom_num, page_id, owner_type, owner_id)";
+    ON property_atoms(name_id, atom_num, page_id, owner_type, owner_id)";
 pub const PROPERTY_ATOMS_DAY_INDEX_DDL: &str = "CREATE INDEX property_atoms_day_idx
-    ON property_atoms(normalized_name, atom_day, page_id, owner_type, owner_id)";
+    ON property_atoms(name_id, atom_day, page_id, owner_type, owner_id)";
 pub const PROPERTY_ATOMS_PAGE_INDEX_DDL: &str = "CREATE INDEX property_atoms_page_idx
-    ON property_atoms(page_id, owner_type, owner_id, normalized_name, ordinal)";
+    ON property_atoms(page_id, owner_type, owner_id, name_id, ordinal)";
 
 // A terminal bootstrap candidate is a brand-new, unpublished database. Its
 // ordinary secondary indexes can be built once after the complete row set is
@@ -684,15 +666,11 @@ pub const PROPERTY_ATOMS_PAGE_INDEX_DDL: &str = "CREATE INDEX property_atoms_pag
 // indexes and both FTS virtual tables remain live throughout construction.
 // This list must reproduce the exact normal schema before the transaction can
 // commit.
-const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 32] = [
+const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 34] = [
+    ("names_raw_key_idx", NAMES_RAW_KEY_INDEX_DDL),
     ("pages_name_idx", PAGES_NAME_INDEX_DDL),
-    ("pages_name_key_idx", PAGES_NAME_KEY_INDEX_DDL),
     ("pages_journal_day_idx", PAGES_JOURNAL_DAY_INDEX_DDL),
     ("pages_path_idx", PAGES_PATH_INDEX_DDL),
-    (
-        "pages_home_document_id_idx",
-        PAGES_HOME_DOCUMENT_ID_INDEX_DDL,
-    ),
     ("blocks_page_order_idx", BLOCKS_PAGE_ORDER_INDEX_DDL),
     ("blocks_parent_page_idx", BLOCKS_PARENT_PAGE_INDEX_DDL),
     ("blocks_logseq_uuid_idx", BLOCKS_LOGSEQ_UUID_INDEX_DDL),
@@ -705,8 +683,16 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 32] = [
         REFERENCE_POSTINGS_SOURCE_INDEX_DDL,
     ),
     (
-        "reference_postings_normalized_name_idx",
-        REFERENCE_POSTINGS_NORMALIZED_NAME_INDEX_DDL,
+        "reference_postings_target_name_idx",
+        REFERENCE_POSTINGS_TARGET_NAME_INDEX_DDL,
+    ),
+    (
+        "reference_postings_occurrence_idx",
+        REFERENCE_POSTINGS_OCCURRENCE_INDEX_DDL,
+    ),
+    (
+        "reference_postings_own_idx",
+        REFERENCE_POSTINGS_OWN_INDEX_DDL,
     ),
     (
         "reference_postings_raw_uuid_idx",
@@ -719,6 +705,10 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 32] = [
     (
         "reference_alias_declarations_source_idx",
         REFERENCE_ALIAS_DECLARATIONS_SOURCE_INDEX_DDL,
+    ),
+    (
+        "reference_alias_declarations_name_idx",
+        REFERENCE_ALIAS_DECLARATIONS_NAME_INDEX_DDL,
     ),
     ("properties_lookup_idx", PROPERTIES_LOOKUP_INDEX_DDL),
     ("properties_page_idx", PROPERTIES_PAGE_INDEX_DDL),
@@ -758,10 +748,12 @@ const TERMINAL_DEFERRED_INDEXES: [(&str, &str); 32] = [
     ("property_atoms_page_idx", PROPERTY_ATOMS_PAGE_INDEX_DDL),
 ];
 
-const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 18] = [
+const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 15] = [
+    ("names", &["name_id", "key", "raw"]),
     (
         "reference_postings",
         &[
+            "posting_id",
             "source_page_id",
             "source_entity_type",
             "source_entity_id",
@@ -769,11 +761,9 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 18] = [
             "ordinal",
             "reference_kind",
             "target_type",
-            "raw_name",
-            "normalized_name",
+            "target_name_id",
             "raw_uuid_claim",
-            "resolved_page_id",
-            "resolved_block_id",
+            "own",
         ],
     ),
     (
@@ -784,20 +774,20 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 18] = [
             "source_entity_id",
             "source_locator",
             "ordinal",
-            "raw_alias",
-            "normalized_alias",
+            "alias_name_id",
         ],
     ),
     (
         "pages",
         &[
             "page_id",
-            "home_document_id",
-            "name",
-            "name_key",
+            "name_id",
             "path",
             "text_kind",
             "journal_day",
+            "position",
+            "estimated_bytes",
+            "property_count",
         ],
     ),
     (
@@ -824,7 +814,7 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 18] = [
         &[
             "block_id",
             "page_id",
-            "home_document_id",
+            "result_id",
             "parent_block_id",
             "order_key",
             "query_visible_folded",
@@ -832,6 +822,10 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 18] = [
             "collapsed",
             "logseq_uuid",
             "logseq_identity_origin",
+            "preorder",
+            "estimated_bytes",
+            "tag_count",
+            "property_count",
         ],
     ),
     (
@@ -840,22 +834,14 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 18] = [
             "owner_type",
             "owner_id",
             "page_id",
-            "name",
-            "normalized_name",
+            "name_id",
             "value",
             "ordinal",
         ],
     ),
     (
         "tags",
-        &[
-            "owner_type",
-            "owner_id",
-            "page_id",
-            "tag",
-            "tag_key",
-            "ordinal",
-        ],
+        &["owner_type", "owner_id", "page_id", "name_id", "ordinal"],
     ),
     (
         "tasks",
@@ -880,31 +866,10 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 18] = [
             "deadline_day",
         ],
     ),
+    ("block_path_refs", &["block_id", "page_id", "name_id"]),
     (
-        "block_path_refs",
-        &["block_id", "page_id", "normalized_name"],
-    ),
-    (
-        "block_own_refs",
-        &["block_id", "page_id", "normalized_name"],
-    ),
-    (
-        "query_block_results",
-        &[
-            "block_id",
-            "page_id",
-            "preorder",
-            "result_id",
-            "estimated_bytes",
-            "tag_count",
-            "property_count",
-        ],
-    ),
-    ("query_page_order", &["page_id", "position"]),
-    ("query_projection_state", &["singleton", "revision"]),
-    (
-        "query_page_results",
-        &["page_id", "estimated_bytes", "property_count"],
+        "query_projection_state",
+        &["singleton", "revision", "next_entity_id"],
     ),
     (
         "property_atoms",
@@ -912,7 +877,7 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 18] = [
             "owner_type",
             "owner_id",
             "page_id",
-            "normalized_name",
+            "name_id",
             "ordinal",
             "atom",
             "atom_key",
@@ -927,7 +892,8 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 18] = [
     ),
 ];
 
-const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 51] = [
+const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 50] = [
+    ("table", "names", NAMES_DDL),
     ("table", "reference_postings", REFERENCE_POSTINGS_DDL),
     (
         "table",
@@ -943,10 +909,6 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 51] = [
     ("table", "tasks", TASKS_DDL),
     ("table", "block_planning", BLOCK_PLANNING_DDL),
     ("table", "block_path_refs", BLOCK_PATH_REFS_DDL),
-    ("table", "block_own_refs", BLOCK_OWN_REFS_DDL),
-    ("table", "query_block_results", QUERY_BLOCK_RESULTS_DDL),
-    ("table", "query_page_order", QUERY_PAGE_ORDER_DDL),
-    ("table", "query_page_results", QUERY_PAGE_RESULTS_DDL),
     (
         "table",
         "query_projection_state",
@@ -956,19 +918,14 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 51] = [
     ("table", "search_fts_owners", SEARCH_FTS_OWNERS_DDL),
     ("table", "search_fts", SEARCH_FTS_DDL),
     ("table", "search_substring_fts", SEARCH_SUBSTRING_FTS_DDL),
+    ("index", "names_raw_key_idx", NAMES_RAW_KEY_INDEX_DDL),
     ("index", "pages_name_idx", PAGES_NAME_INDEX_DDL),
-    ("index", "pages_name_key_idx", PAGES_NAME_KEY_INDEX_DDL),
     (
         "index",
         "pages_journal_day_idx",
         PAGES_JOURNAL_DAY_INDEX_DDL,
     ),
     ("index", "pages_path_idx", PAGES_PATH_INDEX_DDL),
-    (
-        "index",
-        "pages_home_document_id_idx",
-        PAGES_HOME_DOCUMENT_ID_INDEX_DDL,
-    ),
     (
         "index",
         "blocks_page_order_idx",
@@ -996,8 +953,18 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 51] = [
     ),
     (
         "index",
-        "reference_postings_normalized_name_idx",
-        REFERENCE_POSTINGS_NORMALIZED_NAME_INDEX_DDL,
+        "reference_postings_target_name_idx",
+        REFERENCE_POSTINGS_TARGET_NAME_INDEX_DDL,
+    ),
+    (
+        "index",
+        "reference_postings_occurrence_idx",
+        REFERENCE_POSTINGS_OCCURRENCE_INDEX_DDL,
+    ),
+    (
+        "index",
+        "reference_postings_own_idx",
+        REFERENCE_POSTINGS_OWN_INDEX_DDL,
     ),
     (
         "index",
@@ -1013,6 +980,11 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 51] = [
         "index",
         "reference_alias_declarations_source_idx",
         REFERENCE_ALIAS_DECLARATIONS_SOURCE_INDEX_DDL,
+    ),
+    (
+        "index",
+        "reference_alias_declarations_name_idx",
+        REFERENCE_ALIAS_DECLARATIONS_NAME_INDEX_DDL,
     ),
     (
         "index",
@@ -1085,40 +1057,39 @@ pub(crate) fn initialize_graph_projection_schema(
     connection: &Connection,
 ) -> Result<(), MaterializationError> {
     connection.execute_batch(&format!(
-        "{REFERENCE_POSTINGS_DDL};
-         {REFERENCE_ALIAS_DECLARATIONS_DDL};
+        "{NAMES_DDL};
          {PAGES_DDL};
-         {PAGE_TEXT_DDL};
          {BLOCKS_DDL};
+         {REFERENCE_POSTINGS_DDL};
+         {REFERENCE_ALIAS_DECLARATIONS_DDL};
+         {PAGE_TEXT_DDL};
          {BLOCK_TEXT_DDL};
          {PROPERTIES_DDL};
          {TAGS_DDL};
          {TASKS_DDL};
          {BLOCK_PLANNING_DDL};
          {BLOCK_PATH_REFS_DDL};
-         {BLOCK_OWN_REFS_DDL};
-         {QUERY_BLOCK_RESULTS_DDL};
-         {QUERY_PAGE_ORDER_DDL};
-         {QUERY_PAGE_RESULTS_DDL};
          {QUERY_PROJECTION_STATE_DDL};
          {PROPERTY_ATOMS_DDL};
          {SEARCH_FTS_OWNERS_DDL};
          {SEARCH_FTS_DDL};
          {SEARCH_SUBSTRING_FTS_DDL};
+         {NAMES_RAW_KEY_INDEX_DDL};
          {PAGES_NAME_INDEX_DDL};
-         {PAGES_NAME_KEY_INDEX_DDL};
          {PAGES_JOURNAL_DAY_INDEX_DDL};
          {PAGES_PATH_INDEX_DDL};
-         {PAGES_HOME_DOCUMENT_ID_INDEX_DDL};
          {BLOCKS_PAGE_ORDER_INDEX_DDL};
          {BLOCKS_PARENT_PAGE_INDEX_DDL};
          {BLOCKS_LOGSEQ_UUID_INDEX_DDL};
          {SEARCH_FTS_OWNERS_PAGE_INDEX_DDL};
          {REFERENCE_POSTINGS_SOURCE_INDEX_DDL};
-         {REFERENCE_POSTINGS_NORMALIZED_NAME_INDEX_DDL};
+         {REFERENCE_POSTINGS_TARGET_NAME_INDEX_DDL};
+         {REFERENCE_POSTINGS_OCCURRENCE_INDEX_DDL};
+         {REFERENCE_POSTINGS_OWN_INDEX_DDL};
          {REFERENCE_POSTINGS_RAW_UUID_INDEX_DDL};
          {REFERENCE_POSTINGS_NAVIGATION_NAMES_INDEX_DDL};
          {REFERENCE_ALIAS_DECLARATIONS_SOURCE_INDEX_DDL};
+         {REFERENCE_ALIAS_DECLARATIONS_NAME_INDEX_DDL};
          {PROPERTIES_LOOKUP_INDEX_DDL};
          {PROPERTIES_PAGE_INDEX_DDL};
          {TAGS_LOOKUP_INDEX_DDL};
@@ -1138,7 +1109,7 @@ pub(crate) fn initialize_graph_projection_schema(
          {PROPERTY_ATOMS_DAY_INDEX_DDL};
          {PROPERTY_ATOMS_PAGE_INDEX_DDL};"
     ))?;
-    connection.execute("INSERT INTO query_projection_state VALUES (1, 0)", [])?;
+    connection.execute("INSERT INTO query_projection_state VALUES (1, 0, 1)", [])?;
     Ok(())
 }
 
@@ -1204,7 +1175,8 @@ fn canonical_sql(sql: &str) -> String {
 /// with those indexes dropped only while all of these are empty: the per-page
 /// cleanup and FTS lookups that precede insertion are full scans without their
 /// index — free on an empty table, quadratic on a populated one.
-const DEFERRED_INDEX_TABLES: [&str; 11] = [
+const DEFERRED_INDEX_TABLES: [&str; 12] = [
+    "names",
     "pages",
     "blocks",
     "search_fts_owners",
@@ -1261,60 +1233,46 @@ fn insert_reference_posting(
     transaction: &Connection,
     posting: &PhysicalReferencePosting,
 ) -> Result<(), MaterializationError> {
-    let (source_entity_type, source_entity_id) = posting.source_entity.sql_parts();
+    let source_page_id = page_coordinate(transaction, &posting.source_page_path)?;
+    let (source_entity_type, source_entity_id) =
+        entity_coordinate(transaction, &posting.source_entity)?;
+    validate_entity_page(
+        transaction,
+        source_page_id,
+        source_entity_type,
+        source_entity_id,
+    )?;
     let locator = &posting.source_locator;
-    let (
-        target_type,
-        raw_name,
-        normalized_name,
-        raw_uuid_claim,
-        resolved_page_id,
-        resolved_block_id,
-    ) = match &posting.target {
+    let (target_type, target_name_id, raw_uuid_claim) = match &posting.target {
         PhysicalReferenceTarget::PageName {
             raw_name,
             normalized_name,
-            resolved_page_id,
         } => (
             0_i64,
-            Some(raw_name.as_str()),
-            Some(normalized_name.as_str()),
-            None,
-            resolved_page_id.map(|id| id.to_vec()),
+            Some(intern_name(transaction, normalized_name, raw_name)?),
             None,
         ),
-        PhysicalReferenceTarget::ExternalUuid {
-            raw_claim,
-            resolved_block_id,
-        } => (
-            1_i64,
-            None,
-            None,
-            Some(raw_claim.to_vec()),
-            None,
-            resolved_block_id.map(|id| id.to_vec()),
-        ),
+        PhysicalReferenceTarget::ExternalUuid { raw_claim } => {
+            (1_i64, None, Some(raw_claim.to_vec()))
+        }
     };
     execute_cached(
         transaction,
         "INSERT INTO reference_postings (
              source_page_id, source_entity_type, source_entity_id, source_locator,
-             ordinal, reference_kind, target_type, raw_name, normalized_name,
-             raw_uuid_claim, resolved_page_id, resolved_block_id
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             ordinal, reference_kind, target_type, target_name_id,
+             raw_uuid_claim, own
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)",
         params![
-            posting.source_page_id.as_slice(),
+            source_page_id,
             source_entity_type,
-            source_entity_id.as_slice(),
+            source_entity_id,
             locator,
             i64::from(posting.ordinal),
             posting.kind,
             target_type,
-            raw_name,
-            normalized_name,
+            target_name_id,
             raw_uuid_claim,
-            resolved_page_id,
-            resolved_block_id,
         ],
     )?;
     Ok(())
@@ -1324,24 +1282,110 @@ fn insert_alias_declaration(
     transaction: &Connection,
     alias: &PhysicalAliasDeclaration,
 ) -> Result<(), MaterializationError> {
-    let (source_entity_type, source_entity_id) = alias.source_entity.sql_parts();
+    let source_page_id = page_coordinate(transaction, &alias.source_page_path)?;
+    let (source_entity_type, source_entity_id) =
+        entity_coordinate(transaction, &alias.source_entity)?;
+    validate_entity_page(
+        transaction,
+        source_page_id,
+        source_entity_type,
+        source_entity_id,
+    )?;
+    let alias_name_id = intern_name(transaction, &alias.normalized_alias, &alias.raw_alias)?;
     let locator = &alias.source_locator;
     execute_cached(
         transaction,
         "INSERT INTO reference_alias_declarations (
              source_page_id, source_entity_type, source_entity_id, source_locator,
-             ordinal, raw_alias, normalized_alias
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             ordinal, alias_name_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
-            alias.source_page_id.as_slice(),
+            source_page_id,
             source_entity_type,
-            source_entity_id.as_slice(),
+            source_entity_id,
             locator,
             i64::from(alias.ordinal),
-            &alias.raw_alias,
-            &alias.normalized_alias,
+            alias_name_id,
         ],
     )?;
+    Ok(())
+}
+
+fn intern_name(connection: &Connection, key: &str, raw: &str) -> Result<i64, MaterializationError> {
+    if key.is_empty() || raw.is_empty() {
+        return Err(MaterializationError::InvalidInput(
+            "name key and spelling must be non-empty".into(),
+        ));
+    }
+    connection.execute(
+        "INSERT INTO names (key, raw) VALUES (?1, ?2) ON CONFLICT(key, raw) DO NOTHING",
+        params![key, raw],
+    )?;
+    Ok(connection.query_row(
+        "SELECT name_id FROM names WHERE key = ?1 AND raw = ?2",
+        params![key, raw],
+        |row| row.get(0),
+    )?)
+}
+
+fn page_coordinate(connection: &Connection, path: &str) -> Result<i64, MaterializationError> {
+    connection
+        .query_row(
+            "SELECT page_id FROM pages WHERE path = ?1",
+            params![path],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| MaterializationError::InvalidInput(format!("unknown page path {path:?}")))
+}
+
+fn block_coordinate(connection: &Connection, result_id: &str) -> Result<i64, MaterializationError> {
+    connection
+        .query_row(
+            "SELECT block_id FROM blocks WHERE result_id = ?1",
+            params![result_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            MaterializationError::InvalidInput(format!("unknown block result ID {result_id:?}"))
+        })
+}
+
+fn entity_coordinate(
+    connection: &Connection,
+    entity: &PhysicalEntityId,
+) -> Result<(i64, i64), MaterializationError> {
+    match entity {
+        PhysicalEntityId::Page(path) => Ok((0, page_coordinate(connection, path)?)),
+        PhysicalEntityId::Block(result_id) => Ok((1, block_coordinate(connection, result_id)?)),
+    }
+}
+
+fn validate_entity_page(
+    connection: &Connection,
+    source_page_id: i64,
+    entity_type: i64,
+    entity_id: i64,
+) -> Result<(), MaterializationError> {
+    let owner_page_id = match entity_type {
+        0 => entity_id,
+        1 => connection.query_row(
+            "SELECT page_id FROM blocks WHERE block_id = ?1",
+            params![entity_id],
+            |row| row.get(0),
+        )?,
+        _ => {
+            return Err(MaterializationError::InvalidInput(
+                "unknown source entity type".into(),
+            ))
+        }
+    };
+    if owner_page_id != source_page_id {
+        return Err(MaterializationError::InvalidInput(
+            "reference source entity does not belong to its source page".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -1362,7 +1406,9 @@ pub(crate) fn query_projection_revision(
         })
 }
 
-fn advance_query_projection_revision(connection: &Connection) -> Result<(), MaterializationError> {
+pub(crate) fn advance_query_projection_revision(
+    connection: &Connection,
+) -> Result<(), MaterializationError> {
     let changed = connection.execute(
         "UPDATE query_projection_state SET revision = revision + 1
          WHERE singleton = 1 AND revision < 9223372036854775807",
@@ -1378,36 +1424,119 @@ fn advance_query_projection_revision(connection: &Connection) -> Result<(), Mate
 
 pub(crate) fn apply_graph_projection_rows(
     transaction: &Connection,
-    replacements: &[PhysicalPage],
-    deletions: &[[u8; 16]],
+    change: &PhysicalGraphProjectionChange,
+    aliases: &[PhysicalAliasDeclaration],
     fts_instrumentation: Option<&mut FtsChangeInstrumentation>,
 ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
-    advance_query_projection_revision(transaction)?;
-    let affected_pages = replacements
+    validate_change_ownership(change, aliases)?;
+    let replacement_paths = change
+        .replacements
         .iter()
-        .map(|page| page.page_id)
-        .chain(deletions.iter().copied())
+        .map(|page| page.path.as_str())
         .collect::<BTreeSet<_>>();
+    if replacement_paths.len() != change.replacements.len() {
+        return Err(MaterializationError::InvalidInput(
+            "replacement pages contain a duplicate path".into(),
+        ));
+    }
+    let mut page_ids = BTreeMap::new();
+    let mut retained_positions = BTreeMap::new();
+    for path in replacement_paths
+        .iter()
+        .copied()
+        .chain(change.deletions.iter().map(String::as_str))
+    {
+        if let Some((id, position)) = transaction
+            .query_row(
+                "SELECT page_id, position FROM pages WHERE path = ?1",
+                params![path],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+            )
+            .optional()?
+        {
+            page_ids.insert(path.to_owned(), id);
+            if replacement_paths.contains(path) {
+                retained_positions.insert(path.to_owned(), position);
+            }
+        }
+    }
+    let new_page_count = change
+        .replacements
+        .iter()
+        .filter(|page| !page_ids.contains_key(&page.path))
+        .count();
+    let block_count = change
+        .replacements
+        .iter()
+        .map(|page| page.blocks.len())
+        .sum::<usize>();
+    let allocated =
+        allocate_entity_coordinates(transaction, new_page_count.saturating_add(block_count))?;
+    let mut next = allocated.into_iter();
+    for page in &change.replacements {
+        if !page_ids.contains_key(&page.path) {
+            page_ids.insert(
+                page.path.clone(),
+                next.next().expect("allocated page coordinate"),
+            );
+        }
+    }
+    let mut block_ids = BTreeMap::new();
+    for page in &change.replacements {
+        for block in &page.blocks {
+            if block.result_id.is_empty()
+                || block_ids
+                    .insert(
+                        block.result_id.clone(),
+                        next.next().expect("allocated block coordinate"),
+                    )
+                    .is_some()
+            {
+                return Err(MaterializationError::InvalidInput(
+                    "replacement blocks contain an empty or duplicate result ID".into(),
+                ));
+            }
+        }
+    }
+    let affected_pages = page_ids.values().copied().collect::<BTreeSet<_>>();
+    let affected_name_ids = affected_name_ids(transaction, &affected_pages)?;
     let old_fts = load_fts_source_rows(transaction, &affected_pages)?;
     let mut instrumentation = ApplyChangeInstrumentation::default();
-    for page_id in deletions {
-        let cleanup = delete_page(transaction, *page_id)?;
+    for path in &change.deletions {
+        let cleanup = match page_ids.get(path) {
+            Some(page_id) => delete_page(transaction, *page_id)?,
+            None => PageCleanupInstrumentation::default(),
+        };
         instrumentation.cleanup_page_attempts += 1;
         instrumentation.cleanup_existing_pages += cleanup.existing_pages;
         instrumentation.cleanup_owned_rows += cleanup.owned_rows;
         instrumentation.cleanup_fts_rowids += cleanup.fts_rowids;
     }
-    for page in replacements {
-        let cleanup = delete_page(transaction, page.page_id)?;
+    for page in &change.replacements {
+        let cleanup = delete_page(transaction, page_ids[&page.path])?;
         instrumentation.cleanup_page_attempts += 1;
         instrumentation.cleanup_existing_pages += cleanup.existing_pages;
         instrumentation.cleanup_owned_rows += cleanup.owned_rows;
         instrumentation.cleanup_fts_rowids += cleanup.fts_rowids;
     }
-    for page in replacements {
-        insert_page(transaction, page)?;
+    for page in &change.replacements {
+        insert_page(
+            transaction,
+            page,
+            page_ids[&page.path],
+            retained_positions.get(&page.path).copied().flatten(),
+            &block_ids,
+        )?;
     }
-    let new_fts = replacement_fts_rows(replacements)?;
+    for posting in &change.reference_postings {
+        insert_reference_posting(transaction, posting)?;
+    }
+    for alias in aliases {
+        insert_alias_declaration(transaction, alias)?;
+    }
+    insert_own_reference_memberships(transaction, &change.replacements)?;
+    reclaim_affected_names(transaction, &affected_name_ids)?;
+    let new_fts = replacement_fts_rows(&change.replacements, &page_ids, &block_ids)?;
     reconcile_fts_rows(
         transaction,
         old_fts,
@@ -1418,20 +1547,19 @@ pub(crate) fn apply_graph_projection_rows(
     Ok(instrumentation)
 }
 
-pub(crate) fn replace_graph_projection_reference_facts(
-    transaction: &Connection,
+fn validate_change_ownership(
     change: &PhysicalGraphProjectionChange,
     aliases: &[PhysicalAliasDeclaration],
 ) -> Result<(), MaterializationError> {
     let replacement_ids = change
         .replacements
         .iter()
-        .map(|page| page.page_id)
+        .map(|page| page.path.as_str())
         .collect::<BTreeSet<_>>();
     if change
         .reference_postings
         .iter()
-        .any(|posting| !replacement_ids.contains(&posting.source_page_id))
+        .any(|posting| !replacement_ids.contains(posting.source_page_path.as_str()))
     {
         return Err(MaterializationError::InvalidInput(
             "graph-projection reference postings must belong to replacement pages".into(),
@@ -1439,32 +1567,135 @@ pub(crate) fn replace_graph_projection_reference_facts(
     }
     if aliases
         .iter()
-        .any(|alias| !replacement_ids.contains(&alias.source_page_id))
+        .any(|alias| !replacement_ids.contains(alias.source_page_path.as_str()))
     {
         return Err(MaterializationError::InvalidInput(
             "graph-projection aliases must belong to replacement pages".into(),
         ));
     }
-    let affected_pages = replacement_ids
-        .iter()
-        .chain(change.deletions.iter())
-        .copied()
-        .collect::<BTreeSet<_>>();
-    for page_id in &affected_pages {
-        transaction.execute(
-            "DELETE FROM reference_postings WHERE source_page_id = ?1",
-            params![page_id.as_slice()],
-        )?;
-        transaction.execute(
-            "DELETE FROM reference_alias_declarations WHERE source_page_id = ?1",
-            params![page_id.as_slice()],
+    Ok(())
+}
+
+fn allocate_entity_coordinates(
+    connection: &Connection,
+    count: usize,
+) -> Result<Vec<i64>, MaterializationError> {
+    let count = i64::try_from(count).map_err(|_| {
+        MaterializationError::InvalidInput("entity coordinate count exceeds SQLite".into())
+    })?;
+    let start: i64 = connection.query_row(
+        "SELECT next_entity_id FROM query_projection_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let end = start.checked_add(count).ok_or_else(|| {
+        MaterializationError::InvalidInput("entity coordinate allocator exhausted".into())
+    })?;
+    let changed = connection.execute(
+        "UPDATE query_projection_state SET next_entity_id = ?1 WHERE singleton = 1 AND next_entity_id = ?2",
+        params![end, start],
+    )?;
+    if changed != 1 {
+        return Err(MaterializationError::Corrupt(
+            "entity coordinate allocator is missing".into(),
+        ));
+    }
+    Ok((start..end).collect())
+}
+
+fn affected_name_ids(
+    connection: &Connection,
+    page_ids: &BTreeSet<i64>,
+) -> Result<BTreeSet<i64>, MaterializationError> {
+    let mut output = BTreeSet::new();
+    for page_id in page_ids {
+        for sql in [
+            "SELECT name_id FROM pages WHERE page_id = ?1",
+            "SELECT target_name_id FROM reference_postings WHERE source_page_id = ?1 AND target_name_id IS NOT NULL",
+            "SELECT alias_name_id FROM reference_alias_declarations WHERE source_page_id = ?1",
+            "SELECT name_id FROM properties WHERE page_id = ?1",
+            "SELECT name_id FROM tags WHERE page_id = ?1",
+            "SELECT name_id FROM block_path_refs WHERE page_id = ?1",
+            "SELECT name_id FROM property_atoms WHERE page_id = ?1",
+        ] {
+            let mut statement = connection.prepare_cached(sql)?;
+            for row in statement.query_map(params![page_id], |row| row.get::<_, i64>(0))? {
+                output.insert(row?);
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn reclaim_affected_names(
+    connection: &Connection,
+    affected: &BTreeSet<i64>,
+) -> Result<(), MaterializationError> {
+    for name_id in affected {
+        connection.execute(
+            "DELETE FROM names WHERE name_id = ?1
+             AND NOT EXISTS (SELECT 1 FROM pages WHERE name_id = ?1)
+             AND NOT EXISTS (
+                 SELECT 1 FROM reference_postings
+                 WHERE target_name_id = ?1 AND target_type = 0
+             )
+             AND NOT EXISTS (SELECT 1 FROM reference_alias_declarations WHERE alias_name_id = ?1)
+             AND NOT EXISTS (SELECT 1 FROM properties WHERE name_id = ?1)
+             AND NOT EXISTS (SELECT 1 FROM tags WHERE name_id = ?1)
+             AND NOT EXISTS (SELECT 1 FROM block_path_refs WHERE name_id = ?1)
+             AND NOT EXISTS (SELECT 1 FROM property_atoms WHERE name_id = ?1)",
+            params![name_id],
         )?;
     }
-    for posting in &change.reference_postings {
-        insert_reference_posting(transaction, posting)?;
-    }
-    for alias in aliases {
-        insert_alias_declaration(transaction, alias)?;
+    Ok(())
+}
+
+fn insert_own_reference_memberships(
+    connection: &Connection,
+    pages: &[PhysicalPage],
+) -> Result<(), MaterializationError> {
+    for page in pages {
+        let page_id = page_coordinate(connection, &page.path)?;
+        for block in &page.blocks {
+            let block_id = block_coordinate(connection, &block.result_id)?;
+            let mut seen = BTreeSet::new();
+            for name in &block.own_refs {
+                // `own_refs` is the normalized parser set. One occurrence with
+                // the same normalized key witnesses that membership; its raw
+                // spelling is not the source of the membership claim. Every
+                // occurrence keeps its own dictionary spelling regardless.
+                if !seen.insert(name.key.as_str()) {
+                    continue;
+                }
+                let occurrence: Option<i64> = connection
+                    .query_row(
+                        "SELECT r.posting_id FROM reference_postings AS r
+                     JOIN names AS n ON n.name_id = r.target_name_id
+                     WHERE r.source_entity_type = 1 AND r.source_entity_id = ?1
+                       AND r.target_type = 0 AND r.reference_kind < 8
+                       AND n.key = ?2 ORDER BY r.posting_id LIMIT 1",
+                        params![block_id, &name.key],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if let Some(posting_id) = occurrence {
+                    connection.execute(
+                        "UPDATE reference_postings SET own = 1 WHERE posting_id = ?1",
+                        params![posting_id],
+                    )?;
+                } else {
+                    let name_id = intern_name(connection, &name.key, &name.raw)?;
+                    connection.execute(
+                        "INSERT INTO reference_postings (
+                            source_page_id, source_entity_type, source_entity_id,
+                            source_locator, ordinal, reference_kind, target_type,
+                            target_name_id, raw_uuid_claim, own
+                         ) VALUES (?1, 1, ?2, NULL, NULL, 8, 0, ?3, NULL, 1)",
+                        params![page_id, block_id, name_id],
+                    )?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1479,10 +1710,6 @@ pub(crate) fn reset_graph_projection_rows(
          DELETE FROM search_fts_owners;
          DELETE FROM property_atoms;
          DELETE FROM block_path_refs;
-         DELETE FROM block_own_refs;
-         DELETE FROM query_block_results;
-         DELETE FROM query_page_order;
-         DELETE FROM query_page_results;
          DELETE FROM block_planning;
          DELETE FROM tasks;
          DELETE FROM tags;
@@ -1492,7 +1719,9 @@ pub(crate) fn reset_graph_projection_rows(
          DELETE FROM block_text;
          DELETE FROM blocks;
          DELETE FROM page_text;
-         DELETE FROM pages;",
+         DELETE FROM pages;
+         DELETE FROM names;
+         UPDATE query_projection_state SET next_entity_id = 1 WHERE singleton = 1;",
     )?;
     Ok(())
 }
@@ -1506,93 +1735,66 @@ struct PageCleanupInstrumentation {
 
 fn delete_page(
     transaction: &Connection,
-    page_id: [u8; 16],
+    page_id: i64,
 ) -> Result<PageCleanupInstrumentation, MaterializationError> {
     let page = &page_id;
     let existing: i64 = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM pages WHERE page_id = ?1)",
-        params![page.as_slice()],
+        params![page],
         |row| row.get(0),
     )?;
     let mut instrumentation = PageCleanupInstrumentation {
         existing_pages: usize::from(existing != 0),
         ..PageCleanupInstrumentation::default()
     };
-    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(
-        transaction.execute(
-            "DELETE FROM block_own_refs WHERE block_id IN (SELECT block_id FROM blocks WHERE page_id = ?1)",
-            params![page.as_slice()],
-        )?,
-    );
-    for table in [
-        "query_block_results",
-        "query_page_order",
-        "query_page_results",
-    ] {
+    for table in ["reference_postings", "reference_alias_declarations"] {
         instrumentation.owned_rows =
             instrumentation
                 .owned_rows
                 .saturating_add(transaction.execute(
-                    &format!("DELETE FROM {table} WHERE page_id = ?1"),
-                    params![page.as_slice()],
+                    &format!("DELETE FROM {table} WHERE source_page_id = ?1"),
+                    params![page],
                 )?);
     }
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM properties WHERE page_id = ?1",
-            params![page.as_slice()],
-        )?);
+    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(
+        transaction.execute("DELETE FROM properties WHERE page_id = ?1", params![page])?,
+    );
     instrumentation.owned_rows = instrumentation
         .owned_rows
         .saturating_add(transaction.execute(
             "DELETE FROM property_atoms WHERE page_id = ?1",
-            params![page.as_slice()],
+            params![page],
         )?);
     instrumentation.owned_rows = instrumentation
         .owned_rows
         .saturating_add(transaction.execute(
             "DELETE FROM block_path_refs WHERE page_id = ?1",
-            params![page.as_slice()],
+            params![page],
         )?);
     instrumentation.owned_rows = instrumentation
         .owned_rows
         .saturating_add(transaction.execute(
             "DELETE FROM block_planning WHERE page_id = ?1",
-            params![page.as_slice()],
+            params![page],
         )?);
     instrumentation.owned_rows = instrumentation
         .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM tags WHERE page_id = ?1",
-            params![page.as_slice()],
-        )?);
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM tasks WHERE page_id = ?1",
-            params![page.as_slice()],
-        )?);
+        .saturating_add(transaction.execute("DELETE FROM tags WHERE page_id = ?1", params![page])?);
+    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(
+        transaction.execute("DELETE FROM tasks WHERE page_id = ?1", params![page])?,
+    );
     instrumentation.owned_rows += transaction.execute(
         "DELETE FROM block_text WHERE block_id IN (SELECT block_id FROM blocks WHERE page_id = ?1)",
-        params![page.as_slice()],
+        params![page],
     )?;
-    instrumentation.owned_rows += transaction.execute(
-        "DELETE FROM page_text WHERE page_id = ?1",
-        params![page.as_slice()],
-    )?;
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM blocks WHERE page_id = ?1",
-            params![page.as_slice()],
-        )?);
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM pages WHERE page_id = ?1",
-            params![page.as_slice()],
-        )?);
+    instrumentation.owned_rows +=
+        transaction.execute("DELETE FROM page_text WHERE page_id = ?1", params![page])?;
+    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(
+        transaction.execute("DELETE FROM blocks WHERE page_id = ?1", params![page])?,
+    );
+    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(
+        transaction.execute("DELETE FROM pages WHERE page_id = ?1", params![page])?,
+    );
     Ok(instrumentation)
 }
 
@@ -1610,53 +1812,14 @@ fn execute_cached(
     Ok(transaction.prepare_cached(sql)?.execute(parameters)?)
 }
 
-fn insert_page(transaction: &Connection, page: &PhysicalPage) -> Result<(), MaterializationError> {
-    let page_id = &page.page_id;
-    execute_cached(
-        transaction,
-        "INSERT INTO pages (
-             page_id, home_document_id, name, name_key, path, text_kind,
-             journal_day
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            page_id.as_slice(),
-            page.home_document_id.as_slice(),
-            &page.name,
-            &page.name_key,
-            page.path.as_str(),
-            page.text_kind,
-            page.journal_day,
-        ],
-    )?;
-    execute_cached(
-        transaction,
-        "INSERT INTO page_text (page_id, preamble, searchable_text, normalized_searchable_text)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![
-            page_id.as_slice(),
-            &page.preamble,
-            &page.searchable_text,
-            &page.normalized_searchable_text,
-        ],
-    )?;
-    insert_properties(
-        transaction,
-        PhysicalEntityId::Page(page.page_id),
-        page.page_id,
-        &page.properties,
-    )?;
-    insert_tags(
-        transaction,
-        PhysicalEntityId::Page(page.page_id),
-        page.page_id,
-        &page.tags,
-    )?;
-    insert_property_atoms(
-        transaction,
-        PhysicalEntityId::Page(page.page_id),
-        page.page_id,
-        &page.property_atoms,
-    )?;
+fn insert_page(
+    transaction: &Connection,
+    page: &PhysicalPage,
+    page_id: i64,
+    retained_position: Option<i64>,
+    block_ids: &BTreeMap<String, i64>,
+) -> Result<(), MaterializationError> {
+    let name_id = intern_name(transaction, &page.name_key, &page.name)?;
     let page_estimated = query_page_result_estimated_bytes(
         &page.name,
         &page.path,
@@ -1664,35 +1827,85 @@ fn insert_page(transaction: &Connection, page: &PhysicalPage) -> Result<(), Mate
             .iter()
             .map(|property| (property.name.as_str(), property.value.as_str())),
     );
-    execute_cached(transaction,
-        "INSERT INTO query_page_results (page_id, estimated_bytes, property_count) VALUES (?1, ?2, ?3)",
-        params![page.page_id.as_slice(),
-            i64::try_from(page_estimated).map_err(|_| MaterializationError::InvalidInput("query page estimate exceeds SQLite".into()))?,
-            i64::try_from(page.properties.len()).map_err(|_| MaterializationError::InvalidInput("query page property count exceeds SQLite".into()))?])?;
-    if let Some(position) = page.query_page_order {
-        execute_cached(
-            transaction,
-            "INSERT INTO query_page_order (page_id, position) VALUES (?1, ?2)",
-            params![
-                page.page_id.as_slice(),
-                i64::try_from(position).map_err(|_| MaterializationError::InvalidInput(
-                    "query page position exceeds SQLite".into()
-                ))?
-            ],
-        )?;
-    }
-    for block in &page.blocks {
-        insert_block(transaction, page.page_id, block)?;
-    }
-    let traversal = query_block_preorder(
-        page.blocks
-            .iter()
-            .map(|block| (block.block_id, block.parent, block.order.as_str())),
+    execute_cached(
+        transaction,
+        "INSERT INTO pages (
+             page_id, name_id, path, text_kind, journal_day, position,
+             estimated_bytes, property_count
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            page_id,
+            name_id,
+            page.path.as_str(),
+            page.text_kind,
+            page.journal_day,
+            page.position
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| {
+                    MaterializationError::InvalidInput("query page position exceeds SQLite".into())
+                })?
+                .or(retained_position),
+            i64::try_from(page_estimated).map_err(|_| MaterializationError::InvalidInput(
+                "query page estimate exceeds SQLite".into()
+            ))?,
+            i64::try_from(page.properties.len()).map_err(
+                |_| MaterializationError::InvalidInput(
+                    "query page property count exceeds SQLite".into()
+                )
+            )?,
+        ],
     )?;
+    execute_cached(
+        transaction,
+        "INSERT INTO page_text (page_id, preamble, searchable_text, normalized_searchable_text)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            page_id,
+            &page.preamble,
+            &page.searchable_text,
+            &page.normalized_searchable_text,
+        ],
+    )?;
+    insert_properties(
+        transaction,
+        PhysicalEntityCoordinate::Page(page_id),
+        page_id,
+        &page.properties,
+    )?;
+    insert_tags(
+        transaction,
+        PhysicalEntityCoordinate::Page(page_id),
+        page_id,
+        &page.tags,
+    )?;
+    insert_property_atoms(
+        transaction,
+        PhysicalEntityCoordinate::Page(page_id),
+        page_id,
+        &page.property_atoms,
+    )?;
+    let traversal = query_block_preorder(page.blocks.iter().map(|block| {
+        (
+            block.result_id.as_str(),
+            block.parent.as_deref(),
+            block.order.as_str(),
+        )
+    }))?;
     for (preorder, (index, _depth)) in traversal.into_iter().enumerate() {
         let block = &page.blocks[index];
+        let block_id = block_ids[&block.result_id];
+        let parent_id = block
+            .parent
+            .as_ref()
+            .map(|parent| {
+                block_ids.get(parent).copied().ok_or_else(|| {
+                    MaterializationError::InvalidInput("query block has unknown parent".into())
+                })
+            })
+            .transpose()?;
         let estimated = query_result_estimated_bytes(
-            &block.query_result_id,
+            &block.result_id,
             &block.content,
             block.tags.iter().map(|tag| tag.tag.as_str()),
             block
@@ -1700,70 +1913,83 @@ fn insert_page(transaction: &Connection, page: &PhysicalPage) -> Result<(), Mate
                 .iter()
                 .map(|property| (property.name.as_str(), property.value.as_str())),
         );
-        execute_cached(transaction,
-            "INSERT INTO query_block_results (block_id, page_id, preorder, result_id, estimated_bytes, tag_count, property_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![block.block_id.as_slice(), page.page_id.as_slice(), preorder as i64,
-                &block.query_result_id, i64::try_from(estimated).map_err(|_| MaterializationError::InvalidInput("query estimate exceeds SQLite".into()))?,
-                block.tags.len() as i64, block.properties.len() as i64])?;
+        insert_block(
+            transaction,
+            page_id,
+            block,
+            block_id,
+            parent_id,
+            preorder,
+            estimated,
+        )?;
     }
     Ok(())
 }
 
 fn insert_block(
     transaction: &Connection,
-    page_id: [u8; 16],
+    page_id: i64,
     block: &PhysicalBlock,
+    block_id: i64,
+    parent_id: Option<i64>,
+    preorder: usize,
+    estimated: usize,
 ) -> Result<(), MaterializationError> {
     let (logseq_uuid, origin) = match (block.logseq_uuid, block.logseq_identity_origin) {
         (Some(uuid), Some(origin)) => (Some(uuid.to_vec()), Some(origin)),
         (None, None) => (None, None),
         _ => {
             return Err(MaterializationError::InvalidInput(format!(
-                "block {} has incomplete Logseq identity metadata",
-                uuid::Uuid::from_bytes(block.block_id)
+                "block {:?} has incomplete Logseq identity metadata",
+                block.result_id
             )));
         }
     };
     execute_cached(
         transaction,
         "INSERT INTO blocks (
-             block_id, page_id, home_document_id, parent_block_id, order_key,
+             block_id, page_id, result_id, parent_block_id, order_key,
              query_visible_folded, heading_level,
-             collapsed, logseq_uuid, logseq_identity_origin
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             collapsed, logseq_uuid, logseq_identity_origin, preorder,
+             estimated_bytes, tag_count, property_count
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
-            block.block_id.as_slice(),
-            page_id.as_slice(),
-            block.home_document_id.as_slice(),
-            block.parent.map(|parent| parent.to_vec()),
+            block_id,
+            page_id,
+            &block.result_id,
+            parent_id,
             &block.order,
             &block.query_visible_folded,
             block.heading_level.map(i64::from),
             i64::from(block.collapsed),
             logseq_uuid,
             origin,
+            i64::try_from(preorder).map_err(|_| MaterializationError::InvalidInput(
+                "query preorder exceeds SQLite".into()
+            ))?,
+            i64::try_from(estimated).map_err(|_| MaterializationError::InvalidInput(
+                "query estimate exceeds SQLite".into()
+            ))?,
+            i64::try_from(block.tags.len()).map_err(|_| MaterializationError::InvalidInput(
+                "query tag count exceeds SQLite".into()
+            ))?,
+            i64::try_from(block.properties.len()).map_err(|_| {
+                MaterializationError::InvalidInput("query property count exceeds SQLite".into())
+            })?,
         ],
     )?;
     execute_cached(
         transaction,
         "INSERT INTO block_text (block_id, content, searchable_text, normalized_searchable_text, query_visible)
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![block.block_id.as_slice(), &block.content, &block.searchable_text,
+        params![block_id, &block.content, &block.searchable_text,
             &block.normalized_searchable_text, &block.query_visible],
     )?;
-    let owner = PhysicalEntityId::Block(block.block_id);
+    let owner = PhysicalEntityCoordinate::Block(block_id);
     insert_properties(transaction, owner, page_id, &block.properties)?;
     insert_tags(transaction, owner, page_id, &block.tags)?;
     insert_property_atoms(transaction, owner, page_id, &block.property_atoms)?;
-    insert_path_refs(transaction, block.block_id, page_id, &block.path_refs)?;
-    for name in block.own_refs.iter().collect::<BTreeSet<_>>() {
-        execute_cached(
-            transaction,
-            "INSERT INTO block_own_refs (block_id, page_id, normalized_name) VALUES (?1, ?2, ?3)",
-            params![block.block_id.as_slice(), page_id.as_slice(), name],
-        )?;
-    }
+    insert_path_refs(transaction, block_id, page_id, &block.path_refs)?;
     if let Some(task) = &block.task {
         execute_cached(
             transaction,
@@ -1771,8 +1997,8 @@ fn insert_block(
                  block_id, page_id, marker, priority, scheduled, deadline
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
-                block.block_id.as_slice(),
-                page_id.as_slice(),
+                block_id,
+                page_id,
                 &task.marker,
                 &task.priority,
                 &task.scheduled,
@@ -1786,8 +2012,8 @@ fn insert_block(
             && planning.deadline.is_none()
         {
             return Err(MaterializationError::InvalidInput(format!(
-                "block {} carries an empty planning facet",
-                uuid::Uuid::from_bytes(block.block_id)
+                "block {:?} carries an empty planning facet",
+                block.result_id
             )));
         }
         execute_cached(
@@ -1797,8 +2023,8 @@ fn insert_block(
                  deadline, deadline_day
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
-                block.block_id.as_slice(),
-                page_id.as_slice(),
+                block_id,
+                page_id,
                 &planning.priority,
                 &planning.scheduled,
                 planning.scheduled_day,
@@ -1812,15 +2038,15 @@ fn insert_block(
 
 fn load_fts_source_rows(
     transaction: &Connection,
-    page_ids: &BTreeSet<[u8; 16]>,
-) -> Result<BTreeMap<(i64, [u8; 16]), FtsEntityRow>, MaterializationError> {
+    page_ids: &BTreeSet<i64>,
+) -> Result<BTreeMap<(i64, i64), FtsEntityRow>, MaterializationError> {
     let mut rows = BTreeMap::new();
     for page_id in page_ids {
         let page = transaction
             .query_row(
                 "SELECT searchable_text, normalized_searchable_text
                  FROM pages LEFT JOIN page_text USING (page_id) WHERE page_id = ?1",
-                params![page_id.as_slice()],
+                params![page_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?;
@@ -1838,9 +2064,9 @@ fn load_fts_source_rows(
             "SELECT block_id, searchable_text, normalized_searchable_text
              FROM blocks LEFT JOIN block_text USING (block_id) WHERE page_id = ?1 ORDER BY block_id",
         )?;
-        let blocks = statement.query_map(params![page_id.as_slice()], |row| {
+        let blocks = statement.query_map(params![page_id], |row| {
             Ok((
-                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
             ))
@@ -1849,7 +2075,7 @@ fn load_fts_source_rows(
             let (block_id, text, normalized_text) = block?;
             let row = FtsEntityRow {
                 entity_type: 1,
-                entity_id: decode_id(&block_id)?,
+                entity_id: block_id,
                 page_id: *page_id,
                 text,
                 normalized_text,
@@ -1866,13 +2092,15 @@ fn load_fts_source_rows(
 
 fn replacement_fts_rows(
     replacements: &[PhysicalPage],
-) -> Result<BTreeMap<(i64, [u8; 16]), FtsEntityRow>, MaterializationError> {
+    page_ids: &BTreeMap<String, i64>,
+    block_ids: &BTreeMap<String, i64>,
+) -> Result<BTreeMap<(i64, i64), FtsEntityRow>, MaterializationError> {
     let mut rows = BTreeMap::new();
     for page in replacements {
         let page_row = FtsEntityRow {
             entity_type: 0,
-            entity_id: page.page_id,
-            page_id: page.page_id,
+            entity_id: page_ids[&page.path],
+            page_id: page_ids[&page.path],
             text: page.searchable_text.clone(),
             normalized_text: page.normalized_searchable_text.clone(),
         };
@@ -1884,8 +2112,8 @@ fn replacement_fts_rows(
         for block in &page.blocks {
             let block_row = FtsEntityRow {
                 entity_type: 1,
-                entity_id: block.block_id,
-                page_id: page.page_id,
+                entity_id: block_ids[&block.result_id],
+                page_id: page_ids[&page.path],
                 text: block.searchable_text.clone(),
                 normalized_text: block.normalized_searchable_text.clone(),
             };
@@ -1902,13 +2130,13 @@ fn replacement_fts_rows(
 fn delete_fts_entity(
     transaction: &Connection,
     entity_type: i64,
-    entity_id: [u8; 16],
+    entity_id: i64,
 ) -> Result<bool, MaterializationError> {
     let rowid: Option<i64> = transaction
         .query_row(
             "SELECT rowid FROM search_fts_owners
              WHERE entity_type = ?1 AND entity_id = ?2",
-            params![entity_type, entity_id.as_slice()],
+            params![entity_type, entity_id],
             |row| row.get(0),
         )
         .optional()?;
@@ -1929,8 +2157,8 @@ fn delete_fts_entity(
 
 fn reconcile_fts_rows(
     transaction: &Connection,
-    old: BTreeMap<(i64, [u8; 16]), FtsEntityRow>,
-    new: BTreeMap<(i64, [u8; 16]), FtsEntityRow>,
+    old: BTreeMap<(i64, i64), FtsEntityRow>,
+    new: BTreeMap<(i64, i64), FtsEntityRow>,
     instrumentation: &mut ApplyChangeInstrumentation,
     mut fts_instrumentation: Option<&mut FtsChangeInstrumentation>,
 ) -> Result<(), MaterializationError> {
@@ -1985,17 +2213,10 @@ fn insert_fts_row(
             ));
         }
     };
-    execute_cached(
-        transaction,
-        "INSERT INTO search_fts_owners (entity_type, entity_id, page_id)
-         VALUES (?1, ?2, ?3)",
-        params![
-            row.entity_type,
-            row.entity_id.as_slice(),
-            row.page_id.as_slice(),
-        ],
-    )?;
-    let rowid = transaction.last_insert_rowid();
+    let rowid = row.entity_id;
+    execute_cached(transaction,
+        "INSERT INTO search_fts_owners (rowid, entity_type, entity_id, page_id) VALUES (?1, ?2, ?3, ?4)",
+        params![rowid, row.entity_type, row.entity_id, row.page_id])?;
     execute_cached(
         transaction,
         "INSERT INTO search_fts (
@@ -2004,8 +2225,8 @@ fn insert_fts_row(
         params![
             rowid,
             entity_type,
-            uuid::Uuid::from_bytes(row.entity_id).simple().to_string(),
-            uuid::Uuid::from_bytes(row.page_id).simple().to_string(),
+            row.entity_id.to_string(),
+            row.page_id.to_string(),
             &row.text,
             &row.normalized_text,
         ],
@@ -2020,8 +2241,8 @@ fn insert_fts_row(
 
 fn insert_properties(
     transaction: &Connection,
-    owner: PhysicalEntityId,
-    page_id: [u8; 16],
+    owner: PhysicalEntityCoordinate,
+    page_id: i64,
     properties: &[PhysicalProperty],
 ) -> Result<(), MaterializationError> {
     let (owner_type, owner_id) = owner.sql_parts();
@@ -2029,14 +2250,13 @@ fn insert_properties(
         execute_cached(
             transaction,
             "INSERT INTO properties (
-                 owner_type, owner_id, page_id, name, normalized_name, value, ordinal
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 owner_type, owner_id, page_id, name_id, value, ordinal
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 owner_type,
-                owner_id.as_slice(),
-                page_id.as_slice(),
-                &property.name,
-                &property.normalized_name,
+                owner_id,
+                page_id,
+                intern_name(transaction, &property.normalized_name, &property.name)?,
                 &property.value,
                 i64::try_from(ordinal).map_err(|_| {
                     MaterializationError::InvalidInput("property ordinal overflowed".into())
@@ -2049,22 +2269,21 @@ fn insert_properties(
 
 fn insert_tags(
     transaction: &Connection,
-    owner: PhysicalEntityId,
-    page_id: [u8; 16],
+    owner: PhysicalEntityCoordinate,
+    page_id: i64,
     tags: &[PhysicalTag],
 ) -> Result<(), MaterializationError> {
     let (owner_type, owner_id) = owner.sql_parts();
     for (ordinal, tag) in tags.iter().enumerate() {
         execute_cached(
             transaction,
-            "INSERT INTO tags (owner_type, owner_id, page_id, tag, tag_key, ordinal)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO tags (owner_type, owner_id, page_id, name_id, ordinal)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 owner_type,
-                owner_id.as_slice(),
-                page_id.as_slice(),
-                &tag.tag,
-                &tag.tag_key,
+                owner_id,
+                page_id,
+                intern_name(transaction, &tag.tag_key, &tag.tag)?,
                 i64::try_from(ordinal).map_err(|_| {
                     MaterializationError::InvalidInput("tag ordinal overflowed".into())
                 })?,
@@ -2076,8 +2295,8 @@ fn insert_tags(
 
 fn insert_property_atoms(
     transaction: &Connection,
-    owner: PhysicalEntityId,
-    page_id: [u8; 16],
+    owner: PhysicalEntityCoordinate,
+    page_id: i64,
     atoms: &[PhysicalPropertyAtom],
 ) -> Result<(), MaterializationError> {
     let (owner_type, owner_id) = owner.sql_parts();
@@ -2085,14 +2304,14 @@ fn insert_property_atoms(
         execute_cached(
             transaction,
             "INSERT INTO property_atoms (
-                 owner_type, owner_id, page_id, normalized_name, ordinal,
+                 owner_type, owner_id, page_id, name_id, ordinal,
                  atom, atom_key, origin, atom_num, atom_day
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 owner_type,
-                owner_id.as_slice(),
-                page_id.as_slice(),
-                &atom.normalized_name,
+                owner_id,
+                page_id,
+                intern_name(transaction, &atom.normalized_name, &atom.name)?,
                 i64::from(atom.ordinal),
                 &atom.atom,
                 &atom.atom_key,
@@ -2107,16 +2326,20 @@ fn insert_property_atoms(
 
 fn insert_path_refs(
     transaction: &Connection,
-    block_id: [u8; 16],
-    page_id: [u8; 16],
-    names: &[String],
+    block_id: i64,
+    page_id: i64,
+    names: &[PhysicalName],
 ) -> Result<(), MaterializationError> {
     for name in names {
         execute_cached(
             transaction,
-            "INSERT INTO block_path_refs (block_id, page_id, normalized_name)
+            "INSERT INTO block_path_refs (block_id, page_id, name_id)
              VALUES (?1, ?2, ?3)",
-            params![block_id.as_slice(), page_id.as_slice(), name],
+            params![
+                block_id,
+                page_id,
+                intern_name(transaction, &name.key, &name.raw)?
+            ],
         )?;
     }
     Ok(())
@@ -2124,8 +2347,6 @@ fn insert_path_refs(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalPageRow {
-    pub page_id: [u8; 16],
-    pub home_document_id: [u8; 16],
     pub name: String,
     pub name_key: String,
     pub path: String,
@@ -2138,7 +2359,7 @@ pub struct PhysicalPageRow {
 /// searchable body text so a title lookup never retains graph-sized content.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalNavigationPageRow {
-    pub page_id: [u8; 16],
+    pub cursor: i64,
     pub name: String,
     pub name_key: String,
     pub path: String,
@@ -2148,7 +2369,9 @@ pub struct PhysicalNavigationPageRow {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalNavigationAliasRow {
-    pub source_page_id: [u8; 16],
+    pub source_page_path: String,
+    pub cursor: i64,
+    pub name_cursor: i64,
     pub owner_name: String,
     pub owner_path: String,
     pub normalized_alias: String,
@@ -2168,10 +2391,9 @@ pub struct PhysicalNavigationReferenceNameRow {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalBlockRow {
-    pub block_id: [u8; 16],
-    pub page_id: [u8; 16],
-    pub home_document_id: [u8; 16],
-    pub parent: Option<[u8; 16]>,
+    pub result_id: String,
+    pub page_path: String,
+    pub parent: Option<String>,
     pub order: String,
     pub content: String,
     pub searchable_text: String,
@@ -2189,37 +2411,46 @@ pub struct PhysicalBlockReferenceCountRow {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalBlockReferrerCandidateRow {
-    pub source_page_id: [u8; 16],
-    pub source_block_id: [u8; 16],
+    pub source_page_path: String,
+    pub source_block_id: String,
+    pub page_cursor: i64,
+    pub block_cursor: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalPageReferrerCandidateRow {
-    pub source_page_id: [u8; 16],
+    pub source_page_path: String,
     pub source: PhysicalEntityId,
+    pub page_cursor: i64,
+    pub entity_cursor: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalPlainTextCandidatePageRow {
-    pub page_id: [u8; 16],
+    pub page_path: String,
+    pub cursor: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalFuzzyCandidatePageRow {
-    pub page_id: [u8; 16],
+    pub cursor: i64,
     pub path: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalBlockPropertyCandidateRow {
-    pub page_id: [u8; 16],
-    pub block_id: [u8; 16],
+    pub page_path: String,
+    pub block_id: String,
+    pub page_cursor: i64,
+    pub block_cursor: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalPropertyFacetRow {
     pub owner: PhysicalEntityId,
-    pub page_id: [u8; 16],
+    pub page_path: String,
+    pub owner_cursor: i64,
+    pub name_cursor: i64,
     pub source_name: String,
     pub normalized_name: String,
     pub value: String,
@@ -2228,7 +2459,8 @@ pub struct PhysicalPropertyFacetRow {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalTaskCandidatePageRow {
-    pub page_id: [u8; 16],
+    pub page_path: String,
+    pub cursor: i64,
 }
 
 /// One physical task-index candidate with the raw block and page transport
@@ -2238,14 +2470,15 @@ pub struct PhysicalTaskCandidatePageRow {
 /// absent: the application parser remains the authority for those meanings.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalTaskCandidateBlockRow {
-    pub block_id: [u8; 16],
-    pub page_id: [u8; 16],
-    pub parent: Option<[u8; 16]>,
+    pub block_id: String,
+    pub page_path: String,
+    pub parent: Option<String>,
+    pub page_cursor: i64,
+    pub block_cursor: i64,
     pub order: String,
     pub content: String,
     pub logseq_uuid: Option<[u8; 16]>,
     pub page_name: String,
-    pub page_path: String,
     pub page_text_kind: i64,
 }
 
@@ -2257,19 +2490,20 @@ pub struct PhysicalTaskCandidateBlockRow {
 /// and full structural order to recover the exact current `DocBlock`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalTaskCandidateLocatorRow {
-    pub block_id: [u8; 16],
-    pub page_id: [u8; 16],
-    pub parent: Option<[u8; 16]>,
+    pub block_id: String,
+    pub page_path: String,
+    pub parent: Option<String>,
+    pub page_cursor: i64,
+    pub block_cursor: i64,
     pub order: String,
     pub page_name: String,
-    pub page_path: String,
     pub page_text_kind: i64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalPropertyRow {
     pub owner: PhysicalEntityId,
-    pub page_id: [u8; 16],
+    pub page_path: String,
     pub name: String,
     pub value: String,
 }
@@ -2277,14 +2511,14 @@ pub struct PhysicalPropertyRow {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalTagRow {
     pub owner: PhysicalEntityId,
-    pub page_id: [u8; 16],
+    pub page_path: String,
     pub tag: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalTaskRow {
-    pub block_id: [u8; 16],
-    pub page_id: [u8; 16],
+    pub block_id: String,
+    pub page_path: String,
     pub marker: String,
     pub priority: Option<String>,
     pub scheduled: Option<String>,
@@ -2294,18 +2528,18 @@ pub struct PhysicalTaskRow {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalSearchHit {
     pub entity: PhysicalEntityId,
-    pub page_id: [u8; 16],
+    pub page_path: String,
     pub text: String,
     pub rank: f64,
 }
 
 #[derive(Default)]
-struct MaterializationReadBudget {
+pub(crate) struct MaterializationReadBudget {
     bytes: usize,
 }
 
 impl MaterializationReadBudget {
-    fn add(&mut self, bytes: usize) -> Result<(), MaterializationError> {
+    pub(crate) fn add(&mut self, bytes: usize) -> Result<(), MaterializationError> {
         self.bytes = checked_budget_add(
             "materialization read output bytes",
             self.bytes,
@@ -2316,7 +2550,7 @@ impl MaterializationReadBudget {
     }
 }
 
-fn checked_output_bytes<'a>(
+pub(crate) fn checked_output_bytes<'a>(
     fixed_bytes: usize,
     fields: impl IntoIterator<Item = Option<&'a str>>,
 ) -> Result<usize, MaterializationError> {
@@ -2335,6 +2569,12 @@ fn checked_output_bytes<'a>(
                 )
             })
     })
+}
+
+fn public_entity_id(entity: &PhysicalEntityId) -> &str {
+    match entity {
+        PhysicalEntityId::Page(path) | PhysicalEntityId::Block(path) => path,
+    }
 }
 
 fn page_row_output_bytes(row: &PhysicalPageRow) -> Result<usize, MaterializationError> {
@@ -2370,6 +2610,7 @@ fn navigation_alias_row_output_bytes(
     checked_output_bytes(
         16,
         [
+            Some(row.source_page_path.as_str()),
             Some(row.owner_name.as_str()),
             Some(row.owner_path.as_str()),
             Some(row.normalized_alias.as_str()),
@@ -2393,6 +2634,9 @@ fn block_row_output_bytes(row: &PhysicalBlockRow) -> Result<usize, Materializati
     checked_output_bytes(
         96,
         [
+            Some(row.result_id.as_str()),
+            Some(row.page_path.as_str()),
+            row.parent.as_deref(),
             Some(row.order.as_str()),
             Some(row.content.as_str()),
             Some(row.searchable_text.as_str()),
@@ -2406,10 +2650,12 @@ fn task_candidate_block_row_output_bytes(
     checked_output_bytes(
         72,
         [
+            Some(row.block_id.as_str()),
+            Some(row.page_path.as_str()),
+            row.parent.as_deref(),
             Some(row.order.as_str()),
             Some(row.content.as_str()),
             Some(row.page_name.as_str()),
-            Some(row.page_path.as_str()),
         ],
     )
 }
@@ -2420,25 +2666,44 @@ fn task_candidate_locator_row_output_bytes(
     checked_output_bytes(
         64,
         [
+            Some(row.block_id.as_str()),
+            Some(row.page_path.as_str()),
+            row.parent.as_deref(),
             Some(row.order.as_str()),
             Some(row.page_name.as_str()),
-            Some(row.page_path.as_str()),
         ],
     )
 }
 
 fn property_row_output_bytes(row: &PhysicalPropertyRow) -> Result<usize, MaterializationError> {
-    checked_output_bytes(64, [Some(row.name.as_str()), Some(row.value.as_str())])
+    checked_output_bytes(
+        64,
+        [
+            Some(public_entity_id(&row.owner)),
+            Some(row.page_path.as_str()),
+            Some(row.name.as_str()),
+            Some(row.value.as_str()),
+        ],
+    )
 }
 
 fn tag_row_output_bytes(row: &PhysicalTagRow) -> Result<usize, MaterializationError> {
-    checked_output_bytes(64, [Some(row.tag.as_str())])
+    checked_output_bytes(
+        64,
+        [
+            Some(public_entity_id(&row.owner)),
+            Some(row.page_path.as_str()),
+            Some(row.tag.as_str()),
+        ],
+    )
 }
 
 fn task_row_output_bytes(row: &PhysicalTaskRow) -> Result<usize, MaterializationError> {
     checked_output_bytes(
         64,
         [
+            Some(row.block_id.as_str()),
+            Some(row.page_path.as_str()),
             Some(row.marker.as_str()),
             row.priority.as_deref(),
             row.scheduled.as_deref(),
@@ -2448,7 +2713,47 @@ fn task_row_output_bytes(row: &PhysicalTaskRow) -> Result<usize, Materialization
 }
 
 fn search_hit_output_bytes(row: &PhysicalSearchHit) -> Result<usize, MaterializationError> {
-    checked_output_bytes(72, [Some(row.text.as_str())])
+    checked_output_bytes(
+        72,
+        [
+            Some(public_entity_id(&row.entity)),
+            Some(row.page_path.as_str()),
+            Some(row.text.as_str()),
+        ],
+    )
+}
+
+fn block_referrer_candidate_row_output_bytes(
+    row: &PhysicalBlockReferrerCandidateRow,
+) -> Result<usize, MaterializationError> {
+    checked_output_bytes(
+        32,
+        [
+            Some(row.source_page_path.as_str()),
+            Some(row.source_block_id.as_str()),
+        ],
+    )
+}
+
+fn page_referrer_candidate_row_output_bytes(
+    row: &PhysicalPageReferrerCandidateRow,
+) -> Result<usize, MaterializationError> {
+    checked_output_bytes(
+        32,
+        [
+            Some(row.source_page_path.as_str()),
+            Some(public_entity_id(&row.source)),
+        ],
+    )
+}
+
+fn block_property_candidate_row_output_bytes(
+    row: &PhysicalBlockPropertyCandidateRow,
+) -> Result<usize, MaterializationError> {
+    checked_output_bytes(
+        32,
+        [Some(row.page_path.as_str()), Some(row.block_id.as_str())],
+    )
 }
 
 fn collect_read_rows<T>(
@@ -2486,45 +2791,53 @@ fn allow_any_page_header(_path: &str, _kind: i64) -> Result<(), MaterializationE
 }
 
 const TASK_CANDIDATE_BLOCKS_SQL: &str =
-    "SELECT t.block_id, t.page_id, b.parent_block_id, b.order_key,
-            bt.content, b.logseq_uuid, p.name, p.path, p.text_kind
+    "SELECT b.block_id, p.page_id, b.result_id, p.path, parent.result_id,
+            b.order_key, bt.content, b.logseq_uuid, n.raw, p.text_kind
      FROM tasks AS t
      JOIN blocks AS b
        ON b.block_id = t.block_id AND b.page_id = t.page_id
      JOIN pages AS p ON p.page_id = t.page_id
+     JOIN names AS n ON n.name_id = p.name_id
+     LEFT JOIN blocks AS parent ON parent.block_id = b.parent_block_id
      LEFT JOIN block_text AS bt ON bt.block_id = b.block_id
      WHERE t.marker = ?1
      ORDER BY t.page_id, t.block_id LIMIT ?2";
 
 const TASK_CANDIDATE_BLOCKS_AFTER_SQL: &str =
-    "SELECT t.block_id, t.page_id, b.parent_block_id, b.order_key,
-            bt.content, b.logseq_uuid, p.name, p.path, p.text_kind
+    "SELECT b.block_id, p.page_id, b.result_id, p.path, parent.result_id,
+            b.order_key, bt.content, b.logseq_uuid, n.raw, p.text_kind
      FROM tasks AS t
      JOIN blocks AS b
        ON b.block_id = t.block_id AND b.page_id = t.page_id
      JOIN pages AS p ON p.page_id = t.page_id
+     JOIN names AS n ON n.name_id = p.name_id
+     LEFT JOIN blocks AS parent ON parent.block_id = b.parent_block_id
      LEFT JOIN block_text AS bt ON bt.block_id = b.block_id
      WHERE t.marker = ?1
        AND (t.page_id, t.block_id) > (?2, ?3)
      ORDER BY t.page_id, t.block_id LIMIT ?4";
 
 const TASK_CANDIDATE_LOCATORS_SQL: &str =
-    "SELECT t.block_id, t.page_id, b.parent_block_id, b.order_key,
-            p.name, p.path, p.text_kind
+    "SELECT b.block_id, p.page_id, b.result_id, p.path, parent.result_id,
+            b.order_key, n.raw, p.text_kind
      FROM tasks AS t
      JOIN blocks AS b
        ON b.block_id = t.block_id AND b.page_id = t.page_id
      JOIN pages AS p ON p.page_id = t.page_id
+     JOIN names AS n ON n.name_id = p.name_id
+     LEFT JOIN blocks AS parent ON parent.block_id = b.parent_block_id
      WHERE t.marker = ?1
      ORDER BY t.page_id, t.block_id LIMIT ?2";
 
 const TASK_CANDIDATE_LOCATORS_AFTER_SQL: &str =
-    "SELECT t.block_id, t.page_id, b.parent_block_id, b.order_key,
-            p.name, p.path, p.text_kind
+    "SELECT b.block_id, p.page_id, b.result_id, p.path, parent.result_id,
+            b.order_key, n.raw, p.text_kind
      FROM tasks AS t
      JOIN blocks AS b
        ON b.block_id = t.block_id AND b.page_id = t.page_id
      JOIN pages AS p ON p.page_id = t.page_id
+     JOIN names AS n ON n.name_id = p.name_id
+     LEFT JOIN blocks AS parent ON parent.block_id = b.parent_block_id
      WHERE t.marker = ?1
        AND (t.page_id, t.block_id) > (?2, ?3)
      ORDER BY t.page_id, t.block_id LIMIT ?4";
@@ -2538,28 +2851,30 @@ const TASK_CANDIDATE_LOCATORS_AFTER_SQL: &str =
 /// prefix is the index order, so `LIMIT` ends the scan. `DISTINCT` and a
 /// trailing sort term may still use a temporary b-tree; both are bounded by
 /// the batch. `paged_navigation_readers_use_an_index_range` pins this.
-pub(crate) const NAVIGATION_REFERENCE_NAMES_FIRST_SQL: &str =
-    "SELECT DISTINCT r.normalized_name, r.raw_name
-     FROM reference_postings r
+pub(crate) const NAVIGATION_REFERENCE_NAMES_FIRST_SQL: &str = "SELECT DISTINCT n.key, n.raw
+     FROM reference_postings r JOIN names n ON n.name_id = r.target_name_id
      WHERE r.target_type = 0 AND r.reference_kind <= 4
-     ORDER BY r.normalized_name, r.raw_name LIMIT ?1";
-pub(crate) const NAVIGATION_REFERENCE_NAMES_AFTER_SQL: &str =
-    "SELECT DISTINCT r.normalized_name, r.raw_name
-     FROM reference_postings r
+     ORDER BY n.key, n.raw LIMIT ?1";
+pub(crate) const NAVIGATION_REFERENCE_NAMES_AFTER_SQL: &str = "SELECT DISTINCT n.key, n.raw
+     FROM reference_postings r JOIN names n ON n.name_id = r.target_name_id
      WHERE r.target_type = 0 AND r.reference_kind <= 4
-       AND (r.normalized_name, r.raw_name) > (?1, ?2)
-     ORDER BY r.normalized_name, r.raw_name LIMIT ?3";
+       AND (n.key, n.raw) > (?1, ?2)
+     ORDER BY n.key, n.raw LIMIT ?3";
 pub(crate) const NAVIGATION_ALIASES_FIRST_SQL: &str =
-    "SELECT DISTINCT d.source_page_id, p.name, p.path, d.normalized_alias
+    "SELECT DISTINCT d.source_page_id, d.alias_name_id, owner.raw, p.path, alias.key
      FROM reference_alias_declarations d
      JOIN pages p ON p.page_id = d.source_page_id
-     ORDER BY d.source_page_id, d.normalized_alias LIMIT ?1";
+     JOIN names owner ON owner.name_id = p.name_id
+     JOIN names alias ON alias.name_id = d.alias_name_id
+     ORDER BY d.source_page_id, d.alias_name_id LIMIT ?1";
 pub(crate) const NAVIGATION_ALIASES_AFTER_SQL: &str =
-    "SELECT DISTINCT d.source_page_id, p.name, p.path, d.normalized_alias
+    "SELECT DISTINCT d.source_page_id, d.alias_name_id, owner.raw, p.path, alias.key
      FROM reference_alias_declarations d
      JOIN pages p ON p.page_id = d.source_page_id
-     WHERE (d.source_page_id, d.normalized_alias) > (?1, ?2)
-     ORDER BY d.source_page_id, d.normalized_alias LIMIT ?3";
+     JOIN names owner ON owner.name_id = p.name_id
+     JOIN names alias ON alias.name_id = d.alias_name_id
+     WHERE (d.source_page_id, d.alias_name_id) > (?1, ?2)
+     ORDER BY d.source_page_id, d.alias_name_id LIMIT ?3";
 
 impl<'a> SqliteGraphProjectionRead<'a> {
     pub(crate) const fn new(connection: &'a Connection) -> Self {
@@ -2582,22 +2897,22 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    pub fn page(&self, page_id: [u8; 16]) -> Result<Option<PhysicalPageRow>, MaterializationError> {
-        self.page_with_header_validation(page_id, allow_any_page_header)
+    pub fn page(&self, path: &str) -> Result<Option<PhysicalPageRow>, MaterializationError> {
+        self.page_with_header_validation(path, allow_any_page_header)
     }
 
     pub fn page_with_header_validation(
         &self,
-        page_id: [u8; 16],
+        path: &str,
         mut validate_header: impl FnMut(&str, i64) -> Result<(), MaterializationError>,
     ) -> Result<Option<PhysicalPageRow>, MaterializationError> {
         let page = self
             .connection
             .query_row(
-                "SELECT page_id, home_document_id, name, name_key, path,
-                        text_kind, preamble, searchable_text
-                 FROM pages LEFT JOIN page_text USING (page_id) WHERE page_id = ?1",
-                params![page_id.as_slice()],
+                "SELECT n.raw, n.key, p.path, p.text_kind, t.preamble, t.searchable_text
+                 FROM pages AS p JOIN names AS n ON n.name_id = p.name_id
+                 LEFT JOIN page_text AS t USING (page_id) WHERE p.path = ?1",
+                params![path],
                 |row| page_row_with_header_validation(row, &mut validate_header),
             )
             .optional()
@@ -2610,18 +2925,17 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         Ok(page)
     }
 
-    pub fn block(
-        &self,
-        block_id: [u8; 16],
-    ) -> Result<Option<PhysicalBlockRow>, MaterializationError> {
+    pub fn block(&self, result_id: &str) -> Result<Option<PhysicalBlockRow>, MaterializationError> {
         let block = self
             .connection
             .query_row(
-                "SELECT block_id, page_id, home_document_id, parent_block_id,
-                        order_key, content, searchable_text, heading_level,
-                        collapsed, logseq_uuid, logseq_identity_origin
-                 FROM blocks LEFT JOIN block_text USING (block_id) WHERE block_id = ?1",
-                params![block_id.as_slice()],
+                "SELECT b.result_id, p.path, parent.result_id, b.order_key,
+                        bt.content, bt.searchable_text, b.heading_level,
+                        b.collapsed, b.logseq_uuid, b.logseq_identity_origin
+                 FROM blocks AS b JOIN pages AS p ON p.page_id = b.page_id
+                 LEFT JOIN blocks AS parent ON parent.block_id = b.parent_block_id
+                 LEFT JOIN block_text AS bt USING (block_id) WHERE b.result_id = ?1",
+                params![result_id],
                 block_row,
             )
             .optional()
@@ -2646,11 +2960,13 @@ impl<'a> SqliteGraphProjectionRead<'a> {
     ) -> Result<Vec<PhysicalBlockRow>, MaterializationError> {
         let limit = checked_limit(limit)?;
         let mut statement = self.connection.prepare(
-            "SELECT block_id, page_id, home_document_id, parent_block_id,
-                    order_key, content, searchable_text, heading_level,
-                    collapsed, logseq_uuid, logseq_identity_origin
-             FROM blocks LEFT JOIN block_text USING (block_id) WHERE logseq_uuid = ?1
-             ORDER BY block_id LIMIT ?2",
+            "SELECT b.result_id, p.path, parent.result_id, b.order_key,
+                    bt.content, bt.searchable_text, b.heading_level,
+                    b.collapsed, b.logseq_uuid, b.logseq_identity_origin
+             FROM blocks AS b JOIN pages AS p ON p.page_id = b.page_id
+             LEFT JOIN blocks AS parent ON parent.block_id = b.parent_block_id
+             LEFT JOIN block_text AS bt USING (block_id) WHERE b.logseq_uuid = ?1
+             ORDER BY b.block_id LIMIT ?2",
         )?;
         let rows = statement.query_map(params![logseq_uuid.as_slice(), limit], block_row)?;
         collect_read_rows(
@@ -2679,15 +2995,15 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         let limit = checked_limit(limit)?;
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = match kind {
             Some(kind) => (
-                "SELECT page_id, home_document_id, name, name_key, path,
-                        text_kind, preamble, searchable_text
-                 FROM pages LEFT JOIN page_text USING (page_id) WHERE text_kind = ?1 ORDER BY path, page_id LIMIT ?2",
+                "SELECT n.raw, n.key, p.path, p.text_kind, t.preamble, t.searchable_text
+                 FROM pages AS p JOIN names AS n ON n.name_id = p.name_id
+                 LEFT JOIN page_text AS t USING (page_id) WHERE p.text_kind = ?1 ORDER BY p.path, p.page_id LIMIT ?2",
                 vec![kind.into(), limit.into()],
             ),
             None => (
-                "SELECT page_id, home_document_id, name, name_key, path,
-                        text_kind, preamble, searchable_text
-                 FROM pages LEFT JOIN page_text USING (page_id) ORDER BY path, page_id LIMIT ?1",
+                "SELECT n.raw, n.key, p.path, p.text_kind, t.preamble, t.searchable_text
+                 FROM pages AS p JOIN names AS n ON n.name_id = p.name_id
+                 LEFT JOIN page_text AS t USING (page_id) ORDER BY p.path, p.page_id LIMIT ?1",
                 vec![limit.into()],
             ),
         };
@@ -2706,7 +3022,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
     pub fn navigation_pages_after_with_header_validation(
         &self,
         after_path: Option<&str>,
-        after_page_id: Option<&[u8; 16]>,
+        after_page_id: Option<i64>,
         limit: usize,
         mut validate_header: impl FnMut(&str, i64) -> Result<(), MaterializationError>,
     ) -> Result<Vec<PhysicalNavigationPageRow>, MaterializationError> {
@@ -2716,25 +3032,20 @@ impl<'a> SqliteGraphProjectionRead<'a> {
                 "navigation page cursor requires both path and page ID".into(),
             ));
         }
-        if let Some(path) = after_path {
-            checked_query_text(path)?;
-        }
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = match (after_path, after_page_id) {
             (None, None) => (
-                "SELECT page_id, name, name_key, path, text_kind, preamble, page_text.page_id
-                     FROM pages LEFT JOIN page_text USING (page_id) ORDER BY path, page_id LIMIT ?1",
+                "SELECT p.page_id, n.raw, n.key, p.path, p.text_kind, t.preamble, t.page_id
+                     FROM pages AS p JOIN names AS n ON n.name_id = p.name_id
+                     LEFT JOIN page_text AS t USING (page_id) ORDER BY p.path, p.page_id LIMIT ?1",
                 vec![limit.into()],
             ),
             (Some(path), Some(page_id)) => (
-                "SELECT page_id, name, name_key, path, text_kind, preamble, page_text.page_id
-                     FROM pages LEFT JOIN page_text USING (page_id)
-                     WHERE path > ?1 OR (path = ?1 AND page_id > ?2)
-                     ORDER BY path, page_id LIMIT ?3",
-                vec![
-                    path.to_owned().into(),
-                    page_id.to_vec().into(),
-                    limit.into(),
-                ],
+                "SELECT p.page_id, n.raw, n.key, p.path, p.text_kind, t.preamble, t.page_id
+                     FROM pages AS p JOIN names AS n ON n.name_id = p.name_id
+                     LEFT JOIN page_text AS t USING (page_id)
+                     WHERE p.path > ?1 OR (p.path = ?1 AND p.page_id > ?2)
+                     ORDER BY p.path, p.page_id LIMIT ?3",
+                vec![path.to_owned().into(), page_id.into(), limit.into()],
             ),
             _ => unreachable!("cursor presence was validated above"),
         };
@@ -2759,33 +3070,26 @@ impl<'a> SqliteGraphProjectionRead<'a> {
     /// sort the whole join: GH tine#543).
     pub fn navigation_aliases_after(
         &self,
-        after: Option<(&str, &str, &[u8; 16])>,
+        after: Option<(i64, i64)>,
         limit: usize,
     ) -> Result<Vec<PhysicalNavigationAliasRow>, MaterializationError> {
         let limit = checked_limit(limit)?;
-        if let Some((path, alias, _)) = after {
-            checked_query_text(path)?;
-            checked_query_text(alias)?;
-        }
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = match after {
             None => (NAVIGATION_ALIASES_FIRST_SQL, vec![limit.into()]),
-            Some((_, alias, page_id)) => (
+            Some((page_id, name_id)) => (
                 NAVIGATION_ALIASES_AFTER_SQL,
-                vec![
-                    page_id.to_vec().into(),
-                    alias.to_owned().into(),
-                    limit.into(),
-                ],
+                vec![page_id.into(), name_id.into(), limit.into()],
             ),
         };
         let mut statement = self.connection.prepare(sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
-            let page_id: Vec<u8> = row.get(0)?;
             Ok(PhysicalNavigationAliasRow {
-                source_page_id: decode_id_sql(&page_id)?,
-                owner_name: row.get(1)?,
-                owner_path: row.get(2)?,
-                normalized_alias: row.get(3)?,
+                cursor: row.get(0)?,
+                name_cursor: row.get(1)?,
+                owner_name: row.get(2)?,
+                owner_path: row.get(3)?,
+                normalized_alias: row.get(4)?,
+                source_page_path: row.get(3)?,
             })
         })?;
         collect_read_rows(
@@ -2857,7 +3161,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
 
     fn block_reference_counts_query(
         &self,
-        source_page_id: Option<[u8; 16]>,
+        source_page_id: Option<i64>,
         after: Option<[u8; 16]>,
         limit: usize,
     ) -> Result<Vec<PhysicalBlockReferenceCountRow>, MaterializationError> {
@@ -2884,7 +3188,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
                  WHERE target_type = 1 AND source_entity_type = 1
                    AND source_page_id = ?1
                  GROUP BY raw_uuid_claim ORDER BY raw_uuid_claim LIMIT ?2",
-                vec![page_id.to_vec().into(), limit.into()],
+                vec![page_id.into(), limit.into()],
             ),
             (Some(page_id), Some(after)) => (
                 "SELECT raw_uuid_claim, COUNT(DISTINCT source_entity_id)
@@ -2892,7 +3196,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
                  WHERE target_type = 1 AND source_entity_type = 1
                    AND source_page_id = ?1 AND raw_uuid_claim > ?2
                  GROUP BY raw_uuid_claim ORDER BY raw_uuid_claim LIMIT ?3",
-                vec![page_id.to_vec().into(), after.to_vec().into(), limit.into()],
+                vec![page_id.into(), after.to_vec().into(), limit.into()],
             ),
         };
         let mut statement = self.connection.prepare(sql)?;
@@ -2919,47 +3223,49 @@ impl<'a> SqliteGraphProjectionRead<'a> {
     pub fn block_referrer_candidates_after(
         &self,
         raw_uuid_claim: [u8; 16],
-        after: Option<([u8; 16], [u8; 16])>,
+        after: Option<(i64, i64)>,
         limit: usize,
     ) -> Result<Vec<PhysicalBlockReferrerCandidateRow>, MaterializationError> {
         let limit = checked_limit(limit)?;
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = match after {
             None => (
-                "SELECT DISTINCT source_page_id, source_entity_id
-                 FROM reference_postings
-                 WHERE target_type = 1 AND source_entity_type = 1
-                   AND raw_uuid_claim = ?1
-                 ORDER BY source_page_id, source_entity_id LIMIT ?2",
+                "SELECT DISTINCT r.source_page_id, r.source_entity_id, p.path, b.result_id
+                 FROM reference_postings r JOIN pages p ON p.page_id = r.source_page_id
+                 JOIN blocks b ON b.block_id = r.source_entity_id
+                 WHERE r.target_type = 1 AND r.source_entity_type = 1
+                   AND r.raw_uuid_claim = ?1
+                 ORDER BY r.source_page_id, r.source_entity_id LIMIT ?2",
                 vec![raw_uuid_claim.to_vec().into(), limit.into()],
             ),
             Some((page_id, block_id)) => (
-                "SELECT DISTINCT source_page_id, source_entity_id
-                 FROM reference_postings
-                 WHERE target_type = 1 AND source_entity_type = 1
-                   AND raw_uuid_claim = ?1
-                   AND (source_page_id > ?2
-                     OR (source_page_id = ?2 AND source_entity_id > ?3))
-                 ORDER BY source_page_id, source_entity_id LIMIT ?4",
+                "SELECT DISTINCT r.source_page_id, r.source_entity_id, p.path, b.result_id
+                 FROM reference_postings r JOIN pages p ON p.page_id = r.source_page_id
+                 JOIN blocks b ON b.block_id = r.source_entity_id
+                 WHERE r.target_type = 1 AND r.source_entity_type = 1
+                   AND r.raw_uuid_claim = ?1
+                   AND (r.source_page_id > ?2
+                     OR (r.source_page_id = ?2 AND r.source_entity_id > ?3))
+                 ORDER BY r.source_page_id, r.source_entity_id LIMIT ?4",
                 vec![
                     raw_uuid_claim.to_vec().into(),
-                    page_id.to_vec().into(),
-                    block_id.to_vec().into(),
+                    page_id.into(),
+                    block_id.into(),
                     limit.into(),
                 ],
             ),
         };
         let mut statement = self.connection.prepare(sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
-            let page_id: Vec<u8> = row.get(0)?;
-            let block_id: Vec<u8> = row.get(1)?;
             Ok(PhysicalBlockReferrerCandidateRow {
-                source_page_id: decode_id_sql(&page_id)?,
-                source_block_id: decode_id_sql(&block_id)?,
+                page_cursor: row.get(0)?,
+                block_cursor: row.get(1)?,
+                source_page_path: row.get(2)?,
+                source_block_id: row.get(3)?,
             })
         })?;
         collect_read_rows(
             rows.map(|row| row.map_err(MaterializationError::from)),
-            |_| Ok(32),
+            block_referrer_candidate_row_output_bytes,
         )
     }
 
@@ -2970,37 +3276,41 @@ impl<'a> SqliteGraphProjectionRead<'a> {
     pub fn page_referrer_candidates_after(
         &self,
         normalized_name: &str,
-        after: Option<([u8; 16], PhysicalEntityId)>,
+        after: Option<(i64, PhysicalEntityCoordinate)>,
         limit: usize,
     ) -> Result<Vec<PhysicalPageReferrerCandidateRow>, MaterializationError> {
         let limit = checked_limit(limit)?;
         checked_query_text(normalized_name)?;
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = match after {
             None => (
-                "SELECT DISTINCT source_page_id, source_entity_type, source_entity_id
-                 FROM reference_postings
-                 WHERE target_type = 0 AND reference_kind <= 4
-                   AND normalized_name = ?1
-                 ORDER BY source_page_id, source_entity_type, source_entity_id LIMIT ?2",
+                "SELECT DISTINCT r.source_page_id, r.source_entity_type, r.source_entity_id,
+                    p.path, CASE r.source_entity_type WHEN 0 THEN p.path ELSE b.result_id END
+                 FROM reference_postings r JOIN names n ON n.name_id = r.target_name_id
+                 JOIN pages p ON p.page_id = r.source_page_id
+                 LEFT JOIN blocks b ON r.source_entity_type = 1 AND b.block_id = r.source_entity_id
+                 WHERE r.target_type = 0 AND r.reference_kind <= 4 AND n.key = ?1
+                 ORDER BY r.source_page_id, r.source_entity_type, r.source_entity_id LIMIT ?2",
                 vec![normalized_name.to_owned().into(), limit.into()],
             ),
             Some((page_id, source)) => {
                 let (source_type, source_id) = source.sql_parts();
                 (
-                    "SELECT DISTINCT source_page_id, source_entity_type, source_entity_id
-                     FROM reference_postings
-                     WHERE target_type = 0 AND reference_kind <= 4
-                       AND normalized_name = ?1
-                       AND (source_page_id > ?2
-                         OR (source_page_id = ?2 AND source_entity_type > ?3)
-                         OR (source_page_id = ?2 AND source_entity_type = ?3
-                             AND source_entity_id > ?4))
-                     ORDER BY source_page_id, source_entity_type, source_entity_id LIMIT ?5",
+                    "SELECT DISTINCT r.source_page_id, r.source_entity_type, r.source_entity_id,
+                        p.path, CASE r.source_entity_type WHEN 0 THEN p.path ELSE b.result_id END
+                     FROM reference_postings r JOIN names n ON n.name_id = r.target_name_id
+                     JOIN pages p ON p.page_id = r.source_page_id
+                     LEFT JOIN blocks b ON r.source_entity_type = 1 AND b.block_id = r.source_entity_id
+                     WHERE r.target_type = 0 AND r.reference_kind <= 4 AND n.key = ?1
+                       AND (r.source_page_id > ?2
+                         OR (r.source_page_id = ?2 AND r.source_entity_type > ?3)
+                         OR (r.source_page_id = ?2 AND r.source_entity_type = ?3
+                             AND r.source_entity_id > ?4))
+                     ORDER BY r.source_page_id, r.source_entity_type, r.source_entity_id LIMIT ?5",
                     vec![
                         normalized_name.to_owned().into(),
-                        page_id.to_vec().into(),
+                        page_id.into(),
                         source_type.into(),
-                        source_id.to_vec().into(),
+                        source_id.into(),
                         limit.into(),
                     ],
                 )
@@ -3009,21 +3319,26 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         let mut statement = self.connection.prepare(sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
             Ok((
-                row.get::<_, Vec<u8>>(0)?,
+                row.get::<_, i64>(0)?,
                 row.get::<_, i64>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?;
         let rows = rows.map(
             |row| -> Result<PhysicalPageReferrerCandidateRow, MaterializationError> {
-                let (page_id, source_type, source_id) = row.map_err(MaterializationError::from)?;
+                let (page_id, source_type, source_id, page_path, identity) =
+                    row.map_err(MaterializationError::from)?;
                 Ok(PhysicalPageReferrerCandidateRow {
-                    source_page_id: decode_id(&page_id)?,
-                    source: decode_entity(source_type, &source_id)?,
+                    source_page_path: page_path,
+                    source: public_entity(source_type, identity)?,
+                    page_cursor: page_id,
+                    entity_cursor: source_id,
                 })
             },
         );
-        collect_read_rows(rows, |_| Ok(32))
+        collect_read_rows(rows, page_referrer_candidate_row_output_bytes)
     }
 
     /// Page-level candidates for one normalized literal phrase under the
@@ -3032,7 +3347,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
     pub fn plain_text_candidate_pages_after(
         &self,
         normalized_phrase: &str,
-        after: Option<[u8; 16]>,
+        after: Option<i64>,
         limit: usize,
     ) -> Result<Vec<PhysicalPlainTextCandidatePageRow>, MaterializationError> {
         let limit = checked_limit(limit)?;
@@ -3047,32 +3362,34 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         let phrase = format!("\"{}\"", normalized_phrase.replace('"', "\"\""));
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = match after {
             None => (
-                "SELECT DISTINCT owner.page_id
+                "SELECT DISTINCT owner.page_id, pages.path
                  FROM search_fts
                  JOIN search_fts_owners owner ON owner.rowid = search_fts.rowid
+                 JOIN pages ON pages.page_id = owner.page_id
                  WHERE normalized_text MATCH ?1
                  ORDER BY owner.page_id LIMIT ?2",
                 vec![phrase.into(), limit.into()],
             ),
             Some(page_id) => (
-                "SELECT DISTINCT owner.page_id
+                "SELECT DISTINCT owner.page_id, pages.path
                  FROM search_fts
                  JOIN search_fts_owners owner ON owner.rowid = search_fts.rowid
+                 JOIN pages ON pages.page_id = owner.page_id
                  WHERE normalized_text MATCH ?1 AND owner.page_id > ?2
                  ORDER BY owner.page_id LIMIT ?3",
-                vec![phrase.into(), page_id.to_vec().into(), limit.into()],
+                vec![phrase.into(), page_id.into(), limit.into()],
             ),
         };
         let mut statement = self.connection.prepare(sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
-            let page_id: Vec<u8> = row.get(0)?;
             Ok(PhysicalPlainTextCandidatePageRow {
-                page_id: decode_id_sql(&page_id)?,
+                cursor: row.get(0)?,
+                page_path: row.get(1)?,
             })
         })?;
         collect_read_rows(
             rows.map(|row| row.map_err(MaterializationError::from)),
-            |_| Ok(16),
+            |row| checked_output_bytes(16, [Some(row.page_path.as_str())]),
         )
     }
 
@@ -3082,7 +3399,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
     pub fn fuzzy_subsequence_candidate_pages_after(
         &self,
         normalized_needle: &str,
-        after: Option<[u8; 16]>,
+        after: Option<i64>,
         limit: usize,
     ) -> Result<Vec<PhysicalFuzzyCandidatePageRow>, MaterializationError> {
         let limit = checked_limit(limit)?;
@@ -3120,14 +3437,13 @@ impl<'a> SqliteGraphProjectionRead<'a> {
                  WHERE substring.normalized_text LIKE ?1 ESCAPE '\\'
                    AND owner.page_id > ?2
                  ORDER BY owner.page_id LIMIT ?3",
-                vec![pattern.into(), page_id.to_vec().into(), limit.into()],
+                vec![pattern.into(), page_id.into(), limit.into()],
             ),
         };
         let mut statement = self.connection.prepare(sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
-            let page_id: Vec<u8> = row.get(0)?;
             Ok(PhysicalFuzzyCandidatePageRow {
-                page_id: decode_id_sql(&page_id)?,
+                cursor: row.get(0)?,
                 path: row.get(1)?,
             })
         })?;
@@ -3142,7 +3458,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
     pub fn block_property_candidates_after(
         &self,
         normalized_name: &str,
-        after: Option<([u8; 16], [u8; 16])>,
+        after: Option<(i64, i64)>,
         limit: usize,
     ) -> Result<Vec<PhysicalBlockPropertyCandidateRow>, MaterializationError> {
         let limit = checked_limit(limit)?;
@@ -3154,38 +3470,40 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         }
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = match after {
             None => (
-                "SELECT DISTINCT page_id, owner_id
-                 FROM properties
-                 WHERE owner_type = 1 AND normalized_name = ?1
-                 ORDER BY page_id, owner_id LIMIT ?2",
+                "SELECT DISTINCT x.page_id, x.owner_id, p.path, b.result_id
+                 FROM properties x JOIN names n ON n.name_id = x.name_id
+                 JOIN pages p ON p.page_id = x.page_id JOIN blocks b ON b.block_id = x.owner_id
+                 WHERE x.owner_type = 1 AND n.key = ?1
+                 ORDER BY x.page_id, x.owner_id LIMIT ?2",
                 vec![normalized_name.to_owned().into(), limit.into()],
             ),
             Some((page_id, block_id)) => (
-                "SELECT DISTINCT page_id, owner_id
-                 FROM properties
-                 WHERE owner_type = 1 AND normalized_name = ?1
-                   AND (page_id > ?2 OR (page_id = ?2 AND owner_id > ?3))
-                 ORDER BY page_id, owner_id LIMIT ?4",
+                "SELECT DISTINCT x.page_id, x.owner_id, p.path, b.result_id
+                 FROM properties x JOIN names n ON n.name_id = x.name_id
+                 JOIN pages p ON p.page_id = x.page_id JOIN blocks b ON b.block_id = x.owner_id
+                 WHERE x.owner_type = 1 AND n.key = ?1
+                   AND (x.page_id > ?2 OR (x.page_id = ?2 AND x.owner_id > ?3))
+                 ORDER BY x.page_id, x.owner_id LIMIT ?4",
                 vec![
                     normalized_name.to_owned().into(),
-                    page_id.to_vec().into(),
-                    block_id.to_vec().into(),
+                    page_id.into(),
+                    block_id.into(),
                     limit.into(),
                 ],
             ),
         };
         let mut statement = self.connection.prepare(sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
-            let page_id: Vec<u8> = row.get(0)?;
-            let block_id: Vec<u8> = row.get(1)?;
             Ok(PhysicalBlockPropertyCandidateRow {
-                page_id: decode_id_sql(&page_id)?,
-                block_id: decode_id_sql(&block_id)?,
+                page_cursor: row.get(0)?,
+                block_cursor: row.get(1)?,
+                page_path: row.get(2)?,
+                block_id: row.get(3)?,
             })
         })?;
         collect_read_rows(
             rows.map(|row| row.map_err(MaterializationError::from)),
-            |_| Ok(32),
+            block_property_candidate_row_output_bytes,
         )
     }
 
@@ -3196,13 +3514,12 @@ impl<'a> SqliteGraphProjectionRead<'a> {
     pub fn property_facet_rows_after(
         &self,
         block_owners_only: bool,
-        after: Option<(PhysicalEntityId, String, u32)>,
+        after: Option<(PhysicalEntityCoordinate, i64, u32)>,
         limit: usize,
     ) -> Result<Vec<PhysicalPropertyFacetRow>, MaterializationError> {
         let limit = checked_limit(limit)?;
-        if let Some((owner, name, _)) = &after {
-            checked_query_text(name)?;
-            if block_owners_only && !matches!(owner, PhysicalEntityId::Block(_)) {
+        if let Some((owner, _, _)) = &after {
+            if block_owners_only && !matches!(owner, PhysicalEntityCoordinate::Block(_)) {
                 return Err(MaterializationError::InvalidQuery(
                     "block-only property cursor must identify a block".into(),
                 ));
@@ -3210,28 +3527,36 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         }
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = match after {
             None => (
-                "SELECT owner_type, owner_id, page_id, name, normalized_name, value, ordinal
-                 FROM properties
-                 WHERE (?1 = 0 OR owner_type = 1)
-                 ORDER BY owner_type, owner_id, name, ordinal LIMIT ?2",
+                "SELECT x.owner_type, x.owner_id, x.name_id,
+                        CASE x.owner_type WHEN 0 THEN p.path ELSE b.result_id END,
+                        p.path, n.raw, n.key, x.value, x.ordinal
+                 FROM properties x JOIN names n ON n.name_id = x.name_id
+                 JOIN pages p ON p.page_id = x.page_id
+                 LEFT JOIN blocks b ON x.owner_type = 1 AND b.block_id = x.owner_id
+                 WHERE (?1 = 0 OR x.owner_type = 1)
+                 ORDER BY x.owner_type, x.owner_id, x.name_id, x.ordinal LIMIT ?2",
                 vec![i64::from(block_owners_only).into(), limit.into()],
             ),
-            Some((owner, name, ordinal)) => {
+            Some((owner, name_id, ordinal)) => {
                 let (owner_type, owner_id) = owner.sql_parts();
                 (
-                    "SELECT owner_type, owner_id, page_id, name, normalized_name, value, ordinal
-                     FROM properties
-                     WHERE (?1 = 0 OR owner_type = 1)
-                       AND (owner_type > ?2
-                         OR (owner_type = ?2 AND owner_id > ?3)
-                         OR (owner_type = ?2 AND owner_id = ?3 AND name > ?4)
-                         OR (owner_type = ?2 AND owner_id = ?3 AND name = ?4 AND ordinal > ?5))
-                     ORDER BY owner_type, owner_id, name, ordinal LIMIT ?6",
+                    "SELECT x.owner_type, x.owner_id, x.name_id,
+                            CASE x.owner_type WHEN 0 THEN p.path ELSE b.result_id END,
+                            p.path, n.raw, n.key, x.value, x.ordinal
+                     FROM properties x JOIN names n ON n.name_id = x.name_id
+                     JOIN pages p ON p.page_id = x.page_id
+                     LEFT JOIN blocks b ON x.owner_type = 1 AND b.block_id = x.owner_id
+                     WHERE (?1 = 0 OR x.owner_type = 1)
+                       AND (x.owner_type > ?2
+                         OR (x.owner_type = ?2 AND x.owner_id > ?3)
+                         OR (x.owner_type = ?2 AND x.owner_id = ?3 AND x.name_id > ?4)
+                         OR (x.owner_type = ?2 AND x.owner_id = ?3 AND x.name_id = ?4 AND x.ordinal > ?5))
+                     ORDER BY x.owner_type, x.owner_id, x.name_id, x.ordinal LIMIT ?6",
                     vec![
                         i64::from(block_owners_only).into(),
                         owner_type.into(),
-                        owner_id.to_vec().into(),
-                        name.into(),
+                        owner_id.into(),
+                        name_id.into(),
                         i64::from(ordinal).into(),
                         limit.into(),
                     ],
@@ -3242,21 +3567,34 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
-                row.get::<_, i64>(6)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, i64>(8)?,
             ))
         })?;
         collect_read_rows(
             rows.map(|row| {
-                let (owner_type, owner_id, page_id, source_name, normalized_name, value, ordinal) =
-                    row?;
+                let (
+                    owner_type,
+                    owner_id,
+                    name_id,
+                    identity,
+                    page_path,
+                    source_name,
+                    normalized_name,
+                    value,
+                    ordinal,
+                ) = row?;
                 Ok(PhysicalPropertyFacetRow {
-                    owner: decode_entity(owner_type, &owner_id)?,
-                    page_id: decode_id(&page_id)?,
+                    owner: public_entity(owner_type, identity)?,
+                    page_path,
+                    owner_cursor: owner_id,
+                    name_cursor: name_id,
                     source_name,
                     normalized_name,
                     value,
@@ -3268,12 +3606,16 @@ impl<'a> SqliteGraphProjectionRead<'a> {
                 })
             }),
             |row| {
-                Ok(row
-                    .source_name
-                    .len()
-                    .saturating_add(row.normalized_name.len())
-                    .saturating_add(row.value.len())
-                    .saturating_add(96))
+                checked_output_bytes(
+                    96,
+                    [
+                        Some(public_entity_id(&row.owner)),
+                        Some(row.page_path.as_str()),
+                        Some(row.source_name.as_str()),
+                        Some(row.normalized_name.as_str()),
+                        Some(row.value.as_str()),
+                    ],
+                )
             },
         )
     }
@@ -3284,16 +3626,20 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         limit: usize,
     ) -> Result<Vec<PhysicalPropertyRow>, MaterializationError> {
         let limit = checked_limit(limit)?;
-        let (owner_type, owner_id) = owner.sql_parts();
+        let (owner_type, owner_id) = entity_coordinate(self.connection, &owner)?;
         let mut statement = self.connection.prepare(
-            "SELECT owner_type, owner_id, page_id, name, value
-             FROM properties WHERE owner_type = ?1 AND owner_id = ?2
-             ORDER BY name, ordinal, value LIMIT ?3",
+            "SELECT x.owner_type,
+                    CASE x.owner_type WHEN 0 THEN p.path ELSE b.result_id END,
+                    p.path, n.raw, x.value
+             FROM properties x JOIN names n ON n.name_id = x.name_id
+             JOIN pages p ON p.page_id = x.page_id
+             LEFT JOIN blocks b ON x.owner_type = 1 AND b.block_id = x.owner_id
+             WHERE x.owner_type = ?1 AND x.owner_id = ?2
+             ORDER BY n.raw, x.ordinal, x.value LIMIT ?3",
         )?;
-        let rows = property_rows(statement.query_map(
-            params![owner_type, owner_id.as_slice(), limit],
-            property_tuple,
-        )?);
+        let rows = property_rows(
+            statement.query_map(params![owner_type, owner_id, limit], property_tuple)?,
+        );
         rows
     }
 
@@ -3305,23 +3651,28 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         let limit = checked_limit(limit)?;
         checked_query_text(tag)?;
         let mut statement = self.connection.prepare(
-            "SELECT owner_type, owner_id, page_id, tag
-             FROM tags WHERE tag = ?1
-             ORDER BY page_id, owner_type, owner_id, ordinal LIMIT ?2",
+            "SELECT x.owner_type,
+                    CASE x.owner_type WHEN 0 THEN p.path ELSE b.result_id END,
+                    p.path, n.raw
+             FROM tags x JOIN names n ON n.name_id = x.name_id
+             JOIN pages p ON p.page_id = x.page_id
+             LEFT JOIN blocks b ON x.owner_type = 1 AND b.block_id = x.owner_id
+             WHERE n.raw = ?1
+             ORDER BY x.page_id, x.owner_type, x.owner_id, x.ordinal LIMIT ?2",
         )?;
         let rows = statement.query_map(params![tag, limit], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
             ))
         })?;
         let rows = rows.map(|row| {
-            let (owner_type, owner_id, page_id, tag) = row?;
+            let (owner_type, owner_id, page_path, tag) = row?;
             Ok(PhysicalTagRow {
-                owner: decode_entity(owner_type, &owner_id)?,
-                page_id: decode_id(&page_id)?,
+                owner: public_entity(owner_type, owner_id)?,
+                page_path,
                 tag,
             })
         });
@@ -3339,28 +3690,30 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         }
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = match marker {
             Some(marker) => (
-                "SELECT block_id, page_id, marker, priority, scheduled, deadline
-                 FROM tasks WHERE marker = ?1
-                 ORDER BY deadline IS NULL, deadline, scheduled IS NULL, scheduled,
-                          page_id, block_id LIMIT ?2",
+                "SELECT b.result_id, p.path, t.marker, t.priority, t.scheduled, t.deadline
+                 FROM tasks t JOIN blocks b ON b.block_id = t.block_id
+                 JOIN pages p ON p.page_id = t.page_id WHERE t.marker = ?1
+                 ORDER BY t.deadline IS NULL, t.deadline, t.scheduled IS NULL, t.scheduled,
+                          t.page_id, t.block_id LIMIT ?2",
                 vec![
                     rusqlite::types::Value::Text(marker.to_owned()),
                     limit.into(),
                 ],
             ),
             None => (
-                "SELECT block_id, page_id, marker, priority, scheduled, deadline
-                 FROM tasks
-                 ORDER BY deadline IS NULL, deadline, scheduled IS NULL, scheduled,
-                          page_id, block_id LIMIT ?1",
+                "SELECT b.result_id, p.path, t.marker, t.priority, t.scheduled, t.deadline
+                 FROM tasks t JOIN blocks b ON b.block_id = t.block_id
+                 JOIN pages p ON p.page_id = t.page_id
+                 ORDER BY t.deadline IS NULL, t.deadline, t.scheduled IS NULL, t.scheduled,
+                          t.page_id, t.block_id LIMIT ?1",
                 vec![limit.into()],
             ),
         };
         let mut statement = self.connection.prepare(sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
             Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
@@ -3368,10 +3721,10 @@ impl<'a> SqliteGraphProjectionRead<'a> {
             ))
         })?;
         let rows = rows.map(|row| {
-            let (block_id, page_id, marker, priority, scheduled, deadline) = row?;
+            let (block_id, page_path, marker, priority, scheduled, deadline) = row?;
             Ok(PhysicalTaskRow {
-                block_id: decode_id(&block_id)?,
-                page_id: decode_id(&page_id)?,
+                block_id,
+                page_path,
                 marker,
                 priority,
                 scheduled,
@@ -3387,7 +3740,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
     pub fn task_candidate_pages_after(
         &self,
         marker: &str,
-        after: Option<[u8; 16]>,
+        after: Option<i64>,
         limit: usize,
     ) -> Result<Vec<PhysicalTaskCandidatePageRow>, MaterializationError> {
         let limit = checked_limit(limit)?;
@@ -3399,31 +3752,29 @@ impl<'a> SqliteGraphProjectionRead<'a> {
         }
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = match after {
             None => (
-                "SELECT DISTINCT page_id FROM tasks
-                 WHERE marker = ?1 ORDER BY page_id LIMIT ?2",
+                "SELECT DISTINCT t.page_id, p.path FROM tasks t
+                 JOIN pages p ON p.page_id = t.page_id
+                 WHERE t.marker = ?1 ORDER BY t.page_id LIMIT ?2",
                 vec![marker.to_owned().into(), limit.into()],
             ),
             Some(page_id) => (
-                "SELECT DISTINCT page_id FROM tasks
-                 WHERE marker = ?1 AND page_id > ?2
-                 ORDER BY page_id LIMIT ?3",
-                vec![
-                    marker.to_owned().into(),
-                    page_id.to_vec().into(),
-                    limit.into(),
-                ],
+                "SELECT DISTINCT t.page_id, p.path FROM tasks t
+                 JOIN pages p ON p.page_id = t.page_id
+                 WHERE t.marker = ?1 AND t.page_id > ?2
+                 ORDER BY t.page_id LIMIT ?3",
+                vec![marker.to_owned().into(), page_id.into(), limit.into()],
             ),
         };
         let mut statement = self.connection.prepare(sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
-            let page_id: Vec<u8> = row.get(0)?;
             Ok(PhysicalTaskCandidatePageRow {
-                page_id: decode_id_sql(&page_id)?,
+                cursor: row.get(0)?,
+                page_path: row.get(1)?,
             })
         })?;
         collect_read_rows(
             rows.map(|row| row.map_err(MaterializationError::from)),
-            |_| Ok(16),
+            |row| checked_output_bytes(16, [Some(row.page_path.as_str())]),
         )
     }
 
@@ -3436,7 +3787,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
     pub fn task_candidate_blocks_after(
         &self,
         marker: &str,
-        after: Option<([u8; 16], [u8; 16])>,
+        after: Option<(i64, i64)>,
         limit: usize,
     ) -> Result<Vec<PhysicalTaskCandidateBlockRow>, MaterializationError> {
         self.task_candidate_blocks_after_with_header_validation(
@@ -3452,7 +3803,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
     pub(crate) fn task_candidate_blocks_after_with_header_validation(
         &self,
         marker: &str,
-        after: Option<([u8; 16], [u8; 16])>,
+        after: Option<(i64, i64)>,
         limit: usize,
         mut validate_header: impl FnMut(&str, i64) -> Result<(), MaterializationError>,
     ) -> Result<Vec<PhysicalTaskCandidateBlockRow>, MaterializationError> {
@@ -3472,8 +3823,8 @@ impl<'a> SqliteGraphProjectionRead<'a> {
                 TASK_CANDIDATE_BLOCKS_AFTER_SQL,
                 vec![
                     marker.to_owned().into(),
-                    page_id.to_vec().into(),
-                    block_id.to_vec().into(),
+                    page_id.into(),
+                    block_id.into(),
                     limit.into(),
                 ],
             ),
@@ -3498,7 +3849,7 @@ impl<'a> SqliteGraphProjectionRead<'a> {
     pub fn task_candidate_locators_after(
         &self,
         marker: &str,
-        after: Option<([u8; 16], [u8; 16])>,
+        after: Option<(i64, i64)>,
         limit: usize,
     ) -> Result<Vec<PhysicalTaskCandidateLocatorRow>, MaterializationError> {
         let limit = checked_limit(limit)?;
@@ -3517,25 +3868,23 @@ impl<'a> SqliteGraphProjectionRead<'a> {
                 TASK_CANDIDATE_LOCATORS_AFTER_SQL,
                 vec![
                     marker.to_owned().into(),
-                    page_id.to_vec().into(),
-                    block_id.to_vec().into(),
+                    page_id.into(),
+                    block_id.into(),
                     limit.into(),
                 ],
             ),
         };
         let mut statement = self.connection.prepare(sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(args), |row| {
-            let block_id: Vec<u8> = row.get(0)?;
-            let page_id: Vec<u8> = row.get(1)?;
-            let parent: Option<Vec<u8>> = row.get(2)?;
             Ok(PhysicalTaskCandidateLocatorRow {
-                block_id: decode_id_sql(&block_id)?,
-                page_id: decode_id_sql(&page_id)?,
-                parent: parent.as_deref().map(decode_id_sql).transpose()?,
-                order: row.get(3)?,
-                page_name: row.get(4)?,
-                page_path: row.get(5)?,
-                page_text_kind: row.get(6)?,
+                block_cursor: row.get(0)?,
+                page_cursor: row.get(1)?,
+                block_id: row.get(2)?,
+                page_path: row.get(3)?,
+                parent: row.get(4)?,
+                order: row.get(5)?,
+                page_name: row.get(6)?,
+                page_text_kind: row.get(7)?,
             })
         })?;
         collect_read_rows(
@@ -3557,13 +3906,18 @@ impl<'a> SqliteGraphProjectionRead<'a> {
             ));
         }
         let mut statement = self.connection.prepare(
-            "SELECT entity_type, entity_id, page_id, text, bm25(search_fts)
-             FROM search_fts WHERE search_fts MATCH ?1
-             ORDER BY bm25(search_fts), entity_type, entity_id LIMIT ?2",
+            "SELECT owner.entity_type,
+                    CASE owner.entity_type WHEN 0 THEN p.path ELSE b.result_id END,
+                    p.path, search_fts.text, bm25(search_fts)
+             FROM search_fts JOIN search_fts_owners owner ON owner.rowid = search_fts.rowid
+             JOIN pages p ON p.page_id = owner.page_id
+             LEFT JOIN blocks b ON owner.entity_type = 1 AND b.block_id = owner.entity_id
+             WHERE search_fts MATCH ?1
+             ORDER BY bm25(search_fts), owner.entity_type, owner.entity_id LIMIT ?2",
         )?;
         let rows = statement.query_map(params![query, limit], |row| {
             Ok((
-                row.get::<_, String>(0)?,
+                row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
@@ -3571,24 +3925,10 @@ impl<'a> SqliteGraphProjectionRead<'a> {
             ))
         })?;
         let rows = rows.map(|row| {
-            let (entity_type, entity_id, page_id, text, rank) = row?;
-            let uuid = uuid::Uuid::parse_str(&entity_id)
-                .map_err(|error| MaterializationError::Corrupt(error.to_string()))?
-                .into_bytes();
-            let entity = match entity_type.as_str() {
-                "page" => PhysicalEntityId::Page(uuid),
-                "block" => PhysicalEntityId::Block(uuid),
-                _ => {
-                    return Err(MaterializationError::Corrupt(format!(
-                        "unknown FTS entity type {entity_type:?}"
-                    )));
-                }
-            };
+            let (entity_type, entity_id, page_path, text, rank) = row?;
             Ok(PhysicalSearchHit {
-                entity,
-                page_id: uuid::Uuid::parse_str(&page_id)
-                    .map_err(|error| MaterializationError::Corrupt(error.to_string()))?
-                    .into_bytes(),
+                entity: public_entity(entity_type, entity_id)?,
+                page_path,
                 text,
                 rank,
             })
@@ -3601,22 +3941,18 @@ fn page_row_with_header_validation(
     row: &rusqlite::Row<'_>,
     validate_header: &mut impl FnMut(&str, i64) -> Result<(), MaterializationError>,
 ) -> rusqlite::Result<Result<PhysicalPageRow, MaterializationError>> {
-    let page_id: Vec<u8> = row.get(0)?;
-    let home_document_id: Vec<u8> = row.get(1)?;
-    let path: String = row.get(4)?;
-    let kind: i64 = row.get(5)?;
+    let path: String = row.get(2)?;
+    let kind: i64 = row.get(3)?;
     if let Err(error) = validate_header(path.as_str(), kind) {
         return Ok(Err(error));
     }
     Ok(Ok(PhysicalPageRow {
-        page_id: decode_id_sql(&page_id)?,
-        home_document_id: decode_id_sql(&home_document_id)?,
-        name: row.get(2)?,
-        name_key: row.get(3)?,
+        name: row.get(0)?,
+        name_key: row.get(1)?,
         path,
         text_kind: kind,
-        preamble: row.get(6)?,
-        searchable_text: row.get(7)?,
+        preamble: row.get(4)?,
+        searchable_text: row.get(5)?,
     }))
 }
 
@@ -3627,15 +3963,14 @@ fn navigation_page_row_with_header_validation(
     // Preamble may legitimately be NULL. The keyed payload row may not be
     // missing: distinguish cache damage from an empty preamble without reading
     // the large search text solely to check presence.
-    let _payload_id: Vec<u8> = row.get(6)?;
-    let page_id: Vec<u8> = row.get(0)?;
+    let _payload_id: i64 = row.get(6)?;
     let path: String = row.get(3)?;
     let kind: i64 = row.get(4)?;
     if let Err(error) = validate_header(path.as_str(), kind) {
         return Ok(Err(error));
     }
     Ok(Ok(PhysicalNavigationPageRow {
-        page_id: decode_id_sql(&page_id)?,
+        cursor: row.get(0)?,
         name: row.get(1)?,
         name_key: row.get(2)?,
         path,
@@ -3645,25 +3980,20 @@ fn navigation_page_row_with_header_validation(
 }
 
 fn block_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PhysicalBlockRow> {
-    let block_id: Vec<u8> = row.get(0)?;
-    let page_id: Vec<u8> = row.get(1)?;
-    let home_document_id: Vec<u8> = row.get(2)?;
-    let parent: Option<Vec<u8>> = row.get(3)?;
-    let heading_level: Option<i64> = row.get(7)?;
-    let logseq_uuid: Option<Vec<u8>> = row.get(9)?;
-    let origin: Option<i64> = row.get(10)?;
+    let heading_level: Option<i64> = row.get(6)?;
+    let logseq_uuid: Option<Vec<u8>> = row.get(8)?;
+    let origin: Option<i64> = row.get(9)?;
     Ok(PhysicalBlockRow {
-        block_id: decode_id_sql(&block_id)?,
-        page_id: decode_id_sql(&page_id)?,
-        home_document_id: decode_id_sql(&home_document_id)?,
-        parent: parent.as_deref().map(decode_id_sql).transpose()?,
-        order: row.get(4)?,
-        content: row.get(5)?,
-        searchable_text: row.get(6)?,
+        result_id: row.get(0)?,
+        page_path: row.get(1)?,
+        parent: row.get(2)?,
+        order: row.get(3)?,
+        content: row.get(4)?,
+        searchable_text: row.get(5)?,
         heading_level: heading_level
             .map(|value| u8::try_from(value).map_err(sql_decode_error))
             .transpose()?,
-        collapsed: row.get::<_, i64>(8)? != 0,
+        collapsed: row.get::<_, i64>(7)? != 0,
         logseq_uuid: logseq_uuid.as_deref().map(decode_id_sql).transpose()?,
         logseq_identity_origin: origin,
     })
@@ -3673,23 +4003,21 @@ fn task_candidate_block_row_with_header_validation(
     row: &rusqlite::Row<'_>,
     validate_header: &mut impl FnMut(&str, i64) -> Result<(), MaterializationError>,
 ) -> rusqlite::Result<Result<PhysicalTaskCandidateBlockRow, MaterializationError>> {
-    let block_id: Vec<u8> = row.get(0)?;
-    let page_id: Vec<u8> = row.get(1)?;
-    let parent: Option<Vec<u8>> = row.get(2)?;
-    let logseq_uuid: Option<Vec<u8>> = row.get(5)?;
-    let page_path: String = row.get(7)?;
-    let page_text_kind: i64 = row.get(8)?;
+    let page_path: String = row.get(3)?;
+    let logseq_uuid: Option<Vec<u8>> = row.get(7)?;
+    let page_text_kind: i64 = row.get(9)?;
     if let Err(error) = validate_header(page_path.as_str(), page_text_kind) {
         return Ok(Err(error));
     }
     Ok(Ok(PhysicalTaskCandidateBlockRow {
-        block_id: decode_id_sql(&block_id)?,
-        page_id: decode_id_sql(&page_id)?,
-        parent: parent.as_deref().map(decode_id_sql).transpose()?,
-        order: row.get(3)?,
-        content: row.get(4)?,
+        block_cursor: row.get(0)?,
+        page_cursor: row.get(1)?,
+        block_id: row.get(2)?,
+        parent: row.get(4)?,
+        order: row.get(5)?,
+        content: row.get(6)?,
         logseq_uuid: logseq_uuid.as_deref().map(decode_id_sql).transpose()?,
-        page_name: row.get(6)?,
+        page_name: row.get(8)?,
         page_path,
         page_text_kind,
     }))
@@ -3697,7 +4025,7 @@ fn task_candidate_block_row_with_header_validation(
 
 fn property_tuple(
     row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<(i64, Vec<u8>, Vec<u8>, String, String)> {
+) -> rusqlite::Result<(i64, String, String, String, String)> {
     Ok((
         row.get(0)?,
         row.get(1)?,
@@ -3710,14 +4038,14 @@ fn property_tuple(
 fn property_rows(
     rows: rusqlite::MappedRows<
         '_,
-        impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<(i64, Vec<u8>, Vec<u8>, String, String)>,
+        impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<(i64, String, String, String, String)>,
     >,
 ) -> Result<Vec<PhysicalPropertyRow>, MaterializationError> {
     let rows = rows.map(|row| {
-        let (owner_type, owner_id, page_id, name, value) = row?;
+        let (owner_type, owner_id, page_path, name, value) = row?;
         Ok(PhysicalPropertyRow {
-            owner: decode_entity(owner_type, &owner_id)?,
-            page_id: decode_id(&page_id)?,
+            owner: public_entity(owner_type, owner_id)?,
+            page_path,
             name,
             value,
         })
@@ -3735,10 +4063,13 @@ fn checked_limit(limit: usize) -> Result<i64, MaterializationError> {
         .map_err(|_| MaterializationError::InvalidQuery("query limit overflowed".into()))
 }
 
-fn decode_entity(entity_type: i64, bytes: &[u8]) -> Result<PhysicalEntityId, MaterializationError> {
+fn public_entity(
+    entity_type: i64,
+    identity: String,
+) -> Result<PhysicalEntityId, MaterializationError> {
     match entity_type {
-        0 => Ok(PhysicalEntityId::Page(decode_id(bytes)?)),
-        1 => Ok(PhysicalEntityId::Block(decode_id(bytes)?)),
+        0 => Ok(PhysicalEntityId::Page(identity)),
+        1 => Ok(PhysicalEntityId::Block(identity)),
         _ => Err(MaterializationError::Corrupt(format!(
             "unknown entity type {entity_type}"
         ))),
@@ -3751,12 +4082,6 @@ fn decode_id_sql(bytes: &[u8]) -> rusqlite::Result<[u8; 16]> {
 
 fn sql_decode_error(error: impl std::error::Error + Send + Sync + 'static) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Blob, Box::new(error))
-}
-
-fn decode_id(bytes: &[u8]) -> Result<[u8; 16], MaterializationError> {
-    bytes
-        .try_into()
-        .map_err(|_| MaterializationError::Corrupt("invalid UUID length".into()))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3807,24 +4132,43 @@ impl From<rusqlite::Error> for MaterializationError {
 mod tests {
     use super::*;
 
-    fn id(value: u128) -> [u8; 16] {
-        value.to_be_bytes()
-    }
-
     #[test]
     fn query_preorder_rejects_incomplete_or_cyclic_trees() {
-        assert!(query_block_preorder([(id(1), Some(id(2)), "a")]).is_err());
+        assert!(query_block_preorder([("one", Some("two"), "a")]).is_err());
         assert!(
-            query_block_preorder([(id(1), Some(id(2)), "a"), (id(2), Some(id(1)), "b")]).is_err()
+            query_block_preorder([("one", Some("two"), "a"), ("two", Some("one"), "b")]).is_err()
         );
-        assert!(query_block_preorder([(id(1), None, "a"), (id(1), None, "b")]).is_err());
+        assert!(query_block_preorder([("one", None, "a"), ("one", None, "b")]).is_err());
         assert_eq!(
-            query_block_preorder([(id(2), None, "z"), (id(1), None, "z")]).unwrap(),
+            query_block_preorder([("two", None, "z"), ("one", None, "z")]).unwrap(),
             [(1, 1), (0, 1)]
         );
         assert_eq!(
             query_result_estimated_bytes("", "é", ["tag"], [("key", "value")]),
             36 + 2 + 3 + 3 + 5 + 128
         );
+    }
+
+    #[test]
+    fn aggregate_read_budget_charges_public_paths_and_ids() {
+        let row = PhysicalBlockReferrerCandidateRow {
+            source_page_path: "pages/a.md".into(),
+            source_block_id: "b".repeat(1024 * 1024),
+            page_cursor: 1,
+            block_cursor: 2,
+        };
+        let row_bytes = block_referrer_candidate_row_output_bytes(&row).unwrap();
+        let mut budget = MaterializationReadBudget::default();
+        for _ in 0..(MAX_MATERIALIZATION_READ_BYTES / row_bytes) {
+            budget.add(row_bytes).unwrap();
+        }
+        assert!(matches!(
+            budget.add(row_bytes),
+            Err(MaterializationError::ResourceLimit {
+                resource: "materialization read output bytes",
+                maximum: MAX_MATERIALIZATION_READ_BYTES,
+                ..
+            })
+        ));
     }
 }

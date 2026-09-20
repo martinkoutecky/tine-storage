@@ -50,10 +50,11 @@ pub mod sqlite {
     pub use crate::sqlite_materialization::{
         query_page_result_estimated_bytes, query_result_estimated_bytes,
         ApplyChangeInstrumentation, MaterializationError, PhysicalAliasDeclaration, PhysicalBlock,
-        PhysicalEntityId, PhysicalGraphProjectionChange, PhysicalPage, PhysicalPlanning,
-        PhysicalProperty, PhysicalPropertyAtom, PhysicalReferencePosting, PhysicalReferenceTarget,
-        PhysicalTag, PhysicalTask, SqliteGraphProjectionRead, MAX_MATERIALIZATION_QUERY_BYTES,
-        MAX_MATERIALIZATION_QUERY_ROWS, MAX_MATERIALIZATION_READ_BYTES,
+        PhysicalEntityCoordinate, PhysicalEntityId, PhysicalGraphProjectionChange, PhysicalName,
+        PhysicalPage, PhysicalPlanning, PhysicalProperty, PhysicalPropertyAtom,
+        PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalTag, PhysicalTask,
+        SqliteGraphProjectionRead, MAX_MATERIALIZATION_QUERY_BYTES, MAX_MATERIALIZATION_QUERY_ROWS,
+        MAX_MATERIALIZATION_READ_BYTES,
     };
 }
 

@@ -122,7 +122,7 @@ fn standalone_graph_projection_is_usable_without_managed_storage_types() {
         tine_storage::sqlite::PhysicalProjectionQuerySnapshot::open_direct(&path, || Ok(()))
             .unwrap();
     let revision: u64 = snapshot.query_revision().unwrap();
-    assert!(revision > 0);
+    assert_eq!(revision, 0, "an empty apply is inventory-idempotent");
     drop(snapshot);
     drop(database);
     for suffix in ["", "-wal", "-shm"] {

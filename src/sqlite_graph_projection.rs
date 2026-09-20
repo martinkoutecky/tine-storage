@@ -19,24 +19,524 @@ use crate::sqlite_materialization::{
 const PREPARED_STATEMENT_CACHE_STATEMENTS: usize = 64;
 const SOURCE_REVISION_MAX_BYTES: usize = 4096;
 const SOURCE_REVISIONS_DDL: &str = "CREATE TABLE direct_source_revisions (
-    page_id BLOB PRIMARY KEY CHECK (length(page_id) = 16),
+    path TEXT PRIMARY KEY CHECK (length(CAST(path AS BLOB)) BETWEEN 1 AND 4194304),
     revision TEXT NOT NULL CHECK (length(CAST(revision AS BLOB)) BETWEEN 1 AND 4096),
-    query_metadata_schema INTEGER NOT NULL DEFAULT 30 CHECK (query_metadata_schema = 30),
-    FOREIGN KEY (page_id) REFERENCES pages(page_id) ON DELETE CASCADE
+    FOREIGN KEY (path) REFERENCES pages(path) ON DELETE CASCADE
 ) STRICT";
 
 /// Exact application-authority revision for one disposable projection page.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalGraphProjectionSourceRevision {
-    pub page_id: [u8; 16],
+    pub path: String,
     pub revision: String,
+}
+
+#[cfg(test)]
+mod compact_key_tests {
+    use super::*;
+    use crate::sqlite_materialization::{
+        PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityId, PhysicalName, PhysicalPage,
+        PhysicalProperty, PhysicalPropertyAtom, PhysicalReferencePosting, PhysicalReferenceTarget,
+        PhysicalTag, PhysicalTask,
+    };
+
+    fn file(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "tine-storage-p3-{name}-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn block(id: &str, parent: Option<&str>) -> PhysicalBlock {
+        PhysicalBlock {
+            result_id: id.into(),
+            own_refs: vec![
+                PhysicalName {
+                    raw: "Foo".into(),
+                    key: "foo".into(),
+                },
+                PhysicalName {
+                    raw: "FOO".into(),
+                    key: "foo".into(),
+                },
+                PhysicalName {
+                    raw: "Only own".into(),
+                    key: "only own".into(),
+                },
+            ],
+            parent: parent.map(str::to_owned),
+            order: if parent.is_some() {
+                "b".into()
+            } else {
+                "a".into()
+            },
+            content: format!("content {id}"),
+            searchable_text: format!("content {id}"),
+            normalized_searchable_text: format!("content {id}"),
+            query_visible: format!("content {id}"),
+            query_visible_folded: format!("content {id}"),
+            heading_level: None,
+            collapsed: false,
+            logseq_uuid: Some([7; 16]),
+            logseq_identity_origin: Some(0),
+            properties: vec![PhysicalProperty {
+                name: "Priority".into(),
+                normalized_name: "priority".into(),
+                value: "A".into(),
+            }],
+            tags: vec![PhysicalTag {
+                tag: "Tag".into(),
+                tag_key: "tag".into(),
+            }],
+            task: Some(PhysicalTask {
+                marker: "TODO".into(),
+                priority: None,
+                scheduled: None,
+                deadline: None,
+            }),
+            planning: None,
+            path_refs: vec![PhysicalName {
+                raw: "Foo".into(),
+                key: "foo".into(),
+            }],
+            property_atoms: vec![PhysicalPropertyAtom {
+                name: "Priority".into(),
+                normalized_name: "priority".into(),
+                ordinal: 0,
+                atom: "A".into(),
+                atom_key: "a".into(),
+                origin: 1,
+                atom_num: None,
+                atom_day: None,
+            }],
+        }
+    }
+
+    fn page(path: &str, name: &str, blocks: Vec<PhysicalBlock>) -> PhysicalPage {
+        PhysicalPage {
+            position: None,
+            name: name.into(),
+            name_key: name.to_lowercase(),
+            path: path.into(),
+            text_kind: 0,
+            journal_day: None,
+            preamble: None,
+            searchable_text: name.into(),
+            normalized_searchable_text: name.to_lowercase(),
+            properties: Vec::new(),
+            tags: Vec::new(),
+            property_atoms: Vec::new(),
+            blocks,
+        }
+    }
+
+    fn posting(path: &str, block: &str, raw: &str) -> PhysicalReferencePosting {
+        PhysicalReferencePosting {
+            source_page_path: path.into(),
+            source_entity: PhysicalEntityId::Block(block.into()),
+            source_locator: b"content".to_vec(),
+            ordinal: if raw == "Foo" { 0 } else { 1 },
+            kind: 0,
+            target: PhysicalReferenceTarget::PageName {
+                raw_name: raw.into(),
+                normalized_name: "foo".into(),
+            },
+        }
+    }
+
+    fn change(
+        page: PhysicalPage,
+        postings: Vec<PhysicalReferencePosting>,
+    ) -> PhysicalGraphProjectionChange {
+        PhysicalGraphProjectionChange {
+            replacements: vec![page],
+            deletions: Vec::new(),
+            reference_postings: postings,
+        }
+    }
+
+    fn scalar(db: &PhysicalGraphProjectionDatabase, sql: &str) -> i64 {
+        db.connection.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    #[test]
+    fn integer_coordinates_names_and_one_postings_representation() {
+        let path = file("shape");
+        let mut db = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        db.initialize_schema().unwrap();
+        db.validate_schema().unwrap();
+        let a = "pages/a.md";
+        let mut c = change(
+            page(
+                a,
+                "Café",
+                vec![block("b-root", None), block("b-child", Some("b-root"))],
+            ),
+            vec![posting(a, "b-root", "Foo"), posting(a, "b-root", "FOO")],
+        );
+        c.reference_postings.push(PhysicalReferencePosting {
+            source_page_path: a.into(),
+            source_entity: PhysicalEntityId::Block("b-root".into()),
+            source_locator: b"content".to_vec(),
+            ordinal: 2,
+            kind: 6,
+            target: PhysicalReferenceTarget::ExternalUuid { raw_claim: [9; 16] },
+        });
+        db.apply_with_aliases(
+            &c,
+            &[PhysicalAliasDeclaration {
+                source_page_path: a.into(),
+                source_entity: PhysicalEntityId::Page(a.into()),
+                source_locator: b"properties".to_vec(),
+                ordinal: 0,
+                raw_alias: "Café Alias".into(),
+                normalized_alias: "café alias".into(),
+            }],
+        )
+        .unwrap();
+
+        let root = db.read().block("b-root").unwrap().unwrap();
+        let child = db.read().block("b-child").unwrap().unwrap();
+        assert_eq!(root.page_path, a);
+        assert_eq!(child.parent.as_deref(), Some("b-root"));
+        assert_eq!(
+            db.read().blocks_by_logseq_uuid([7; 16], 10).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            scalar(&db, "SELECT COUNT(*) FROM names WHERE key = 'foo'"),
+            2
+        );
+        assert_eq!(
+            scalar(&db, "SELECT COUNT(*) FROM reference_postings WHERE own = 1"),
+            4
+        );
+        let raw_occurrences = db
+            .connection
+            .prepare(
+                "SELECT n.raw FROM reference_postings r
+                 JOIN names n ON n.name_id = r.target_name_id
+                 JOIN blocks b ON b.block_id = r.source_entity_id
+                 WHERE b.result_id = 'b-root' AND r.reference_kind < 8 AND n.key = 'foo'
+                 ORDER BY n.raw",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(raw_occurrences, ["FOO", "Foo"]);
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM reference_postings r
+                 JOIN names n ON n.name_id = r.target_name_id
+                 JOIN blocks b ON b.block_id = r.source_entity_id
+                 WHERE b.result_id = 'b-root' AND n.key = 'foo' AND r.own = 1"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM reference_postings r
+                 JOIN names n ON n.name_id = r.target_name_id
+                 JOIN blocks b ON b.block_id = r.source_entity_id
+                 WHERE b.result_id = 'b-root' AND n.key = 'foo'
+                   AND r.reference_kind = 8"
+            ),
+            0
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM reference_postings r
+                 JOIN names n ON n.name_id = r.target_name_id
+                 JOIN blocks b ON b.block_id = r.source_entity_id
+                 WHERE b.result_id = 'b-root' AND n.key = 'only own'
+                   AND r.reference_kind = 8 AND r.own = 1"
+            ),
+            1
+        );
+        assert_eq!(
+            scalar(
+                &db,
+                "SELECT COUNT(*) FROM reference_postings WHERE reference_kind = 8"
+            ),
+            3
+        );
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM block_path_refs"), 2);
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('block_own_refs','query_block_results','query_page_results','query_page_order')"), 0);
+        let read = db.read();
+        assert_eq!(
+            read.navigation_pages_after_with_header_validation(None, None, 10, |_, _| Ok(()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(read.navigation_aliases_after(None, 10).unwrap().len(), 1);
+        assert_eq!(
+            read.navigation_reference_names_after(None, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            read.block_reference_counts_after(None, 10).unwrap()[0].raw_uuid_claim,
+            [9; 16]
+        );
+        assert_eq!(
+            read.block_referrer_candidates_after([9; 16], None, 10)
+                .unwrap()[0]
+                .source_block_id,
+            "b-root"
+        );
+        assert_eq!(
+            read.page_referrer_candidates_after("foo", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            read.plain_text_candidate_pages_after("content", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            read.fuzzy_subsequence_candidate_pages_after("cnt", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            read.block_property_candidates_after("priority", None, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            read.property_facet_rows_after(true, None, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            read.properties(PhysicalEntityId::Block("b-root".into()), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(read.tags("Tag", 10).unwrap().len(), 2);
+        assert_eq!(read.tasks(Some("TODO"), 10).unwrap().len(), 2);
+        assert_eq!(
+            read.task_candidate_pages_after("TODO", None, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            read.task_candidate_blocks_after("TODO", None, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            read.task_candidate_locators_after("TODO", None, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(read.search("content", 10).unwrap().len(), 2);
+        for plan in [
+            read.query_plan(
+                "SELECT name_id FROM names WHERE key = ?1 AND raw = ?2",
+                &[String::from("foo").into(), String::from("Foo").into()],
+            )
+            .unwrap(),
+            read.query_plan(
+                "SELECT name_id FROM names WHERE raw = ?1 AND key = ?2",
+                &[String::from("Foo").into(), String::from("foo").into()],
+            )
+            .unwrap(),
+        ] {
+            assert!(plan.iter().any(|step| step.contains("SEARCH")), "{plan:?}");
+        }
+        db.quick_check().unwrap();
+        drop(db);
+        let db = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        db.validate_schema().unwrap();
+        assert_eq!(db.read().page(a).unwrap().unwrap().name, "Café");
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn replacements_allocate_fresh_blocks_preserve_pages_and_reclaim_affected_names() {
+        let path = file("replace");
+        let mut db = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        db.initialize_schema().unwrap();
+        let a = "pages/a.md";
+        db.apply(&change(
+            page(a, "Old unique", vec![block("live", None)]),
+            vec![posting(a, "live", "Foo")],
+        ))
+        .unwrap();
+        let page_id = scalar(&db, "SELECT page_id FROM pages WHERE path = 'pages/a.md'");
+        let first_block = scalar(&db, "SELECT block_id FROM blocks WHERE result_id = 'live'");
+        db.apply(&change(
+            page(a, "New unique", vec![block("live", None)]),
+            vec![],
+        ))
+        .unwrap();
+        let second_block = scalar(&db, "SELECT block_id FROM blocks WHERE result_id = 'live'");
+        assert_eq!(
+            scalar(&db, "SELECT page_id FROM pages WHERE path = 'pages/a.md'"),
+            page_id
+        );
+        assert!(second_block > first_block);
+        assert_eq!(
+            scalar(&db, "SELECT COUNT(*) FROM names WHERE raw = 'Old unique'"),
+            0
+        );
+
+        let b = "pages/b.md";
+        db.apply(&change(page(b, "B", vec![block("newest", None)]), vec![]))
+            .unwrap();
+        let newest = scalar(
+            &db,
+            "SELECT block_id FROM blocks WHERE result_id = 'newest'",
+        );
+        db.apply(&PhysicalGraphProjectionChange {
+            replacements: Vec::new(),
+            deletions: vec![b.into()],
+            reference_postings: Vec::new(),
+        })
+        .unwrap();
+        db.apply(&change(
+            page(a, "New unique", vec![block("live", None)]),
+            vec![],
+        ))
+        .unwrap();
+        assert!(scalar(&db, "SELECT block_id FROM blocks WHERE result_id = 'live'") > newest);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn source_paths_foreign_keys_off_and_reset_are_coherent() {
+        let path = file("lifecycle");
+        let mut db = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        db.initialize_schema().unwrap();
+        let a = "pages/a.md";
+        let c = change(page(a, "A", vec![block("one", None)]), vec![]);
+        db.apply_with_source_revisions_aliases_and_page_order(
+            &c,
+            &[PhysicalGraphProjectionSourceRevision {
+                path: a.into(),
+                revision: "r1".into(),
+            }],
+            &[],
+            &[a.into()],
+        )
+        .unwrap();
+        assert_eq!(
+            db.source_delta(&[PhysicalGraphProjectionSourceRevision {
+                path: a.into(),
+                revision: "r1".into()
+            }])
+            .unwrap(),
+            PhysicalGraphProjectionSourceDelta::default()
+        );
+        let revision = scalar(&db, "SELECT revision FROM query_projection_state");
+        db.apply_with_source_revisions_aliases_and_page_order(
+            &PhysicalGraphProjectionChange {
+                replacements: Vec::new(),
+                deletions: Vec::new(),
+                reference_postings: Vec::new(),
+            },
+            &[],
+            &[],
+            &[a.into()],
+        )
+        .unwrap();
+        assert_eq!(
+            scalar(&db, "SELECT revision FROM query_projection_state"),
+            revision
+        );
+        db.connection
+            .pragma_update(None, "foreign_keys", "OFF")
+            .unwrap();
+        db.apply(&PhysicalGraphProjectionChange {
+            replacements: Vec::new(),
+            deletions: vec![a.into()],
+            reference_postings: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM pages"), 0);
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM reference_postings"), 0);
+        db.reset().unwrap();
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM names"), 0);
+        assert_eq!(
+            scalar(&db, "SELECT next_entity_id FROM query_projection_state"),
+            1
+        );
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn public_ids_are_not_query_expression_capped() {
+        let path = file("long-public-ids");
+        let mut db = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        db.initialize_schema().unwrap();
+        let long_path = format!("pages/{}.md", "p".repeat(70_000));
+        let long_block_id = "b".repeat(70_000);
+        db.apply(&change(
+            page(&long_path, "Long", vec![block(&long_block_id, None)]),
+            vec![],
+        ))
+        .unwrap();
+        assert_eq!(db.read().page(&long_path).unwrap().unwrap().path, long_path);
+        let page_cursor = db
+            .connection
+            .query_row(
+                "SELECT page_id FROM pages WHERE path = ?1",
+                [&long_path],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert!(db
+            .read()
+            .navigation_pages_after_with_header_validation(
+                Some(&long_path),
+                Some(page_cursor),
+                10,
+                |_, _| Ok(()),
+            )
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.read().block(&long_block_id).unwrap().unwrap().result_id,
+            long_block_id
+        );
+        assert_eq!(
+            db.read()
+                .properties(PhysicalEntityId::Block(long_block_id), 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Page IDs whose physical facts differ from an application's current source.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PhysicalGraphProjectionSourceDelta {
-    pub replacements: Vec<[u8; 16]>,
-    pub deletions: Vec<[u8; 16]>,
+    pub replacements: Vec<String>,
+    pub deletions: Vec<String>,
 }
 
 /// Connection-owning standalone graph-fact projection.
@@ -177,9 +677,9 @@ impl PhysicalGraphProjectionDatabase {
         let columns = statement
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<Result<Vec<_>, _>>()?;
-        if columns != ["page_id", "revision", "query_metadata_schema"] {
+        if columns != ["path", "revision"] {
             return Err(MaterializationError::Schema(format!(
-                "direct_source_revisions columns {columns:?} != [page_id, revision, query_metadata_schema]"
+                "direct_source_revisions columns {columns:?} != [path, revision]"
             )));
         }
         let schema_sql: String = self.connection.query_row(
@@ -230,8 +730,8 @@ impl PhysicalGraphProjectionDatabase {
     }
 
     /// Apply page/reference facts, exact source revisions, and aliases in one
-    /// transaction. This additive API keeps `PhysicalGraphProjectionChange`
-    /// source-compatible with tine-storage 0.6.0.
+    /// transaction. Source identity is the same public relative path used by
+    /// page replacement; no derived UUID coordinate crosses this boundary.
     pub fn apply_with_source_revisions_and_aliases(
         &mut self,
         change: &PhysicalGraphProjectionChange,
@@ -250,7 +750,7 @@ impl PhysicalGraphProjectionDatabase {
         change: &PhysicalGraphProjectionChange,
         revisions: &[PhysicalGraphProjectionSourceRevision],
         aliases: &[PhysicalAliasDeclaration],
-        page_order: &[[u8; 16]],
+        page_order: &[String],
     ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
         self.apply_inner(change, Some(revisions), aliases, Some(page_order))
     }
@@ -260,12 +760,12 @@ impl PhysicalGraphProjectionDatabase {
         change: &PhysicalGraphProjectionChange,
         revisions: Option<&[PhysicalGraphProjectionSourceRevision]>,
         aliases: &[PhysicalAliasDeclaration],
-        page_order: Option<&[[u8; 16]]>,
+        page_order: Option<&[String]>,
     ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
         let replacement_ids = change
             .replacements
             .iter()
-            .map(|page| page.page_id)
+            .map(|page| page.path.clone())
             .collect::<BTreeSet<_>>();
         if let Some(revisions) = revisions {
             let revision_ids = validated_source_revisions(revisions)?
@@ -280,39 +780,28 @@ impl PhysicalGraphProjectionDatabase {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if let Some(order) = page_order {
-            let positions = order
-                .iter()
-                .enumerate()
-                .map(|(position, id)| (*id, position as u64))
-                .collect::<BTreeMap<_, _>>();
-            if positions.len() != order.len() {
-                return Err(MaterializationError::InvalidInput(
-                    "duplicate page in query inventory".into(),
-                ));
-            }
-            for page in &change.replacements {
-                if let Some(position) = page.query_page_order {
-                    if positions.get(&page.page_id) != Some(&position) {
-                        return Err(MaterializationError::InvalidInput(
-                            "page order differs from complete inventory".into(),
-                        ));
-                    }
-                }
-            }
-            // A changed inventory may permute occupied positions. Clear only
-            // its small order table before page writes; the final reconciliation
-            // below restores the complete order within this same transaction.
-            if !change.replacements.is_empty() || !change.deletions.is_empty() {
-                transaction.execute("DELETE FROM query_page_order", [])?;
-            }
+        let page_order_plan = page_order
+            .map(|order| prepare_query_page_order(&transaction, change, order))
+            .transpose()?;
+        let order_changed = page_order_plan
+            .as_ref()
+            .is_some_and(|plan| !plan.mismatched.is_empty());
+        if !change.replacements.is_empty()
+            || !change.deletions.is_empty()
+            || !change.reference_postings.is_empty()
+            || !aliases.is_empty()
+            || order_changed
+        {
+            sqlite_materialization::advance_query_projection_revision(&transaction)?;
         }
-        // Fresh-build route (GH #543): into an empty projection, every row of
-        // every secondary index lands on a random B-tree leaf (the keys are
-        // UUIDs), so a graph-sized build touches the whole index set per
-        // page and, past the page-cache ceiling, spills and re-reads it.
-        // Building the indexes once after the rows is an external sort
-        // instead. Readers on this WAL file see the old snapshot until the
+        if let Some(plan) = &page_order_plan {
+            plan.clear_insert_collisions(&transaction)?;
+        }
+        // Fresh-build route (GH #543): maintaining every secondary index once
+        // per inserted fact makes a graph-sized build touch the whole index
+        // set page by page and, past the page-cache ceiling, spill and re-read
+        // it. Building the indexes once after the rows is an external sort.
+        // Readers on this WAL file see the old snapshot until the
         // commit, and a rollback restores the indexes, so the route is
         // invisible outside this transaction. It is taken only while the
         // covered tables are empty: without indexes the per-page cleanup
@@ -324,43 +813,38 @@ impl PhysicalGraphProjectionDatabase {
         }
         let instrumentation = sqlite_materialization::apply_graph_projection_rows(
             &transaction,
-            &change.replacements,
-            &change.deletions,
-            None,
-        )?;
-        sqlite_materialization::replace_graph_projection_reference_facts(
-            &transaction,
             change,
             aliases,
+            None,
         )?;
-        for page_id in &change.deletions {
+        for path in &change.deletions {
             transaction.execute(
-                "DELETE FROM direct_source_revisions WHERE page_id = ?1",
-                rusqlite::params![page_id.as_slice()],
+                "DELETE FROM direct_source_revisions WHERE path = ?1",
+                rusqlite::params![path],
             )?;
         }
         match revisions {
             Some(revisions) => {
                 for revision in revisions {
                     transaction.execute(
-                        "INSERT INTO direct_source_revisions (page_id, revision)
+                        "INSERT INTO direct_source_revisions (path, revision)
                          VALUES (?1, ?2)
-                         ON CONFLICT(page_id) DO UPDATE SET revision = excluded.revision",
-                        rusqlite::params![revision.page_id.as_slice(), &revision.revision],
+                         ON CONFLICT(path) DO UPDATE SET revision = excluded.revision",
+                        rusqlite::params![&revision.path, &revision.revision],
                     )?;
                 }
             }
             None => {
                 for page in &change.replacements {
                     transaction.execute(
-                        "DELETE FROM direct_source_revisions WHERE page_id = ?1",
-                        rusqlite::params![page.page_id.as_slice()],
+                        "DELETE FROM direct_source_revisions WHERE path = ?1",
+                        rusqlite::params![&page.path],
                     )?;
                 }
             }
         }
-        if let Some(order) = page_order {
-            reconcile_query_page_order(&transaction, order)?;
+        if let Some(plan) = &page_order_plan {
+            plan.reconcile(&transaction)?;
         }
         if deferred_indexes {
             sqlite_materialization::create_deferred_indexes(&transaction)?;
@@ -377,34 +861,38 @@ impl PhysicalGraphProjectionDatabase {
         current: &[PhysicalGraphProjectionSourceRevision],
     ) -> Result<PhysicalGraphProjectionSourceDelta, MaterializationError> {
         let current = validated_source_revisions(current)?;
-        let mut existing = BTreeMap::<[u8; 16], Option<String>>::new();
+        let mut existing = BTreeMap::<String, Option<String>>::new();
         let mut statement = self.connection.prepare(
-            "SELECT p.page_id, s.revision
+            "SELECT p.path, s.revision
              FROM pages AS p
-             LEFT JOIN direct_source_revisions AS s ON s.page_id = p.page_id
-             ORDER BY p.page_id",
+             LEFT JOIN direct_source_revisions AS s ON s.path = p.path
+             ORDER BY p.path",
         )?;
         for row in statement.query_map([], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<String>>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
         })? {
-            let (page_id, revision) = row?;
-            let page_id: [u8; 16] = page_id.try_into().map_err(|_| {
-                MaterializationError::Corrupt("stored page ID is not 16 bytes".into())
-            })?;
-            existing.insert(page_id, revision);
+            let (path, revision) = row?;
+            existing.insert(path, revision);
         }
-        let replacements = current
-            .iter()
-            .filter_map(|(page_id, revision)| {
-                (existing.get(page_id).and_then(Option::as_ref) != Some(revision))
-                    .then_some(*page_id)
-            })
-            .collect();
-        let deletions = existing
-            .keys()
-            .filter(|page_id| !current.contains_key(*page_id))
-            .copied()
-            .collect();
+        let mut output_budget = sqlite_materialization::MaterializationReadBudget::default();
+        let mut replacements = Vec::new();
+        for (path, revision) in &current {
+            if existing.get(path).and_then(Option::as_ref) != Some(revision) {
+                output_budget.add(sqlite_materialization::checked_output_bytes(
+                    0,
+                    [Some(path.as_str())],
+                )?)?;
+                replacements.push(path.clone());
+            }
+        }
+        let mut deletions = Vec::new();
+        for path in existing.keys().filter(|path| !current.contains_key(*path)) {
+            output_budget.add(sqlite_materialization::checked_output_bytes(
+                0,
+                [Some(path.as_str())],
+            )?)?;
+            deletions.push(path.clone());
+        }
         Ok(PhysicalGraphProjectionSourceDelta {
             replacements,
             deletions,
@@ -432,50 +920,126 @@ impl PhysicalGraphProjectionDatabase {
     }
 }
 
-fn reconcile_query_page_order(
+struct QueryPageOrderPlan {
+    /// Final positions whose post-replacement value differs from the complete
+    /// inventory. Existing rows at these paths temporarily vacate their
+    /// positions before replacement rows retain positions, then only these
+    /// rows receive their final positions.
+    mismatched: Vec<(String, i64)>,
+}
+
+impl QueryPageOrderPlan {
+    fn clear_insert_collisions(&self, connection: &Connection) -> Result<(), MaterializationError> {
+        let mut clear = connection.prepare_cached(
+            "UPDATE pages SET position = NULL WHERE path = ?1 AND position IS NOT NULL",
+        )?;
+        for (path, _) in &self.mismatched {
+            clear.execute([path])?;
+        }
+        Ok(())
+    }
+
+    fn reconcile(&self, connection: &Connection) -> Result<(), MaterializationError> {
+        // Pre-materialization clearing makes mismatched retained positions
+        // NULL. Clear conditionally again after insertion before assigning any
+        // target so every reconciliation remains collision-free.
+        let mut clear = connection.prepare_cached(
+            "UPDATE pages SET position = NULL WHERE path = ?1 AND position IS NOT NULL",
+        )?;
+        for (path, _) in &self.mismatched {
+            clear.execute([path])?;
+        }
+        let mut set = connection.prepare_cached(
+            "UPDATE pages SET position = ?2 WHERE path = ?1 AND position IS NOT ?2",
+        )?;
+        for (path, position) in &self.mismatched {
+            if set.execute(rusqlite::params![path, position])? != 1 {
+                return Err(MaterializationError::Corrupt(
+                    "query inventory page disappeared during reconciliation".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn prepare_query_page_order(
     connection: &Connection,
-    order: &[[u8; 16]],
-) -> Result<(), MaterializationError> {
-    let expected = order.iter().copied().collect::<BTreeSet<_>>();
-    let decode_id = |row: &rusqlite::Row<'_>| -> rusqlite::Result<[u8; 16]> {
-        row.get::<_, Vec<u8>>(0)?
-            .try_into()
-            .map_err(|_| rusqlite::Error::InvalidQuery)
-    };
-    let actual = connection
-        .prepare("SELECT page_id FROM pages")?
-        .query_map([], decode_id)?
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    if expected.len() != order.len() || expected != actual {
+    change: &PhysicalGraphProjectionChange,
+    order: &[String],
+) -> Result<QueryPageOrderPlan, MaterializationError> {
+    let mut desired = BTreeMap::new();
+    for (position, path) in order.iter().enumerate() {
+        let position = i64::try_from(position).map_err(|_| {
+            MaterializationError::InvalidInput("query page position exceeds SQLite".into())
+        })?;
+        if desired.insert(path.clone(), position).is_some() {
+            return Err(MaterializationError::InvalidInput(
+                "duplicate page in query inventory".into(),
+            ));
+        }
+    }
+
+    let existing = connection
+        .prepare("SELECT path, position FROM pages")?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let replacements = change
+        .replacements
+        .iter()
+        .map(|page| (page.path.as_str(), page))
+        .collect::<BTreeMap<_, _>>();
+    let mut final_paths = existing.keys().cloned().collect::<BTreeSet<_>>();
+    for path in &change.deletions {
+        final_paths.remove(path);
+    }
+    final_paths.extend(change.replacements.iter().map(|page| page.path.clone()));
+    if final_paths.len() != desired.len()
+        || final_paths.iter().any(|path| !desired.contains_key(path))
+    {
         return Err(MaterializationError::InvalidInput(
             "query inventory must exactly cover projected pages".into(),
         ));
     }
-    let existing = connection
-        .prepare("SELECT page_id, position FROM query_page_order ORDER BY position")?
-        .query_map([], |row| Ok((decode_id(row)?, row.get::<_, u64>(1)?)))?
-        .collect::<Result<Vec<_>, _>>()?;
-    if existing.len() == order.len()
-        && existing.iter().zip(order).enumerate().all(
-            |(position, ((found_id, found_position), expected_id))| {
-                found_id == expected_id && *found_position == position as u64
-            },
-        )
-    {
-        return Ok(());
+
+    for page in &change.replacements {
+        if let Some(position) = page.position {
+            let position = i64::try_from(position).map_err(|_| {
+                MaterializationError::InvalidInput("query page position exceeds SQLite".into())
+            })?;
+            if desired.get(&page.path) != Some(&position) {
+                return Err(MaterializationError::InvalidInput(
+                    "page order differs from complete inventory".into(),
+                ));
+            }
+        }
     }
-    connection.execute("DELETE FROM query_page_order", [])?;
-    let mut insert = connection
-        .prepare_cached("INSERT INTO query_page_order (page_id, position) VALUES (?1, ?2)")?;
-    for (position, id) in order.iter().enumerate() {
-        insert.execute(rusqlite::params![id.as_slice(), position as i64])?;
+
+    let mut mismatched = Vec::new();
+    for (path, desired_position) in desired {
+        let post_apply_position = match replacements.get(path.as_str()) {
+            Some(page) => page
+                .position
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| {
+                    MaterializationError::InvalidInput("query page position exceeds SQLite".into())
+                })?
+                .or_else(|| existing.get(&path).copied().flatten()),
+            None => existing.get(&path).copied().flatten(),
+        };
+        if post_apply_position != Some(desired_position) {
+            mismatched.push((path, desired_position));
+        }
     }
-    Ok(())
+    Ok(QueryPageOrderPlan { mismatched })
 }
 
 fn validated_source_revisions(
     revisions: &[PhysicalGraphProjectionSourceRevision],
-) -> Result<BTreeMap<[u8; 16], String>, MaterializationError> {
+) -> Result<BTreeMap<String, String>, MaterializationError> {
     let mut validated = BTreeMap::new();
     for revision in revisions {
         if revision.revision.is_empty() || revision.revision.len() > SOURCE_REVISION_MAX_BYTES {
@@ -484,7 +1048,7 @@ fn validated_source_revisions(
             ));
         }
         if validated
-            .insert(revision.page_id, revision.revision.clone())
+            .insert(revision.path.clone(), revision.revision.clone())
             .is_some()
         {
             return Err(MaterializationError::InvalidInput(
@@ -868,24 +1432,30 @@ mod tests {
     };
 
     use crate::sqlite_materialization::{
-        PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityId, PhysicalPage, PhysicalPlanning,
-        PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalTask,
+        PhysicalAliasDeclaration, PhysicalBlock, PhysicalEntityId, PhysicalName, PhysicalPage,
+        PhysicalPlanning, PhysicalReferencePosting, PhysicalReferenceTarget, PhysicalTask,
     };
 
+    fn scalar(database: &PhysicalGraphProjectionDatabase, sql: &str) -> i64 {
+        database
+            .connection
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap()
+    }
+
     /// The GH #543 fixture shape: `pages` pages of 60 blocks, each block
-    /// carrying one page link and one tag, every identity a random UUID
-    /// (as Direct Files derives them), so every index insert is a random
-    /// B-tree leaf exactly as in the reporter-scale build.
+    /// carrying one page link and one tag, exercising the same cardinality
+    /// and secondary-index fanout as the reporter-scale build.
     fn gh543_snapshot(
         pages: usize,
     ) -> (
         PhysicalGraphProjectionChange,
         Vec<PhysicalGraphProjectionSourceRevision>,
-        Vec<[u8; 16]>,
+        Vec<String>,
     ) {
         use crate::sqlite_materialization::PhysicalTag;
         let page_ids = (0..pages)
-            .map(|_| *uuid::Uuid::new_v4().as_bytes())
+            .map(|page| format!("pages/主题-{page:05}.md"))
             .collect::<Vec<_>>();
         let mut replacements = Vec::with_capacity(pages);
         let mut postings = Vec::with_capacity(pages * 120);
@@ -895,7 +1465,7 @@ mod tests {
             let normalized_target = target_name.to_lowercase();
             let mut blocks = Vec::with_capacity(60);
             for block in 0..60 {
-                let block_id = *uuid::Uuid::new_v4().as_bytes();
+                let block_id = format!("b-{position}-{block}");
                 let tag = format!("tag{}", block % 10);
                 let content = format!(
                     "outline sentinel543 你好世界 page {position} block {block} [[{target_name}]] #{tag}"
@@ -906,23 +1476,29 @@ mod tests {
                         .enumerate()
                 {
                     postings.push(PhysicalReferencePosting {
-                        source_page_id: *page_id,
-                        source_entity: PhysicalEntityId::Block(block_id),
+                        source_page_path: page_id.clone(),
+                        source_entity: PhysicalEntityId::Block(block_id.clone()),
                         source_locator: b"content".to_vec(),
                         ordinal: ordinal as u32,
                         kind: 0,
                         target: PhysicalReferenceTarget::PageName {
                             raw_name: raw.clone(),
                             normalized_name: normalized.clone(),
-                            resolved_page_id: (ordinal == 0).then_some(page_ids[target]),
                         },
                     });
                 }
                 blocks.push(PhysicalBlock {
-                    block_id,
-                    query_result_id: uuid::Uuid::from_bytes(block_id).to_string(),
-                    own_refs: vec![normalized_target.clone(), tag.clone()],
-                    home_document_id: *page_id,
+                    result_id: block_id,
+                    own_refs: vec![
+                        PhysicalName {
+                            raw: target_name.clone(),
+                            key: normalized_target.clone(),
+                        },
+                        PhysicalName {
+                            raw: tag.clone(),
+                            key: tag.clone(),
+                        },
+                    ],
                     parent: None,
                     order: format!("{block:04}"),
                     content: content.clone(),
@@ -941,17 +1517,24 @@ mod tests {
                     }],
                     task: None,
                     planning: None,
-                    path_refs: vec![normalized_target.clone(), tag],
+                    path_refs: vec![
+                        PhysicalName {
+                            raw: target_name.clone(),
+                            key: normalized_target.clone(),
+                        },
+                        PhysicalName {
+                            raw: tag.clone(),
+                            key: tag,
+                        },
+                    ],
                     property_atoms: Vec::new(),
                 });
             }
             let name = format!("Topic {position} 你好");
             replacements.push(PhysicalPage {
-                page_id: *page_id,
-                query_page_order: Some(position as u64),
-                home_document_id: *page_id,
+                position: Some(position as u64),
                 name_key: name.to_lowercase(),
-                path: format!("pages/主题-{position:05}.md"),
+                path: page_id.clone(),
                 name,
                 text_kind: 0,
                 journal_day: None,
@@ -967,7 +1550,7 @@ mod tests {
         let revisions = page_ids
             .iter()
             .map(|page_id| PhysicalGraphProjectionSourceRevision {
-                page_id: *page_id,
+                path: page_id.clone(),
                 revision: "probe".into(),
             })
             .collect();
@@ -1024,7 +1607,7 @@ mod tests {
         let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
         database.initialize_schema().unwrap();
         let fresh_indexes = secondary_index_count(&database.connection);
-        assert_eq!(fresh_indexes, 32);
+        assert_eq!(fresh_indexes, 34);
         let (change, revisions, order) = gh543_snapshot(3);
 
         database
@@ -1046,7 +1629,7 @@ mod tests {
             reference_postings: change
                 .reference_postings
                 .iter()
-                .filter(|posting| posting.source_page_id == change.replacements[0].page_id)
+                .filter(|posting| posting.source_page_path == change.replacements[0].path)
                 .cloned()
                 .collect(),
         };
@@ -1060,15 +1643,14 @@ mod tests {
         database.reset().unwrap();
         let mut broken = change.clone();
         broken.reference_postings.push(PhysicalReferencePosting {
-            source_page_id: [0xEE; 16],
-            source_entity: PhysicalEntityId::Page([0xEE; 16]),
+            source_page_path: "pages/nowhere.md".into(),
+            source_entity: PhysicalEntityId::Page("pages/nowhere.md".into()),
             source_locator: b"nowhere".to_vec(),
             ordinal: 0,
             kind: 0,
             target: PhysicalReferenceTarget::PageName {
                 raw_name: "x".into(),
                 normalized_name: "x".into(),
-                resolved_page_id: None,
             },
         });
         database
@@ -1150,7 +1732,7 @@ mod tests {
                             .unwrap();
                         assert!(database.last_apply_deferred_indexes());
                         let mut with_seed = order.clone();
-                        with_seed.push(seed_ids[0]);
+                        with_seed.push(seed_ids[0].clone());
                         with_seed
                     } else {
                         order.clone()
@@ -1564,9 +2146,7 @@ mod tests {
 
     fn page(page_id: u8, task: &str, content: &str) -> PhysicalPage {
         PhysicalPage {
-            page_id: [page_id; 16],
-            query_page_order: Some(u64::from(page_id)),
-            home_document_id: [page_id; 16],
+            position: Some(u64::from(page_id)),
             name: format!("Page {page_id}"),
             name_key: format!("page {page_id}"),
             path: format!("pages/page-{page_id}.md"),
@@ -1579,11 +2159,8 @@ mod tests {
             tags: Vec::new(),
             property_atoms: Vec::new(),
             blocks: vec![PhysicalBlock {
-                block_id: [page_id.saturating_add(100); 16],
-                query_result_id: uuid::Uuid::from_bytes([page_id.saturating_add(100); 16])
-                    .to_string(),
+                result_id: format!("block-{page_id}"),
                 own_refs: Vec::new(),
-                home_document_id: [page_id; 16],
                 parent: None,
                 order: "0001".into(),
                 content: content.into(),
@@ -1654,7 +2231,7 @@ mod tests {
         // Inventory validation fails after page rows were written: all writes,
         // including the image revision, must roll back together.
         let mut invalid = page(1, "TODO", "must roll back");
-        invalid.query_page_order = None;
+        invalid.position = None;
         assert!(database
             .apply_with_source_revisions_aliases_and_page_order(
                 &PhysicalGraphProjectionChange {
@@ -1663,11 +2240,11 @@ mod tests {
                     reference_postings: vec![]
                 },
                 &[PhysicalGraphProjectionSourceRevision {
-                    page_id: [1; 16],
+                    path: "pages/page-1.md".into(),
                     revision: "bad".into()
                 }],
                 &[],
-                &[[2; 16]],
+                &["pages/page-2.md".into()],
             )
             .is_err());
         assert_eq!(open().query_revision().unwrap(), revision);
@@ -1687,11 +2264,12 @@ mod tests {
                 },
                 &[],
                 &[],
-                &[[1; 16]],
+                &["pages/page-1.md".into()],
             )
             .unwrap();
-        assert!(open().query_revision().unwrap() > revision);
-        let before_reset = open().query_revision().unwrap();
+        let order_revision = open().query_revision().unwrap();
+        assert!(order_revision > revision);
+        let before_reset = order_revision;
         database
             .connection
             .execute_batch("PRAGMA foreign_keys=OFF")
@@ -1757,29 +2335,32 @@ mod tests {
         ));
         let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
         database.initialize_schema().unwrap();
-        let mut first = page(1, "TODO", "unchanged one");
-        let mut second = page(2, "DONE", "unchanged two");
-        first.query_page_order = None;
-        second.query_page_order = None;
+        let pages = (1..=8)
+            .map(|index| {
+                let mut value = page(index, "TODO", &format!("page {index}"));
+                value.position = None;
+                value
+            })
+            .collect::<Vec<_>>();
+        let revisions = (1..=8)
+            .map(|index| PhysicalGraphProjectionSourceRevision {
+                path: format!("pages/page-{index}.md"),
+                revision: format!("r{index}"),
+            })
+            .collect::<Vec<_>>();
+        let original_order = (1..=8)
+            .map(|index| format!("pages/page-{index}.md"))
+            .collect::<Vec<_>>();
         database
             .apply_with_source_revisions_aliases_and_page_order(
                 &PhysicalGraphProjectionChange {
-                    replacements: vec![first.clone(), second],
+                    replacements: pages,
                     deletions: vec![],
                     reference_postings: vec![],
                 },
-                &[
-                    PhysicalGraphProjectionSourceRevision {
-                        page_id: [1; 16],
-                        revision: "one".into(),
-                    },
-                    PhysicalGraphProjectionSourceRevision {
-                        page_id: [2; 16],
-                        revision: "two".into(),
-                    },
-                ],
+                &revisions,
                 &[],
-                &[[1; 16], [2; 16]],
+                &original_order,
             )
             .unwrap();
         let empty = PhysicalGraphProjectionChange {
@@ -1787,67 +2368,115 @@ mod tests {
             deletions: vec![],
             reference_postings: vec![],
         };
-        for table in [
-            "pages",
-            "blocks",
-            "page_text",
-            "block_text",
-            "query_block_results",
-            "query_page_results",
-        ] {
-            for operation in ["INSERT", "UPDATE", "DELETE"] {
-                database
-                    .connection
-                    .execute_batch(&format!(
-                        "CREATE TEMP TRIGGER no_{table}_{operation} BEFORE {operation} ON {table}
-                     BEGIN SELECT RAISE(ABORT, 'unchanged page facts were rewritten'); END;"
-                    ))
-                    .unwrap();
-            }
-        }
         database
-            .apply_with_source_revisions_aliases_and_page_order(
-                &empty,
-                &[],
-                &[],
-                &[[2; 16], [1; 16]],
+            .connection
+            .execute_batch(
+                "CREATE TEMP TABLE position_writes(path TEXT NOT NULL);
+                 CREATE TEMP TRIGGER track_position_writes AFTER UPDATE OF position ON pages
+                 BEGIN INSERT INTO position_writes(path) VALUES (NEW.path); END;",
             )
             .unwrap();
-        let order = database
+        let mut permuted = original_order.clone();
+        permuted.swap(2, 3);
+        database
+            .apply_with_source_revisions_aliases_and_page_order(&empty, &[], &[], &permuted)
+            .unwrap();
+        let writes = database
             .connection
-            .prepare("SELECT page_id FROM query_page_order ORDER BY position")
+            .prepare("SELECT path FROM position_writes ORDER BY path")
             .unwrap()
-            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .query_map([], |row| row.get::<_, String>(0))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        assert_eq!(order, [vec![2; 16], vec![1; 16]]);
-        for operation in ["INSERT", "UPDATE", "DELETE"] {
-            database
-                .connection
-                .execute_batch(&format!(
-                "CREATE TEMP TRIGGER no_order_{operation} BEFORE {operation} ON query_page_order
-                 BEGIN SELECT RAISE(ABORT, 'unchanged order was rewritten'); END;"
-            ))
-                .unwrap();
-        }
+        assert_eq!(
+            writes,
+            [
+                "pages/page-3.md",
+                "pages/page-3.md",
+                "pages/page-4.md",
+                "pages/page-4.md"
+            ]
+        );
+        let order = database
+            .connection
+            .prepare("SELECT path FROM pages ORDER BY position")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(order, permuted);
         database
+            .connection
+            .execute("DELETE FROM position_writes", [])
+            .unwrap();
+        let unchanged_revision = scalar(&database, "SELECT revision FROM query_projection_state");
+        database
+            .apply_with_source_revisions_aliases_and_page_order(&empty, &[], &[], &permuted)
+            .unwrap();
+        assert_eq!(
+            scalar(&database, "SELECT revision FROM query_projection_state"),
+            unchanged_revision
+        );
+        assert_eq!(scalar(&database, "SELECT COUNT(*) FROM position_writes"), 0);
+
+        let mut replacement = page(5, "DONE", "replacement unchanged order");
+        replacement.position = None;
+        database
+            .apply_with_source_revisions_aliases_and_page_order(
+                &PhysicalGraphProjectionChange {
+                    replacements: vec![replacement],
+                    deletions: vec![],
+                    reference_postings: vec![],
+                },
+                &[PhysicalGraphProjectionSourceRevision {
+                    path: "pages/page-5.md".into(),
+                    revision: "replacement".into(),
+                }],
+                &[],
+                &permuted,
+            )
+            .unwrap();
+        assert_eq!(scalar(&database, "SELECT COUNT(*) FROM position_writes"), 0);
+        assert_eq!(
+            scalar(
+                &database,
+                "SELECT position FROM pages WHERE path = 'pages/page-5.md'"
+            ),
+            4
+        );
+
+        let mut ordinary_replacement = page(6, "DONE", "ordinary replacement");
+        ordinary_replacement.position = None;
+        database
+            .apply(&PhysicalGraphProjectionChange {
+                replacements: vec![ordinary_replacement],
+                deletions: vec![],
+                reference_postings: vec![],
+            })
+            .unwrap();
+        assert_eq!(
+            scalar(
+                &database,
+                "SELECT position FROM pages WHERE path = 'pages/page-6.md'"
+            ),
+            5
+        );
+        assert!(database
             .apply_with_source_revisions_aliases_and_page_order(
                 &empty,
                 &[],
                 &[],
-                &[[2; 16], [1; 16]],
+                &["pages/page-1.md".into()]
             )
-            .unwrap();
-        assert!(database
-            .apply_with_source_revisions_aliases_and_page_order(&empty, &[], &[], &[[1; 16]])
             .is_err());
         assert!(database
             .apply_with_source_revisions_aliases_and_page_order(
                 &empty,
                 &[],
                 &[],
-                &[[1; 16], [1; 16]]
+                &["pages/page-1.md".into(), "pages/page-1.md".into()]
             )
             .is_err());
         drop(database);
@@ -1855,7 +2484,80 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_inventory_rolls_back_page_and_source_changes() {
+    fn mixed_explicit_and_retained_replacement_positions_are_collision_safe() {
+        let path = std::env::temp_dir().join(format!(
+            "tine-order-mixed-replacement-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.initialize_schema().unwrap();
+        let mut first = page(1, "TODO", "first before");
+        first.position = Some(0);
+        let mut second = page(2, "TODO", "second before");
+        second.position = Some(1);
+        database
+            .apply_with_source_revisions_aliases_and_page_order(
+                &PhysicalGraphProjectionChange {
+                    replacements: vec![first, second],
+                    deletions: vec![],
+                    reference_postings: vec![],
+                },
+                &[
+                    PhysicalGraphProjectionSourceRevision {
+                        path: "pages/page-1.md".into(),
+                        revision: "before-1".into(),
+                    },
+                    PhysicalGraphProjectionSourceRevision {
+                        path: "pages/page-2.md".into(),
+                        revision: "before-2".into(),
+                    },
+                ],
+                &[],
+                &["pages/page-1.md".into(), "pages/page-2.md".into()],
+            )
+            .unwrap();
+
+        let mut first = page(1, "DONE", "first after");
+        first.position = Some(1);
+        let mut second = page(2, "DONE", "second after");
+        second.position = None;
+        database
+            .apply_with_source_revisions_aliases_and_page_order(
+                &PhysicalGraphProjectionChange {
+                    replacements: vec![first, second],
+                    deletions: vec![],
+                    reference_postings: vec![],
+                },
+                &[
+                    PhysicalGraphProjectionSourceRevision {
+                        path: "pages/page-1.md".into(),
+                        revision: "after-1".into(),
+                    },
+                    PhysicalGraphProjectionSourceRevision {
+                        path: "pages/page-2.md".into(),
+                        revision: "after-2".into(),
+                    },
+                ],
+                &[],
+                &["pages/page-2.md".into(), "pages/page-1.md".into()],
+            )
+            .unwrap();
+
+        let order = database
+            .connection
+            .prepare("SELECT path FROM pages ORDER BY position")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(order, ["pages/page-2.md", "pages/page-1.md"]);
+        drop(database);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn incomplete_inventory_is_rejected_before_page_and_source_changes() {
         let path = std::env::temp_dir().join(format!(
             "tine-order-rollback-{}.sqlite",
             uuid::Uuid::new_v4()
@@ -1863,9 +2565,9 @@ mod tests {
         let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
         database.initialize_schema().unwrap();
         let mut first = page(1, "TODO", "before");
-        first.query_page_order = None;
+        first.position = None;
         let revisions = [PhysicalGraphProjectionSourceRevision {
-            page_id: [1; 16],
+            path: "pages/page-1.md".into(),
             revision: "before".into(),
         }];
         database
@@ -1877,7 +2579,7 @@ mod tests {
                 },
                 &revisions,
                 &[],
-                &[[1; 16]],
+                &["pages/page-1.md".into()],
             )
             .unwrap();
         first.blocks[0].content = "after".into();
@@ -1889,7 +2591,7 @@ mod tests {
                     reference_postings: vec![]
                 },
                 &[PhysicalGraphProjectionSourceRevision {
-                    page_id: [1; 16],
+                    path: "pages/page-1.md".into(),
                     revision: "after".into()
                 }],
                 &[],
@@ -1912,11 +2614,148 @@ mod tests {
         assert_eq!(
             database
                 .connection
-                .query_row("SELECT count(*) FROM query_page_order", [], |row| row
-                    .get::<_, i64>(0))
+                .query_row(
+                    "SELECT count(*) FROM pages WHERE position IS NOT NULL",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
                 .unwrap(),
             1
         );
+        drop(database);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn post_write_order_reconciliation_failure_rolls_back_everything() {
+        let path = std::env::temp_dir().join(format!(
+            "tine-order-post-write-rollback-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.initialize_schema().unwrap();
+        let mut first = page(1, "TODO", "first before");
+        first.position = Some(0);
+        let mut second = page(2, "TODO", "second before");
+        second.position = Some(1);
+        let before_revisions = [
+            PhysicalGraphProjectionSourceRevision {
+                path: "pages/page-1.md".into(),
+                revision: "before-1".into(),
+            },
+            PhysicalGraphProjectionSourceRevision {
+                path: "pages/page-2.md".into(),
+                revision: "before-2".into(),
+            },
+        ];
+        database
+            .apply_with_source_revisions_aliases_and_page_order(
+                &PhysicalGraphProjectionChange {
+                    replacements: vec![first, second],
+                    deletions: vec![],
+                    reference_postings: vec![],
+                },
+                &before_revisions,
+                &[],
+                &["pages/page-1.md".into(), "pages/page-2.md".into()],
+            )
+            .unwrap();
+        let before_projection_revision =
+            scalar(&database, "SELECT revision FROM query_projection_state");
+        database
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER abort_final_position_reconciliation
+                 BEFORE UPDATE OF position ON pages
+                 WHEN OLD.position IS NULL AND NEW.position IS NOT NULL
+                 BEGIN
+                     SELECT RAISE(ABORT, 'test abort during final position reconciliation');
+                 END;",
+            )
+            .unwrap();
+
+        let mut first = page(1, "DONE", "first after");
+        first.position = None;
+        let mut second = page(2, "DONE", "second after");
+        second.position = None;
+        let error = database
+            .apply_with_source_revisions_aliases_and_page_order(
+                &PhysicalGraphProjectionChange {
+                    replacements: vec![first, second],
+                    deletions: vec![],
+                    reference_postings: vec![],
+                },
+                &[
+                    PhysicalGraphProjectionSourceRevision {
+                        path: "pages/page-1.md".into(),
+                        revision: "after-1".into(),
+                    },
+                    PhysicalGraphProjectionSourceRevision {
+                        path: "pages/page-2.md".into(),
+                        revision: "after-2".into(),
+                    },
+                ],
+                &[],
+                &["pages/page-2.md".into(), "pages/page-1.md".into()],
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("test abort during final position reconciliation"),
+            "{error}"
+        );
+
+        let order = database
+            .connection
+            .prepare("SELECT path FROM pages ORDER BY position")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(order, ["pages/page-1.md", "pages/page-2.md"]);
+        let content = database
+            .connection
+            .prepare(
+                "SELECT block_text.content
+                 FROM pages
+                 JOIN blocks USING (page_id)
+                 JOIN block_text USING (block_id)
+                 ORDER BY pages.position",
+            )
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(content, ["first before", "second before"]);
+        let source_revisions = database
+            .connection
+            .prepare("SELECT path, revision FROM direct_source_revisions ORDER BY path")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            source_revisions,
+            [
+                ("pages/page-1.md".into(), "before-1".into()),
+                ("pages/page-2.md".into(), "before-2".into())
+            ]
+        );
+        assert_eq!(
+            scalar(&database, "SELECT revision FROM query_projection_state"),
+            before_projection_revision
+        );
+        assert!(database
+            .source_delta(&before_revisions)
+            .unwrap()
+            .replacements
+            .is_empty());
         drop(database);
         let _ = std::fs::remove_file(path);
     }
@@ -1940,7 +2779,7 @@ mod tests {
         // Reads work, and parameters come back as values.
         let rows = reader
             .run_projection_query(
-                "SELECT COUNT(*) FROM pages WHERE name_key = ?1",
+                "SELECT COUNT(*) FROM pages p JOIN names n ON n.name_id = p.name_id WHERE n.key = ?1",
                 &[PhysicalQueryValue::Text("absent".into())],
             )
             .unwrap();
@@ -1949,9 +2788,9 @@ mod tests {
         // Every write shape is refused by SQLite itself.
         for write in [
             "DELETE FROM pages",
-            "INSERT INTO pages (page_id, name, name_key, text_kind)
-             VALUES (zeroblob(16), 'x', 'x', 0)",
-            "UPDATE pages SET name = 'x'",
+            "INSERT INTO pages (page_id, name_id, path, text_kind, journal_day, position, estimated_bytes, property_count)
+             VALUES (1, 1, 'x', 0, NULL, NULL, 0, 0)",
+            "UPDATE pages SET text_kind = 0",
             "DROP TABLE pages",
             "CREATE TABLE smuggled (x INTEGER)",
         ] {
@@ -1967,7 +2806,7 @@ mod tests {
         let hostile = "'; DROP TABLE pages; --";
         let rows = reader
             .run_projection_query(
-                "SELECT COUNT(*) FROM pages WHERE name_key = ?1",
+                "SELECT COUNT(*) FROM pages p JOIN names n ON n.name_id = p.name_id WHERE n.key = ?1",
                 &[PhysicalQueryValue::Text(hostile.into())],
             )
             .unwrap();
@@ -1987,7 +2826,7 @@ mod tests {
         // gate live in the repository instead of a scratch harness.
         let plan = reader
             .explain_query_plan(
-                "SELECT page_id FROM pages WHERE name_key = ?1",
+                "SELECT p.page_id FROM pages p JOIN names n ON n.name_id = p.name_id WHERE n.key = ?1",
                 &[PhysicalQueryValue::Text("x".into())],
             )
             .unwrap();
@@ -2059,7 +2898,7 @@ mod tests {
         database
             .apply(&PhysicalGraphProjectionChange {
                 replacements: Vec::new(),
-                deletions: vec![[1; 16]],
+                deletions: vec!["pages/page-1.md".into()],
                 reference_postings: Vec::new(),
             })
             .unwrap();
@@ -2082,15 +2921,14 @@ mod tests {
         database.initialize_schema().unwrap();
 
         let posting = |raw_name: &str, normalized_name: &str| PhysicalReferencePosting {
-            source_page_id: [1; 16],
-            source_entity: PhysicalEntityId::Page([1; 16]),
+            source_page_path: "pages/page-1.md".into(),
+            source_entity: PhysicalEntityId::Page("pages/page-1.md".into()),
             source_locator: b"preamble".to_vec(),
             ordinal: 0,
             kind: 0,
             target: PhysicalReferenceTarget::PageName {
                 raw_name: raw_name.into(),
                 normalized_name: normalized_name.into(),
-                resolved_page_id: None,
             },
         };
         database
@@ -2130,7 +2968,7 @@ mod tests {
         );
 
         let mut orphan = posting("Orphan", "orphan");
-        orphan.source_page_id = [2; 16];
+        orphan.source_page_path = "pages/page-2.md".into();
         assert!(matches!(
             database.apply(&PhysicalGraphProjectionChange {
                 replacements: vec![page(1, "TODO", "unchanged")],
@@ -2153,7 +2991,7 @@ mod tests {
         database
             .apply(&PhysicalGraphProjectionChange {
                 replacements: Vec::new(),
-                deletions: vec![[1; 16]],
+                deletions: vec!["pages/page-1.md".into()],
                 reference_postings: Vec::new(),
             })
             .unwrap();
@@ -2207,7 +3045,6 @@ mod tests {
         database.initialize_schema().unwrap();
         let read = database.read();
         let text = |value: &str| rusqlite::types::Value::from(value.to_owned());
-        let blob = rusqlite::types::Value::from(vec![0u8; 16]);
         let limit = rusqlite::types::Value::from(512i64);
 
         let shapes: [(&str, &[rusqlite::types::Value], &str); 4] = [
@@ -2224,11 +3061,11 @@ mod tests {
             (
                 NAVIGATION_ALIASES_FIRST_SQL,
                 &[limit.clone()],
-                "SCAN d USING INDEX ",
+                "SCAN d USING COVERING INDEX ",
             ),
             (
                 NAVIGATION_ALIASES_AFTER_SQL,
-                &[blob.clone(), text("alias"), limit.clone()],
+                &[0i64.into(), 0i64.into(), limit.clone()],
                 "SEARCH d USING ",
             ),
         ];
@@ -2241,11 +3078,12 @@ mod tests {
         // for: an order over the joined path is a full scan plus a sort.
         let pre_fix = read
             .query_plan(
-                "SELECT DISTINCT r.source_page_id, p.path, r.raw_name, r.normalized_name
+                "SELECT DISTINCT r.source_page_id, p.path, n.raw, n.key
                  FROM reference_postings r JOIN pages p ON p.page_id = r.source_page_id
+                 JOIN names n ON n.name_id = r.target_name_id
                  WHERE r.target_type = 0 AND r.reference_kind <= 4
-                   AND (p.path > ?1 OR (p.path = ?1 AND r.raw_name > ?2))
-                 ORDER BY p.path, r.raw_name, r.normalized_name, r.source_page_id LIMIT ?3",
+                   AND (p.path > ?1 OR (p.path = ?1 AND n.raw > ?2))
+                 ORDER BY p.path, n.raw, n.key, r.source_page_id LIMIT ?3",
                 &[text("pages/a.md"), text("Topic"), limit],
             )
             .unwrap();
@@ -2275,15 +3113,14 @@ mod tests {
         database.initialize_schema().unwrap();
         let posting = |page: u8, ordinal: u32, raw_name: &str, normalized_name: &str| {
             PhysicalReferencePosting {
-                source_page_id: [page; 16],
-                source_entity: PhysicalEntityId::Page([page; 16]),
+                source_page_path: format!("pages/page-{page}.md"),
+                source_entity: PhysicalEntityId::Page(format!("pages/page-{page}.md")),
                 source_locator: b"preamble".to_vec(),
                 ordinal,
                 kind: 0,
                 target: PhysicalReferenceTarget::PageName {
                     raw_name: raw_name.into(),
                     normalized_name: normalized_name.into(),
-                    resolved_page_id: None,
                 },
             }
         };
@@ -2355,8 +3192,8 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let alias = |raw_alias: &str, normalized_alias: &str| PhysicalAliasDeclaration {
-            source_page_id: [1; 16],
-            source_entity: PhysicalEntityId::Page([1; 16]),
+            source_page_path: "pages/page-1.md".into(),
+            source_entity: PhysicalEntityId::Page("pages/page-1.md".into()),
             source_locator: b"page-alias".to_vec(),
             ordinal: 0,
             raw_alias: raw_alias.into(),
@@ -2403,7 +3240,7 @@ mod tests {
         assert_eq!(alias_names(&database), vec!["second alias"]);
 
         let mut orphan = alias("Orphan Alias", "orphan alias");
-        orphan.source_page_id = [2; 16];
+        orphan.source_page_path = "pages/page-2.md".into();
         assert!(matches!(
             database.apply_with_aliases(
                 &PhysicalGraphProjectionChange {
@@ -2425,7 +3262,7 @@ mod tests {
         database
             .apply(&PhysicalGraphProjectionChange {
                 replacements: Vec::new(),
-                deletions: vec![[1; 16]],
+                deletions: vec!["pages/page-1.md".into()],
                 reference_postings: Vec::new(),
             })
             .unwrap();
@@ -2462,7 +3299,7 @@ mod tests {
                 .blocks_by_logseq_uuid(claim, 3)
                 .unwrap()
                 .into_iter()
-                .map(|row| row.block_id)
+                .map(|row| row.result_id)
                 .collect::<Vec<_>>()
         };
 
@@ -2470,25 +3307,53 @@ mod tests {
         database.initialize_schema().unwrap();
         database
             .apply(&PhysicalGraphProjectionChange {
-                replacements: vec![with_claim(1, "first"), with_claim(2, "second")],
+                replacements: vec![
+                    with_claim(1, "first"),
+                    with_claim(2, "second"),
+                    page(3, "TODO", "referrer"),
+                ],
                 deletions: Vec::new(),
-                reference_postings: Vec::new(),
+                reference_postings: vec![PhysicalReferencePosting {
+                    source_page_path: "pages/page-3.md".into(),
+                    source_entity: PhysicalEntityId::Block("block-3".into()),
+                    source_locator: b"content".to_vec(),
+                    ordinal: 0,
+                    kind: 6,
+                    target: PhysicalReferenceTarget::ExternalUuid { raw_claim: claim },
+                }],
             })
             .unwrap();
-        assert_eq!(claimant_ids(&database), vec![[101; 16], [102; 16]]);
+        assert_eq!(claimant_ids(&database), vec!["block-1", "block-2"]);
+        assert_eq!(
+            database
+                .read()
+                .block_referrer_candidates_after(claim, None, 3)
+                .unwrap()[0]
+                .source_block_id,
+            "block-3"
+        );
         drop(database);
 
         let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
         database.validate_schema().unwrap();
-        assert_eq!(claimant_ids(&database), vec![[101; 16], [102; 16]]);
+        assert_eq!(claimant_ids(&database), vec!["block-1", "block-2"]);
         database
             .apply(&PhysicalGraphProjectionChange {
                 replacements: vec![page(1, "DONE", "claim removed")],
-                deletions: vec![[2; 16]],
+                deletions: vec!["pages/page-2.md".into()],
                 reference_postings: Vec::new(),
             })
             .unwrap();
         assert!(claimant_ids(&database).is_empty());
+        assert_eq!(
+            database
+                .read()
+                .block_referrer_candidates_after(claim, None, 3)
+                .unwrap()[0]
+                .source_block_id,
+            "block-3",
+            "raw UUID reference evidence remains resolvable independently of claimant edits"
+        );
         database.quick_check().unwrap();
         drop(database);
         for suffix in ["", "-wal", "-shm"] {
