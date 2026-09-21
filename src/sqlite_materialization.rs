@@ -1133,6 +1133,66 @@ fn insert_reference_posting(
         source_entity_type,
         source_entity_id,
     )?;
+    insert_reference_posting_at(
+        transaction,
+        posting,
+        source_page_id,
+        source_entity_type,
+        source_entity_id,
+    )
+}
+
+/// A fresh append allocated every coordinate its postings can name, so it
+/// resolves and checks ownership from those maps instead of three lookups
+/// per posting. The refusals are the ones `insert_reference_posting` makes.
+fn insert_fresh_reference_posting(
+    transaction: &Connection,
+    posting: &PhysicalReferencePosting,
+    page_ids: &BTreeMap<String, i64>,
+    block_ids: &BTreeMap<String, i64>,
+    block_pages: &BTreeMap<&str, &str>,
+) -> Result<i64, MaterializationError> {
+    let source_path = posting.source_page_path.as_str();
+    let source_page_id = *page_ids.get(source_path).ok_or_else(|| {
+        MaterializationError::InvalidInput(format!("unknown page path {source_path:?}"))
+    })?;
+    let (source_entity_type, source_entity_id, owner_path) = match &posting.source_entity {
+        PhysicalEntityId::Page(path) => {
+            let page_id = *page_ids.get(path).ok_or_else(|| {
+                MaterializationError::InvalidInput(format!("unknown page path {path:?}"))
+            })?;
+            (0, page_id, path.as_str())
+        }
+        PhysicalEntityId::Block(result_id) => {
+            let unknown = || {
+                MaterializationError::InvalidInput(format!("unknown block result ID {result_id:?}"))
+            };
+            let block_id = *block_ids.get(result_id).ok_or_else(unknown)?;
+            let owner = *block_pages.get(result_id.as_str()).ok_or_else(unknown)?;
+            (1, block_id, owner)
+        }
+    };
+    if owner_path != source_path {
+        return Err(MaterializationError::InvalidInput(
+            "reference source entity does not belong to its source page".into(),
+        ));
+    }
+    insert_reference_posting_at(
+        transaction,
+        posting,
+        source_page_id,
+        source_entity_type,
+        source_entity_id,
+    )
+}
+
+fn insert_reference_posting_at(
+    transaction: &Connection,
+    posting: &PhysicalReferencePosting,
+    source_page_id: i64,
+    source_entity_type: i64,
+    source_entity_id: i64,
+) -> Result<i64, MaterializationError> {
     let locator = &posting.source_locator;
     let (target_type, target_name_id, raw_uuid_claim) = match &posting.target {
         PhysicalReferenceTarget::PageName {
@@ -1208,39 +1268,55 @@ fn intern_name(connection: &Connection, key: &str, raw: &str) -> Result<i64, Mat
             "name key and spelling must be non-empty".into(),
         ));
     }
-    connection.execute(
+    // Nearly every call names an existing row (a build interns each tag,
+    // property, and path reference once per use), so look it up before
+    // attempting the insert.
+    let select_existing = || {
+        query_row_cached(
+            connection,
+            "SELECT name_id FROM names WHERE key = ?1 AND raw = ?2",
+            params![key, raw],
+            |row| row.get(0),
+        )
+        .optional()
+    };
+    if let Some(name_id) = select_existing()? {
+        return Ok(name_id);
+    }
+    if execute_cached(
+        connection,
         "INSERT INTO names (key, raw) VALUES (?1, ?2) ON CONFLICT(key, raw) DO NOTHING",
         params![key, raw],
-    )?;
-    Ok(connection.query_row(
-        "SELECT name_id FROM names WHERE key = ?1 AND raw = ?2",
-        params![key, raw],
-        |row| row.get(0),
-    )?)
+    )? == 1
+    {
+        return Ok(connection.last_insert_rowid());
+    }
+    select_existing()?
+        .ok_or_else(|| MaterializationError::Corrupt("interned name vanished after insert".into()))
 }
 
 fn page_coordinate(connection: &Connection, path: &str) -> Result<i64, MaterializationError> {
-    connection
-        .query_row(
-            "SELECT page_id FROM pages WHERE path = ?1",
-            params![path],
-            |row| row.get(0),
-        )
-        .optional()?
-        .ok_or_else(|| MaterializationError::InvalidInput(format!("unknown page path {path:?}")))
+    query_row_cached(
+        connection,
+        "SELECT page_id FROM pages WHERE path = ?1",
+        params![path],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| MaterializationError::InvalidInput(format!("unknown page path {path:?}")))
 }
 
 fn block_coordinate(connection: &Connection, result_id: &str) -> Result<i64, MaterializationError> {
-    connection
-        .query_row(
-            "SELECT block_id FROM blocks WHERE result_id = ?1",
-            params![result_id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .ok_or_else(|| {
-            MaterializationError::InvalidInput(format!("unknown block result ID {result_id:?}"))
-        })
+    query_row_cached(
+        connection,
+        "SELECT block_id FROM blocks WHERE result_id = ?1",
+        params![result_id],
+        |row| row.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| {
+        MaterializationError::InvalidInput(format!("unknown block result ID {result_id:?}"))
+    })
 }
 
 fn entity_coordinate(
@@ -1261,7 +1337,8 @@ fn validate_entity_page(
 ) -> Result<(), MaterializationError> {
     let owner_page_id = match entity_type {
         0 => entity_id,
-        1 => connection.query_row(
+        1 => query_row_cached(
+            connection,
             "SELECT page_id FROM blocks WHERE block_id = ?1",
             params![entity_id],
             |row| row.get(0),
@@ -1283,13 +1360,13 @@ fn validate_entity_page(
 pub(crate) fn query_projection_revision(
     connection: &Connection,
 ) -> Result<u64, MaterializationError> {
-    let revision: Option<i64> = connection
-        .query_row(
-            "SELECT revision FROM query_projection_state WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let revision: Option<i64> = query_row_cached(
+        connection,
+        "SELECT revision FROM query_projection_state WHERE singleton = 1",
+        &[],
+        |row| row.get(0),
+    )
+    .optional()?;
     revision
         .and_then(|value| u64::try_from(value).ok())
         .ok_or_else(|| {
@@ -1300,10 +1377,11 @@ pub(crate) fn query_projection_revision(
 pub(crate) fn advance_query_projection_revision(
     connection: &Connection,
 ) -> Result<(), MaterializationError> {
-    let changed = connection.execute(
+    let changed = execute_cached(
+        connection,
         "UPDATE query_projection_state SET revision = revision + 1
          WHERE singleton = 1 AND revision < 9223372036854775807",
-        [],
+        &[],
     )?;
     if changed != 1 {
         return Err(MaterializationError::Corrupt(
@@ -1338,13 +1416,13 @@ pub(crate) fn apply_graph_projection_rows(
         .copied()
         .chain(change.deletions.iter().map(String::as_str))
     {
-        if let Some((id, position)) = transaction
-            .query_row(
-                "SELECT page_id, position FROM pages WHERE path = ?1",
-                params![path],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
-            )
-            .optional()?
+        if let Some((id, position)) = query_row_cached(
+            transaction,
+            "SELECT page_id, position FROM pages WHERE path = ?1",
+            params![path],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()?
         {
             page_ids.insert(path.to_owned(), id);
             if replacement_paths.contains(path) {
@@ -1483,7 +1561,8 @@ pub(crate) fn append_fresh_graph_projection_rows(
         ));
     }
     for path in &replacement_paths {
-        let exists: bool = connection.query_row(
+        let exists: bool = query_row_cached(
+            connection,
             "SELECT EXISTS(SELECT 1 FROM pages WHERE path = ?1)",
             params![path],
             |row| row.get(0),
@@ -1523,7 +1602,8 @@ pub(crate) fn append_fresh_graph_projection_rows(
                     "fresh projection blocks contain an empty or duplicate result ID".into(),
                 ));
             }
-            let exists: bool = connection.query_row(
+            let exists: bool = query_row_cached(
+                connection,
                 "SELECT EXISTS(SELECT 1 FROM blocks WHERE result_id = ?1)",
                 params![&block.result_id],
                 |row| row.get(0),
@@ -1557,9 +1637,24 @@ pub(crate) fn append_fresh_graph_projection_rows(
         &block_ids,
         None,
     )?;
+    let block_pages = change
+        .replacements
+        .iter()
+        .flat_map(|page| {
+            page.blocks
+                .iter()
+                .map(|block| (block.result_id.as_str(), page.path.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut own_memberships = DeferredOwnReferenceMemberships::new(&change.replacements);
     for posting in &change.reference_postings {
-        let posting_id = insert_reference_posting(connection, posting)?;
+        let posting_id = insert_fresh_reference_posting(
+            connection,
+            posting,
+            &page_ids,
+            &block_ids,
+            &block_pages,
+        )?;
         own_memberships.capture_first_occurrence(posting, posting_id);
     }
     for alias in aliases {
@@ -1611,15 +1706,16 @@ fn allocate_entity_coordinates(
     let count = i64::try_from(count).map_err(|_| {
         MaterializationError::InvalidInput("entity coordinate count exceeds SQLite".into())
     })?;
-    let start: i64 = connection.query_row(
+    let start: i64 = query_row_cached(
+        connection,
         "SELECT next_entity_id FROM query_projection_state WHERE singleton = 1",
-        [],
+        &[],
         |row| row.get(0),
     )?;
     let end = start.checked_add(count).ok_or_else(|| {
         MaterializationError::InvalidInput("entity coordinate allocator exhausted".into())
     })?;
-    let changed = connection.execute(
+    let changed = execute_cached(connection,
         "UPDATE query_projection_state SET next_entity_id = ?1 WHERE singleton = 1 AND next_entity_id = ?2",
         params![end, start],
     )?;
@@ -1660,7 +1756,8 @@ fn reclaim_affected_names(
     affected: &BTreeSet<i64>,
 ) -> Result<(), MaterializationError> {
     for name_id in affected {
-        connection.execute(
+        execute_cached(
+            connection,
             "DELETE FROM names WHERE name_id = ?1
              AND NOT EXISTS (SELECT 1 FROM pages WHERE name_id = ?1)
              AND NOT EXISTS (
@@ -1772,7 +1869,7 @@ fn insert_deferred_own_reference_memberships(
                     block.result_id.as_str(),
                     name.key.as_str(),
                 ) {
-                    connection.execute(MARK_OWN_REFERENCE_SQL, params![posting_id])?;
+                    execute_cached(connection, MARK_OWN_REFERENCE_SQL, params![posting_id])?;
                 } else {
                     insert_synthetic_own_reference(connection, page_id, block_id, name)?;
                 }
@@ -1799,15 +1896,15 @@ fn insert_own_reference_memberships(
                 if !seen.insert(name.key.as_str()) {
                     continue;
                 }
-                let occurrence: Option<i64> = connection
-                    .query_row(
-                        OWN_REFERENCE_OCCURRENCE_SQL,
-                        params![page_id, block_id, &name.key],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
+                let occurrence: Option<i64> = query_row_cached(
+                    connection,
+                    OWN_REFERENCE_OCCURRENCE_SQL,
+                    params![page_id, block_id, &name.key],
+                    |row| row.get(0),
+                )
+                .optional()?;
                 if let Some(posting_id) = occurrence {
-                    connection.execute(MARK_OWN_REFERENCE_SQL, params![posting_id])?;
+                    execute_cached(connection, MARK_OWN_REFERENCE_SQL, params![posting_id])?;
                 } else {
                     insert_synthetic_own_reference(connection, page_id, block_id, name)?;
                 }
@@ -1824,7 +1921,8 @@ fn insert_synthetic_own_reference(
     name: &PhysicalName,
 ) -> Result<(), MaterializationError> {
     let name_id = intern_name(connection, &name.key, &name.raw)?;
-    connection.execute(
+    execute_cached(
+        connection,
         "INSERT INTO reference_postings (
             source_page_id, source_entity_type, source_entity_id,
             source_locator, ordinal, reference_kind, target_type,
@@ -1871,7 +1969,8 @@ fn delete_page(
     page_id: i64,
 ) -> Result<PageCleanupInstrumentation, MaterializationError> {
     let page = &page_id;
-    let existing: i64 = transaction.query_row(
+    let existing: i64 = query_row_cached(
+        transaction,
         "SELECT EXISTS(SELECT 1 FROM pages WHERE page_id = ?1)",
         params![page],
         |row| row.get(0),
@@ -1885,58 +1984,69 @@ fn delete_page(
         .query_map(params![page], |row| row.get::<_, i64>(0))?
         .collect::<Result<Vec<_>, _>>()?;
     for rowid in std::iter::once(page_id).chain(block_ids) {
-        instrumentation.fts_rowids = instrumentation.fts_rowids.saturating_add(
-            transaction.execute("DELETE FROM search_fts WHERE rowid = ?1", params![rowid])?,
-        );
+        instrumentation.fts_rowids = instrumentation.fts_rowids.saturating_add(execute_cached(
+            transaction,
+            "DELETE FROM search_fts WHERE rowid = ?1",
+            params![rowid],
+        )?);
     }
     for table in ["reference_postings", "reference_alias_declarations"] {
-        instrumentation.owned_rows =
-            instrumentation
-                .owned_rows
-                .saturating_add(transaction.execute(
-                    &format!("DELETE FROM {table} WHERE source_page_id = ?1"),
-                    params![page],
-                )?);
+        instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(execute_cached(
+            transaction,
+            &format!("DELETE FROM {table} WHERE source_page_id = ?1"),
+            params![page],
+        )?);
     }
-    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(
-        transaction.execute("DELETE FROM properties WHERE page_id = ?1", params![page])?,
-    );
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM property_atoms WHERE page_id = ?1",
-            params![page],
-        )?);
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM block_path_refs WHERE page_id = ?1",
-            params![page],
-        )?);
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute(
-            "DELETE FROM block_planning WHERE page_id = ?1",
-            params![page],
-        )?);
-    instrumentation.owned_rows = instrumentation
-        .owned_rows
-        .saturating_add(transaction.execute("DELETE FROM tags WHERE page_id = ?1", params![page])?);
-    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(
-        transaction.execute("DELETE FROM tasks WHERE page_id = ?1", params![page])?,
-    );
-    instrumentation.owned_rows += transaction.execute(
+    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(execute_cached(
+        transaction,
+        "DELETE FROM properties WHERE page_id = ?1",
+        params![page],
+    )?);
+    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(execute_cached(
+        transaction,
+        "DELETE FROM property_atoms WHERE page_id = ?1",
+        params![page],
+    )?);
+    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(execute_cached(
+        transaction,
+        "DELETE FROM block_path_refs WHERE page_id = ?1",
+        params![page],
+    )?);
+    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(execute_cached(
+        transaction,
+        "DELETE FROM block_planning WHERE page_id = ?1",
+        params![page],
+    )?);
+    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(execute_cached(
+        transaction,
+        "DELETE FROM tags WHERE page_id = ?1",
+        params![page],
+    )?);
+    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(execute_cached(
+        transaction,
+        "DELETE FROM tasks WHERE page_id = ?1",
+        params![page],
+    )?);
+    instrumentation.owned_rows += execute_cached(
+        transaction,
         "DELETE FROM block_text WHERE block_id IN (SELECT block_id FROM blocks WHERE page_id = ?1)",
         params![page],
     )?;
-    instrumentation.owned_rows +=
-        transaction.execute("DELETE FROM page_text WHERE page_id = ?1", params![page])?;
-    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(
-        transaction.execute("DELETE FROM blocks WHERE page_id = ?1", params![page])?,
-    );
-    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(
-        transaction.execute("DELETE FROM pages WHERE page_id = ?1", params![page])?,
-    );
+    instrumentation.owned_rows += execute_cached(
+        transaction,
+        "DELETE FROM page_text WHERE page_id = ?1",
+        params![page],
+    )?;
+    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(execute_cached(
+        transaction,
+        "DELETE FROM blocks WHERE page_id = ?1",
+        params![page],
+    )?);
+    instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(execute_cached(
+        transaction,
+        "DELETE FROM pages WHERE page_id = ?1",
+        params![page],
+    )?);
     Ok(instrumentation)
 }
 
@@ -1952,6 +2062,18 @@ fn execute_cached(
     parameters: &[&dyn rusqlite::ToSql],
 ) -> Result<usize, MaterializationError> {
     Ok(transaction.prepare_cached(sql)?.execute(parameters)?)
+}
+
+/// Read one row through the prepared-statement cache, for the same reason as
+/// [`execute_cached`]: a build resolves page, block, and name coordinates
+/// once per reference posting and own-reference membership.
+fn query_row_cached<T>(
+    connection: &Connection,
+    sql: &str,
+    parameters: &[&dyn rusqlite::ToSql],
+    map: impl FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    connection.prepare_cached(sql)?.query_row(parameters, map)
 }
 
 fn insert_page(

@@ -7,6 +7,18 @@ independently in `src/formats.rs` and summarized in
 
 ## Unreleased
 
+## [0.27.1] - 2026-09-21
+
+### Changed
+
+- A fresh projection build is about 45% faster on a 10,000-page graph
+  (47.5 s to 26.2 s, 600,062 blocks, Linux): the per-row name, page and
+  block lookups now go through the prepared-statement cache instead of
+  compiling their SQL on every call, `intern_name` looks a name up before
+  attempting to insert it, and a fresh append resolves its reference
+  postings from the coordinates it has just allocated instead of three
+  queries each. No format, schema or API change; the refusals are the same.
+
 ## [0.27.0] - 2026-09-20
 
 Completes the compact-projection storage work: schema 30 stores one raw text

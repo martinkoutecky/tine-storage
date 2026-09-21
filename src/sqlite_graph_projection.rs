@@ -262,6 +262,83 @@ mod compact_key_tests {
     }
 
     #[test]
+    fn fresh_append_resolves_postings_from_its_own_coordinates_and_keeps_ownership_refusals() {
+        let two_pages = |postings| PhysicalGraphProjectionChange {
+            replacements: vec![
+                page("pages/a.md", "A", vec![block("b-a", None)]),
+                page("pages/b.md", "B", vec![block("b-b", None)]),
+            ],
+            deletions: Vec::new(),
+            reference_postings: postings,
+        };
+        let revisions = [
+            PhysicalGraphProjectionSourceRevision {
+                path: "pages/a.md".into(),
+                revision: "one".into(),
+            },
+            PhysicalGraphProjectionSourceRevision {
+                path: "pages/b.md".into(),
+                revision: "one".into(),
+            },
+        ];
+        let refused = [
+            posting("pages/a.md", "b-b", "Foo"),
+            PhysicalReferencePosting {
+                source_entity: PhysicalEntityId::Page("pages/b.md".into()),
+                ..posting("pages/a.md", "b-a", "Foo")
+            },
+            posting("pages/a.md", "missing", "Foo"),
+        ];
+        for bad in refused {
+            let path = file("fresh-posting-owner");
+            let mut build = fresh_build(&path).unwrap();
+            assert!(
+                build
+                    .append_with_source_revisions_and_aliases(
+                        &two_pages(vec![bad.clone()]),
+                        &revisions,
+                        &[],
+                    )
+                    .is_err(),
+                "a posting whose source entity is not on its source page was accepted: {bad:?}"
+            );
+        }
+
+        let path = file("fresh-posting-coordinates");
+        let mut build = fresh_build(&path).unwrap();
+        build
+            .append_with_source_revisions_and_aliases(
+                &two_pages(vec![
+                    posting("pages/a.md", "b-a", "Foo"),
+                    posting("pages/b.md", "b-b", "Foo"),
+                ]),
+                &revisions,
+                &[],
+            )
+            .unwrap();
+        let database = build.database.as_ref().unwrap();
+        for (page_path, result_id) in [("pages/a.md", "b-a"), ("pages/b.md", "b-b")] {
+            let stored: i64 = database
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM reference_postings AS posting
+                     JOIN pages ON pages.page_id = posting.source_page_id
+                     JOIN blocks ON blocks.block_id = posting.source_entity_id
+                     WHERE posting.source_entity_type = 1 AND pages.path = ?1
+                       AND blocks.result_id = ?2 AND blocks.page_id = pages.page_id
+                       AND posting.source_locator = CAST('content' AS BLOB)",
+                    rusqlite::params![page_path, result_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                stored, 1,
+                "posting on {page_path} names the wrong coordinates"
+            );
+        }
+    }
+
+    #[test]
     fn fresh_build_refuses_an_unrelated_preexisting_file_without_changing_it() {
         let path = file("fresh-build-collision");
         std::fs::write(&path, b"not a projection").unwrap();
