@@ -4369,6 +4369,126 @@ mod tests {
         }
     }
 
+    /// A turn's applies commit together or not at all (tine GH #543: one
+    /// transaction writes each shared index page to the WAL once).
+    #[test]
+    fn a_turn_commits_its_applies_together() {
+        let path =
+            std::env::temp_dir().join(format!("tine-storage-turn-{}.sqlite", uuid::Uuid::new_v4()));
+        let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.initialize_schema().unwrap();
+        let (change, revisions, _) = gh543_snapshot(4);
+        let (first, second) = change.replacements.split_at(2);
+        let halves = [
+            PhysicalGraphProjectionChange {
+                replacements: first.to_vec(),
+                deletions: Vec::new(),
+                reference_postings: change
+                    .reference_postings
+                    .iter()
+                    .filter(|posting| {
+                        first
+                            .iter()
+                            .any(|page| page.path == posting.source_page_path)
+                    })
+                    .cloned()
+                    .collect(),
+            },
+            PhysicalGraphProjectionChange {
+                replacements: second.to_vec(),
+                deletions: Vec::new(),
+                reference_postings: change
+                    .reference_postings
+                    .iter()
+                    .filter(|posting| {
+                        second
+                            .iter()
+                            .any(|page| page.path == posting.source_page_path)
+                    })
+                    .cloned()
+                    .collect(),
+            },
+        ];
+        let apply_halves = |turn: &mut PhysicalGraphProjectionTurn<'_>| {
+            turn.apply_with_source_revisions_and_aliases(&halves[0], &revisions[..2], &[])
+                .unwrap();
+            turn.apply_with_source_revisions_and_aliases(&halves[1], &revisions[2..], &[])
+                .unwrap();
+        };
+        {
+            let mut turn = database.begin_turn().unwrap();
+            apply_halves(&mut turn);
+            // Dropped uncommitted: a stopped or failed turn.
+        }
+        assert_eq!(scalar(&database, "SELECT COUNT(*) FROM pages"), 0);
+        let mut turn = database.begin_turn().unwrap();
+        apply_halves(&mut turn);
+        turn.commit().unwrap();
+        assert_eq!(scalar(&database, "SELECT COUNT(*) FROM pages"), 4);
+        assert_eq!(
+            scalar(&database, "SELECT COUNT(*) FROM direct_source_revisions"),
+            4
+        );
+        database.quick_check().unwrap();
+        drop(database);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// A writer configured not to checkpoint leaves its commits in the WAL,
+    /// and `checkpoint_passive_at` copies them from a connection of its own
+    /// (tine GH #543: the inline checkpoint stalled the committing thread).
+    #[test]
+    fn checkpoints_run_only_where_the_caller_puts_them() {
+        let path = std::env::temp_dir().join(format!(
+            "tine-storage-checkpoint-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.initialize_schema().unwrap();
+        database.checkpoint_truncate().unwrap();
+        database.disable_automatic_checkpoints().unwrap();
+        database.keep_temporary_files_in_memory().unwrap();
+        let image_bytes = || std::fs::metadata(&path).unwrap().len();
+        let before = image_bytes();
+        let (change, revisions, _) = gh543_snapshot(200);
+        database
+            .apply_with_source_revisions_and_aliases(&change, &revisions, &[])
+            .unwrap();
+        let wal = std::fs::metadata(format!("{}-wal", path.display()))
+            .unwrap()
+            .len();
+        assert!(
+            wal > 4096 * 1000,
+            "the commit must be past SQLite's default 1,000-page checkpoint threshold: {wal}"
+        );
+        assert_eq!(
+            image_bytes(),
+            before,
+            "the committing connection must not have copied the WAL into the image"
+        );
+        assert_eq!(
+            PhysicalGraphProjectionDatabase::checkpoint_passive_at(&path).unwrap(),
+            0
+        );
+        assert!(
+            image_bytes() > before,
+            "the checkpoint copies the commit into the image"
+        );
+        assert_eq!(scalar(&database, "SELECT COUNT(*) FROM pages"), 200);
+        assert!(
+            PhysicalGraphProjectionDatabase::checkpoint_passive_at(&path.with_extension("absent"))
+                .is_err(),
+            "a checkpoint never creates an image"
+        );
+        assert!(!path.with_extension("absent").exists());
+        drop(database);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
     /// Draining one row at a time visits exactly the distinct rows an
     /// unbounded read returns — no row skipped or repeated at a batch edge,
     /// including two spellings of one name on one page and one spelling on
