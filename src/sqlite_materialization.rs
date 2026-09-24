@@ -2974,14 +2974,25 @@ const TASK_CANDIDATE_LOCATORS_AFTER_SQL: &str =
 /// prefix is the index order, so `LIMIT` ends the scan. `DISTINCT` and a
 /// trailing sort term may still use a temporary b-tree; both are bounded by
 /// the batch. `paged_navigation_readers_use_an_index_range` pins this.
-pub(crate) const NAVIGATION_REFERENCE_NAMES_FIRST_SQL: &str = "SELECT DISTINCT n.key, n.raw
-     FROM reference_postings r JOIN names n ON n.name_id = r.target_name_id
-     WHERE r.target_type = 0 AND r.reference_kind <= 4
+// Driven by `names` in its `(key, raw)` order, probing the postings index per
+// name: a name is one row, so no `DISTINCT`, and the order is the index's, so
+// no sort. As a `DISTINCT` join, SQLite's statistics on a real 10,000-page
+// graph chose to scan the postings and sort them in a temporary B-tree: 2.66 MB
+// of temp file on every edit, because every save asks again (GH tine#543).
+pub(crate) const NAVIGATION_REFERENCE_NAMES_FIRST_SQL: &str = "SELECT n.key, n.raw
+     FROM names n
+     WHERE EXISTS (
+       SELECT 1 FROM reference_postings r
+       WHERE r.target_name_id = n.name_id AND r.target_type = 0 AND r.reference_kind <= 4
+     )
      ORDER BY n.key, n.raw LIMIT ?1";
-pub(crate) const NAVIGATION_REFERENCE_NAMES_AFTER_SQL: &str = "SELECT DISTINCT n.key, n.raw
-     FROM reference_postings r JOIN names n ON n.name_id = r.target_name_id
-     WHERE r.target_type = 0 AND r.reference_kind <= 4
-       AND (n.key, n.raw) > (?1, ?2)
+pub(crate) const NAVIGATION_REFERENCE_NAMES_AFTER_SQL: &str = "SELECT n.key, n.raw
+     FROM names n
+     WHERE (n.key, n.raw) > (?1, ?2)
+       AND EXISTS (
+         SELECT 1 FROM reference_postings r
+         WHERE r.target_name_id = n.name_id AND r.target_type = 0 AND r.reference_kind <= 4
+       )
      ORDER BY n.key, n.raw LIMIT ?3";
 pub(crate) const NAVIGATION_ALIASES_FIRST_SQL: &str =
     "SELECT DISTINCT d.source_page_id, d.alias_name_id, owner.raw, p.path, alias.key

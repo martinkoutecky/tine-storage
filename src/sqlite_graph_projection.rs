@@ -1285,6 +1285,42 @@ pub struct PhysicalGraphProjectionDatabase {
     last_apply_deferred_indexes: std::cell::Cell<bool>,
 }
 
+/// Applies to a [`PhysicalGraphProjectionDatabase`] that commit together; see
+/// [`PhysicalGraphProjectionDatabase::begin_turn`].
+pub struct PhysicalGraphProjectionTurn<'a> {
+    transaction: rusqlite::Transaction<'a>,
+    last_apply_deferred_indexes: &'a std::cell::Cell<bool>,
+}
+
+impl PhysicalGraphProjectionTurn<'_> {
+    /// [`PhysicalGraphProjectionDatabase::apply_with_source_revisions_and_aliases`],
+    /// uncommitted until [`Self::commit`].
+    pub fn apply_with_source_revisions_and_aliases(
+        &mut self,
+        change: &PhysicalGraphProjectionChange,
+        revisions: &[PhysicalGraphProjectionSourceRevision],
+        aliases: &[PhysicalAliasDeclaration],
+    ) -> Result<ApplyChangeInstrumentation, MaterializationError> {
+        validate_replacement_revisions(change, Some(revisions))?;
+        let (instrumentation, deferred_indexes) = apply_projection_change_in_transaction(
+            &self.transaction,
+            change,
+            Some(revisions),
+            aliases,
+            None,
+            true,
+        )?;
+        self.last_apply_deferred_indexes.set(deferred_indexes);
+        Ok(instrumentation)
+    }
+
+    /// Commit every apply of this turn at once.
+    pub fn commit(self) -> Result<(), MaterializationError> {
+        self.transaction.commit()?;
+        Ok(())
+    }
+}
+
 /// One unpublished graph projection under construction in a single SQLite
 /// transaction.
 ///
@@ -1315,6 +1351,11 @@ pub struct FinalizedPhysicalGraphProjection {
 /// The smallest page-cache ceiling [`PhysicalGraphProjectionDatabase::set_page_cache_budget`]
 /// accepts; below SQLite's own ~2 MiB default a budget is a slowdown, never a saving.
 pub const MIN_PAGE_CACHE_BUDGET_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The size a connection configured by
+/// [`PhysicalGraphProjectionDatabase::disable_automatic_checkpoints`] truncates
+/// its WAL file back to when the WAL restarts.
+const WAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 
 impl PhysicalGraphProjectionDatabase {
     /// Begin a disposable, unpublished projection build at a path that must
@@ -1584,6 +1625,24 @@ impl PhysicalGraphProjectionDatabase {
         Ok(instrumentation)
     }
 
+    /// Start several applies that commit together, as one SQLite transaction.
+    ///
+    /// Every apply rewrites the pages it names and their index entries. Split
+    /// across transactions, an index page that several of them touch is
+    /// written to the WAL once per transaction; in one transaction it is
+    /// written once. A 261-page rename applied as nine 32-page transactions
+    /// wrote 620 MB on a 10,000-page graph (tine GH #543). Dropping the turn
+    /// without [`PhysicalGraphProjectionTurn::commit`] rolls every apply back.
+    pub fn begin_turn(&mut self) -> Result<PhysicalGraphProjectionTurn<'_>, MaterializationError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        Ok(PhysicalGraphProjectionTurn {
+            transaction,
+            last_apply_deferred_indexes: &self.last_apply_deferred_indexes,
+        })
+    }
+
     /// Compare caller authority revisions to the persisted disposable facts.
     /// Missing metadata is stale, never authoritative.
     pub fn source_delta(
@@ -1647,6 +1706,62 @@ impl PhysicalGraphProjectionDatabase {
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         Ok(())
+    }
+
+    /// Stop this connection's commits from checkpointing the WAL.
+    ///
+    /// SQLite's default runs a checkpoint inside the commit that grows the
+    /// WAL past 1,000 pages, on the committing thread: it copies every page
+    /// the WAL holds into the database file and flushes both. A large
+    /// incremental change commits in several bounded transactions, so it paid
+    /// one checkpoint and two flushes per transaction on the thread that also
+    /// publishes the result (a 261-page rename: nine of each, ~60 s on a
+    /// hosted Windows disk; tine GH #543). A connection configured here only
+    /// appends to the WAL; the caller must checkpoint it with
+    /// [`Self::checkpoint_passive_at`] from another connection, or the WAL grows
+    /// without bound. The WAL file is truncated back to
+    /// [`WAL_SIZE_LIMIT_BYTES`] whenever it restarts after a checkpoint.
+    pub fn disable_automatic_checkpoints(&self) -> Result<(), MaterializationError> {
+        self.connection
+            .pragma_update(None, "wal_autocheckpoint", 0)?;
+        self.connection
+            .pragma_update(None, "journal_size_limit", WAL_SIZE_LIMIT_BYTES)?;
+        Ok(())
+    }
+
+    /// Keep this connection's temporary files in memory.
+    ///
+    /// A multi-row `DELETE` that cascades through foreign keys needs a
+    /// statement journal. On disk it is a second copy of every page the
+    /// statement touches (16-30 MB per 32-page batch on a 10,000-page graph).
+    /// Intended for the incremental writer, whose statements are bounded
+    /// batches; a connection that may sort unbounded results should keep the
+    /// default so SQLite can spill them.
+    pub fn keep_temporary_files_in_memory(&self) -> Result<(), MaterializationError> {
+        self.connection
+            .pragma_update(None, "temp_store", "MEMORY")?;
+        Ok(())
+    }
+
+    /// Copy the committed WAL pages of the image at `path` into it, without
+    /// waiting for its readers or writer (`PRAGMA wal_checkpoint(PASSIVE)`),
+    /// on a connection of its own that is closed again before this returns.
+    ///
+    /// It flushes the WAL and then the database file, so it can take seconds
+    /// on a slow disk: call it from a thread nothing interactive waits on. It
+    /// never creates the file. Returns how many WAL frames it could not copy
+    /// yet because a reader still needs them; a later call copies them.
+    pub fn checkpoint_passive_at(path: &Path) -> Result<u64, MaterializationError> {
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        let (log, checkpointed): (i64, i64) =
+            connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(1)?, row.get(2)?))
+            })?;
+        Ok(u64::try_from(log.saturating_sub(checkpointed)).unwrap_or(0))
     }
 
     /// Let SQLite finalize planner statistics and other bounded maintenance
@@ -4107,6 +4222,18 @@ mod tests {
     /// so every 512-row batch scanned and sorted the whole join — O(N²) over
     /// the graph, ~11 GB of reads per launch at 10,000 pages.
     fn plan_uses_index_range(plan: &[String], expected: &str) -> Result<(), String> {
+        plan_uses_index_range_allowing(plan, expected, false)
+    }
+
+    /// `batch_distinct`: the reader's rows arrive in its keyset order, so a
+    /// `DISTINCT` B-tree holds one batch and `LIMIT` still ends the scan. The
+    /// alias readers are the only ones: the same alias can be declared twice on
+    /// a page, and the duplicates are adjacent in the index they scan.
+    fn plan_uses_index_range_allowing(
+        plan: &[String],
+        expected: &str,
+        batch_distinct: bool,
+    ) -> Result<(), String> {
         if !plan.iter().any(|line| line.starts_with(expected)) {
             return Err(format!("expected `{expected}…` in plan {plan:?}"));
         }
@@ -4119,7 +4246,8 @@ mod tests {
             (line.starts_with("SCAN ")
                 && !line.contains(" USING INDEX ")
                 && !line.contains(" USING COVERING INDEX "))
-                || line.as_str() == "USE TEMP B-TREE FOR ORDER BY"
+                || (line.starts_with("USE TEMP B-TREE")
+                    && !(batch_distinct && line.as_str() == "USE TEMP B-TREE FOR DISTINCT"))
         }) {
             return Err(format!(
                 "paged reader would sort or scan the whole table per batch (`{line}`): \
@@ -4142,32 +4270,79 @@ mod tests {
         let text = |value: &str| rusqlite::types::Value::from(value.to_owned());
         let limit = rusqlite::types::Value::from(512i64);
 
-        let shapes: [(&str, &[rusqlite::types::Value], &str); 4] = [
+        let shapes: [(&str, &[rusqlite::types::Value], &str, bool); 4] = [
             (
                 NAVIGATION_REFERENCE_NAMES_FIRST_SQL,
                 &[limit.clone()],
-                "SCAN r USING COVERING INDEX reference_postings_navigation_names_idx",
+                "SCAN n USING COVERING INDEX sqlite_autoindex_names_1",
+                false,
             ),
             (
                 NAVIGATION_REFERENCE_NAMES_AFTER_SQL,
                 &[text("topic"), text("Topic"), limit.clone()],
-                "SEARCH r USING COVERING INDEX reference_postings_navigation_names_idx",
+                "SEARCH n USING COVERING INDEX sqlite_autoindex_names_1",
+                false,
             ),
             (
                 NAVIGATION_ALIASES_FIRST_SQL,
                 &[limit.clone()],
                 "SCAN d USING COVERING INDEX ",
+                true,
             ),
             (
                 NAVIGATION_ALIASES_AFTER_SQL,
                 &[0i64.into(), 0i64.into(), limit.clone()],
                 "SEARCH d USING ",
+                true,
             ),
         ];
-        for (sql, args, expected) in shapes {
+        for (sql, args, expected, batch_distinct) in shapes {
             let plan = read.query_plan(sql, args).unwrap();
-            plan_uses_index_range(&plan, expected).unwrap_or_else(|why| panic!("{why}\n{sql}"));
+            plan_uses_index_range_allowing(&plan, expected, batch_distinct)
+                .unwrap_or_else(|why| panic!("{why}\n{sql}"));
         }
+        // The plan an empty schema gets is not the plan a user's graph gets:
+        // SQLite plans from `sqlite_stat1`. These are a real 10,000-page
+        // graph's statistics, under which the `DISTINCT`-join form of the
+        // referenced-names reader sorted every posting per call (GH tine#543)
+        // while passing this guard on the empty schema.
+        database
+            .connection
+            .execute_batch(
+                "ANALYZE sqlite_schema;
+                 DELETE FROM sqlite_stat1;
+                 INSERT INTO sqlite_stat1 (tbl, idx, stat) VALUES
+                   ('names', 'names_raw_key_idx', '26226 1 1 1'),
+                   ('names', 'sqlite_autoindex_names_1', '26226 1 1'),
+                   ('pages', 'pages_name_idx', '10009 1 1'),
+                   ('pages', 'pages_path_idx', '10009 1 1'),
+                   ('reference_alias_declarations', 'reference_alias_declarations_name_idx', '1750 1 1 1 1'),
+                   ('reference_alias_declarations', 'reference_alias_declarations_source_idx', '1750 1 1 1 1 1'),
+                   ('reference_postings', 'reference_postings_navigation_names_idx', '76806 364 211'),
+                   ('reference_postings', 'reference_postings_target_name_idx', '76806 364 2 2 1 1 1'),
+                   ('reference_postings', 'reference_postings_source_idx', '104536 6 6 2 2 1');
+                 ANALYZE sqlite_schema;",
+            )
+            .unwrap();
+        let read = database.read();
+        for (sql, args, expected, batch_distinct) in shapes {
+            let plan = read.query_plan(sql, args).unwrap();
+            plan_uses_index_range_allowing(&plan, expected, batch_distinct)
+                .unwrap_or_else(|why| panic!("with a real graph's statistics: {why}\n{sql}"));
+        }
+        let distinct_join = read
+            .query_plan(
+                "SELECT DISTINCT n.key, n.raw
+                 FROM reference_postings r JOIN names n ON n.name_id = r.target_name_id
+                 WHERE r.target_type = 0 AND r.reference_kind <= 4
+                 ORDER BY n.key, n.raw LIMIT ?1",
+                &[limit.clone()],
+            )
+            .unwrap();
+        assert!(
+            plan_uses_index_range(&distinct_join, "SEARCH r USING").is_err(),
+            "guard must reject the v0.28.0 referenced-names plan: {distinct_join:?}"
+        );
 
         // The pre-fix shape (v0.20.1) is the counterexample the guard exists
         // for: an order over the joined path is a full scan plus a sort.

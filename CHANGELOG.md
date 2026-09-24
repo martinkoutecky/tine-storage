@@ -7,6 +7,30 @@ independently in `src/formats.rs` and summarized in
 
 ## Unreleased
 
+## [0.28.1] - 2026-09-24
+
+Write-side cost of incremental updates (Tine GH #543). A 261-page rename on a
+10,000-page graph wrote 603 MB; with Tine's matching changes, 200 MB.
+
+### Added
+
+- `PhysicalGraphProjectionDatabase::begin_turn` and
+  `PhysicalGraphProjectionTurn`: several applies committed as one transaction,
+  so an index page every apply touches is written to the WAL once.
+- `disable_automatic_checkpoints`, `keep_temporary_files_in_memory` and
+  `checkpoint_passive_at`: a writer whose commits never checkpoint (and whose
+  statement journals stay in memory), and a checkpoint on a connection of its
+  own that the caller runs where nothing interactive waits.
+
+### Changed
+
+- The referenced-names navigation reader is driven by `names` in index order
+  and probes the postings per name. As a `DISTINCT` join, a real graph's
+  statistics made SQLite sort every posting in a temporary B-tree per call
+  (2.66 MB of temp file per Tine edit). The plan guard now also runs under a
+  real graph's `sqlite_stat1` and rejects any temporary B-tree except the
+  alias readers' batch-bounded `DISTINCT`.
+
 ## [0.28.0] - 2026-09-24
 
 ### Added
