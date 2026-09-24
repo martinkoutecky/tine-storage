@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn format_identity_is_pinned() {
         assert_eq!(SQLITE_APPLICATION_ID, 0x5449_4e45);
-        assert_eq!(SQLITE_SCHEMA_VERSION, 30);
+        assert_eq!(SQLITE_SCHEMA_VERSION, 31);
     }
 
     /// The manifest must quote the live constants, not a stale copy. Every row

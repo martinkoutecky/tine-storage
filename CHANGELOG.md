@@ -7,6 +7,27 @@ independently in `src/formats.rs` and summarized in
 
 ## Unreleased
 
+## [0.28.0] - 2026-09-24
+
+### Added
+
+- A second contentless FTS5 table, `short_word_fts`, answers one- and
+  two-character CJK searches that the trigram index cannot (Tine ADR 0069).
+  `PhysicalPage` and `PhysicalBlock` gain an application-owned
+  `short_word_tokens` field: space-separated whole tokens, indexed with the
+  `ascii` tokenizer so every non-ASCII scalar (combining marks included) stays
+  inside its token. An entity whose field is empty writes no row, so a graph
+  without such text pays nothing. Rows share the page/block rowids of
+  `search_fts` and are written, replaced, deleted and reset with them.
+
+### Changed
+
+- `SQLITE_SCHEMA_VERSION` moves 30 → 31 for the new table. An existing
+  projection file is rebuilt from the graph, never reinterpreted.
+- Breaking: the two new public fields make exhaustive struct literals of
+  `PhysicalPage` / `PhysicalBlock` fail to compile until they set
+  `short_word_tokens`.
+
 ## [0.27.1] - 2026-09-21
 
 ### Changed

@@ -83,6 +83,7 @@ mod compact_key_tests {
             },
             content: format!("content {id}"),
             search_tokens: format!("content {id}"),
+            short_word_tokens: String::new(),
             heading_level: None,
             collapsed: false,
             logseq_uuid: Some([7; 16]),
@@ -130,6 +131,7 @@ mod compact_key_tests {
             journal_day: None,
             preamble: None,
             search_tokens: name.to_lowercase(),
+            short_word_tokens: String::new(),
             properties: Vec::new(),
             tags: Vec::new(),
             property_atoms: Vec::new(),
@@ -205,10 +207,9 @@ mod compact_key_tests {
                 .unwrap(),
             0
         );
-        let change = change(
-            page("pages/a.md", "A", vec![block("b-a", None)]),
-            Vec::new(),
-        );
+        let mut short = block("b-a", None);
+        short.short_word_tokens = "会 议 会议".into();
+        let change = change(page("pages/a.md", "A", vec![short]), Vec::new());
         build
             .append_with_source_revisions_and_aliases(
                 &change,
@@ -253,6 +254,7 @@ mod compact_key_tests {
             1
         );
         assert!(reopened.read().block("b-a").unwrap().is_some());
+        assert_eq!(short_word_rowids(&reopened, "会议").len(), 1);
         drop(reopened);
         drop(finalized);
         assert!(
@@ -1100,6 +1102,84 @@ mod compact_key_tests {
         })
         .unwrap();
         assert_eq!(scalar(&db, "SELECT COUNT(*) FROM search_fts"), 0);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn short_word_rowids(db: &PhysicalGraphProjectionDatabase, token: &str) -> Vec<i64> {
+        db.connection
+            .prepare(
+                "SELECT rowid FROM short_word_fts WHERE short_word_fts MATCH ?1 ORDER BY rowid",
+            )
+            .unwrap()
+            .query_map([format!("\"{token}\"")], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// The schema-30 -> 31 rebuild proof: a file with the schema-30 shape (no
+    /// `short_word_fts`) is refused by validation, which makes Tine rebuild it.
+    #[test]
+    fn an_older_schema_without_short_word_fts_fails_validation() {
+        let path = file("schema-30");
+        let db = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        db.initialize_schema().unwrap();
+        db.validate_schema().unwrap();
+        db.connection
+            .execute_batch("DROP TABLE short_word_fts")
+            .unwrap();
+        assert!(db.validate_schema().is_err());
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// ADR 0069 (Tine): short-word rows live and die with their page or block,
+    /// and an entity without short-word tokens owns no row at all.
+    #[test]
+    fn short_word_rows_follow_their_entities_and_cost_nothing_without_tokens() {
+        let path = file("short-words");
+        let mut db = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        db.initialize_schema().unwrap();
+        db.validate_schema().unwrap();
+        let mut cjk = block("cjk", None);
+        // A combining voicing mark (U+3099) stays inside its token.
+        cjk.short_word_tokens = "会 议 会议 か\u{3099}".into();
+        let mut fixture = page("pages/a.md", "A", vec![cjk, block("latin", Some("cjk"))]);
+        fixture.short_word_tokens = "東 京 東京".into();
+        db.apply(&change(fixture.clone(), vec![])).unwrap();
+
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM short_word_fts"), 2);
+        let page_id = scalar(&db, "SELECT page_id FROM pages WHERE path = 'pages/a.md'");
+        let block_id = scalar(&db, "SELECT block_id FROM blocks WHERE result_id = 'cjk'");
+        assert_eq!(short_word_rowids(&db, "会议"), vec![block_id]);
+        assert_eq!(short_word_rowids(&db, "会"), vec![block_id]);
+        assert_eq!(short_word_rowids(&db, "か\u{3099}"), vec![block_id]);
+        assert!(
+            short_word_rowids(&db, "か").is_empty(),
+            "a combining mark is not a token separator"
+        );
+        assert_eq!(short_word_rowids(&db, "東京"), vec![page_id]);
+
+        let mut replacement = fixture.clone();
+        replacement.blocks[0].short_word_tokens = "新".into();
+        db.apply(&change(replacement, vec![])).unwrap();
+        assert!(short_word_rowids(&db, "会议").is_empty());
+        assert_eq!(short_word_rowids(&db, "新").len(), 1);
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM short_word_fts"), 2);
+
+        db.apply(&PhysicalGraphProjectionChange {
+            replacements: vec![],
+            deletions: vec!["pages/a.md".into()],
+            reference_postings: vec![],
+        })
+        .unwrap();
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM short_word_fts"), 0);
+
+        db.apply(&change(fixture, vec![])).unwrap();
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM short_word_fts"), 2);
+        db.reset().unwrap();
+        assert_eq!(scalar(&db, "SELECT COUNT(*) FROM short_word_fts"), 0);
         drop(db);
         let _ = std::fs::remove_file(path);
     }
@@ -2490,6 +2570,7 @@ mod tests {
                     order: format!("{block:04}"),
                     content: content.clone(),
                     search_tokens: content.to_lowercase(),
+                    short_word_tokens: String::new(),
                     heading_level: None,
                     collapsed: false,
                     logseq_uuid: None,
@@ -2524,6 +2605,7 @@ mod tests {
                 journal_day: None,
                 preamble: None,
                 search_tokens: String::new(),
+                short_word_tokens: String::new(),
                 properties: Vec::new(),
                 tags: Vec::new(),
                 property_atoms: Vec::new(),
@@ -3137,6 +3219,7 @@ mod tests {
             journal_day: None,
             preamble: None,
             search_tokens: content.to_lowercase(),
+            short_word_tokens: String::new(),
             properties: Vec::new(),
             tags: Vec::new(),
             property_atoms: Vec::new(),
@@ -3147,6 +3230,7 @@ mod tests {
                 order: "0001".into(),
                 content: content.into(),
                 search_tokens: content.to_lowercase(),
+                short_word_tokens: String::new(),
                 heading_level: None,
                 collapsed: false,
                 logseq_uuid: None,

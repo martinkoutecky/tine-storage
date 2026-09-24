@@ -8,7 +8,7 @@ second source of truth.
 
 | Artifact | Format identity | Compatibility rule |
 | --- | --- | --- |
-| SQLite projection | application ID `0x54494e45`; schema 30 | SQLite is disposable. A file whose `user_version` differs is rebuilt from the graph's Markdown/Org files, never reinterpreted under a new schema. |
+| SQLite projection | application ID `0x54494e45`; schema 31 | SQLite is disposable. A file whose `user_version` differs is rebuilt from the graph's Markdown/Org files, never reinterpreted under a new schema. |
 
 Schema 30 is the single unreleased compact projection format: entity
 coordinates are monotonic integer rowids, public identity remains path/result
@@ -17,6 +17,11 @@ Page preamble and block source are the only stored raw document text. Search is
 one contentless, detail-free, case-sensitive trigram FTS5 table whose rowids are
 those same disjoint page/block coordinates; application-folded `search_tokens`
 are indexed but cannot be read back as text.
+
+Schema 31 (0.28.0) adds `short_word_fts`, a second contentless, detail-free
+FTS5 table over application `short_word_tokens` (whole tokens, `ascii`
+tokenizer), keyed by the same page/block rowids. Only entities with tokens own
+a row. A schema-30 file is rebuilt, never migrated.
 
 Fresh projection construction may use an unpublished journal-OFF staging file
 which is atomically installed only after completion. That changes build and

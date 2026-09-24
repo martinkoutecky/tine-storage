@@ -10,9 +10,13 @@ use rusqlite::{params, Connection, OptionalExtension as _};
 
 /// `PRAGMA application_id` of every Tine projection file.
 pub const SQLITE_APPLICATION_ID: u32 = 0x5449_4e45;
-/// `PRAGMA user_version` of the Direct Files projection schema. A file whose
-/// version differs is rebuilt from the graph, never reinterpreted.
-pub const SQLITE_SCHEMA_VERSION: u32 = 30;
+/// Version label of the Direct Files projection schema, published in the
+/// format manifest. It is not stored in the file: an open file is accepted
+/// only when `validate_schema` finds exactly this schema's DDL census, so a
+/// file of any other schema fails validation and the application rebuilds it
+/// from the graph, never reinterpreting it
+/// (`an_older_schema_without_short_word_fts_fails_validation`).
+pub const SQLITE_SCHEMA_VERSION: u32 = 31;
 pub const MAX_MATERIALIZATION_QUERY_ROWS: usize = 10_000;
 pub const MAX_MATERIALIZATION_QUERY_BYTES: usize = 64 * 1024;
 pub const MAX_MATERIALIZATION_READ_BYTES: usize = 64 * 1024 * 1024;
@@ -236,6 +240,10 @@ pub struct PhysicalBlock {
     /// Application-owned folded visible tokens. Storage feeds this ephemeral
     /// value to the contentless search index and never persists it as text.
     pub search_tokens: String,
+    /// Application-owned space-separated short-word tokens (for Tine, the
+    /// unigrams and bigrams of CJK runs in `search_tokens`). Empty writes no
+    /// row; otherwise indexed like `search_tokens`, never persisted as text.
+    pub short_word_tokens: String,
     pub heading_level: Option<u8>,
     pub collapsed: bool,
     pub logseq_uuid: Option<[u8; 16]>,
@@ -267,6 +275,8 @@ pub struct PhysicalPage {
     /// Application-owned folded visible tokens. Storage feeds this ephemeral
     /// value to the contentless search index and never persists it as text.
     pub search_tokens: String,
+    /// Application-owned short-word tokens; see [`PhysicalBlock::short_word_tokens`].
+    pub short_word_tokens: String,
     pub properties: Vec<PhysicalProperty>,
     pub tags: Vec<PhysicalTag>,
     pub property_atoms: Vec<PhysicalPropertyAtom>,
@@ -521,6 +531,18 @@ pub const SEARCH_FTS_DDL: &str = "CREATE VIRTUAL TABLE search_fts USING fts5(
     contentless_delete = 1,
     detail = none,
     tokenize = 'trigram case_sensitive 1 remove_diacritics 0'
+)";
+/// Whole-token index over application short-word tokens (one- and
+/// two-character CJK words, which the trigram index cannot answer). Rowids are
+/// the same page/block coordinates as `search_fts`. The `ascii` tokenizer
+/// splits only on ASCII separators, so every non-ASCII scalar -- combining
+/// marks included -- stays inside its token, byte for byte.
+pub const SHORT_WORD_FTS_DDL: &str = "CREATE VIRTUAL TABLE short_word_fts USING fts5(
+    short_words,
+    content = '',
+    contentless_delete = 1,
+    detail = none,
+    tokenize = 'ascii'
 )";
 
 pub const NAMES_RAW_KEY_INDEX_DDL: &str =
@@ -816,7 +838,7 @@ const MATERIALIZATION_TABLE_COLUMNS: [(&str, &[&str]); 14] = [
     ),
 ];
 
-const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 47] = [
+const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 48] = [
     ("table", "names", NAMES_DDL),
     ("table", "reference_postings", REFERENCE_POSTINGS_DDL),
     (
@@ -840,6 +862,7 @@ const MATERIALIZATION_SCHEMA_OBJECTS: [(&str, &str, &str); 47] = [
     ),
     ("table", "property_atoms", PROPERTY_ATOMS_DDL),
     ("table", "search_fts", SEARCH_FTS_DDL),
+    ("table", "short_word_fts", SHORT_WORD_FTS_DDL),
     ("index", "names_raw_key_idx", NAMES_RAW_KEY_INDEX_DDL),
     ("index", "pages_name_idx", PAGES_NAME_INDEX_DDL),
     (
@@ -999,7 +1022,8 @@ pub(crate) fn initialize_graph_projection_schema_without_secondary_indexes(
          {BLOCK_PATH_REFS_DDL};
          {QUERY_PROJECTION_STATE_DDL};
          {PROPERTY_ATOMS_DDL};
-         {SEARCH_FTS_DDL};"
+         {SEARCH_FTS_DDL};
+         {SHORT_WORD_FTS_DDL};"
     ))?;
     connection.execute("INSERT INTO query_projection_state VALUES (1, 0, 1)", [])?;
     Ok(())
@@ -1939,6 +1963,7 @@ pub(crate) fn reset_graph_projection_rows(
     advance_query_projection_revision(transaction)?;
     transaction.execute_batch(
         "DELETE FROM search_fts;
+         DELETE FROM short_word_fts;
          DELETE FROM property_atoms;
          DELETE FROM block_path_refs;
          DELETE FROM block_planning;
@@ -1989,6 +2014,11 @@ fn delete_page(
             "DELETE FROM search_fts WHERE rowid = ?1",
             params![rowid],
         )?);
+        execute_cached(
+            transaction,
+            "DELETE FROM short_word_fts WHERE rowid = ?1",
+            params![rowid],
+        )?;
     }
     for table in ["reference_postings", "reference_alias_declarations"] {
         instrumentation.owned_rows = instrumentation.owned_rows.saturating_add(execute_cached(
@@ -2299,6 +2329,7 @@ fn insert_replacement_fts_rows(
 ) -> Result<(), MaterializationError> {
     for page in replacements {
         insert_fts_row(transaction, page_ids[&page.path], &page.search_tokens)?;
+        insert_short_word_row(transaction, page_ids[&page.path], &page.short_word_tokens)?;
         if let Some(stats) = instrumentation.as_deref_mut() {
             stats.page_rows = stats.page_rows.saturating_add(1);
         }
@@ -2307,6 +2338,11 @@ fn insert_replacement_fts_rows(
                 transaction,
                 block_ids[&block.result_id],
                 &block.search_tokens,
+            )?;
+            insert_short_word_row(
+                transaction,
+                block_ids[&block.result_id],
+                &block.short_word_tokens,
             )?;
             if let Some(stats) = instrumentation.as_deref_mut() {
                 stats.block_rows = stats.block_rows.saturating_add(1);
@@ -2332,6 +2368,31 @@ fn insert_fts_row(
         transaction,
         "INSERT INTO search_fts (rowid, normalized_text) VALUES (?1, ?2)",
         params![rowid, search_tokens],
+    )?;
+    Ok(())
+}
+
+/// Writes nothing for an entity without short-word tokens, so a graph with no
+/// CJK text pays no row, page or byte for this index.
+fn insert_short_word_row(
+    transaction: &Connection,
+    rowid: i64,
+    short_word_tokens: &str,
+) -> Result<(), MaterializationError> {
+    if short_word_tokens.is_empty() {
+        return Ok(());
+    }
+    if short_word_tokens.len() > MAX_MATERIALIZATION_FIELD_BYTES {
+        return Err(resource_limit(
+            "short-word token bytes",
+            short_word_tokens.len(),
+            MAX_MATERIALIZATION_FIELD_BYTES,
+        ));
+    }
+    execute_cached(
+        transaction,
+        "INSERT INTO short_word_fts (rowid, short_words) VALUES (?1, ?2)",
+        params![rowid, short_word_tokens],
     )?;
     Ok(())
 }
@@ -4109,6 +4170,7 @@ mod tests {
             journal_day: None,
             preamble: None,
             search_tokens: String::new(),
+            short_word_tokens: String::new(),
             properties: Vec::new(),
             tags: Vec::new(),
             property_atoms: Vec::new(),
@@ -4128,6 +4190,7 @@ mod tests {
                 order: "a".into(),
                 content: String::new(),
                 search_tokens: String::new(),
+                short_word_tokens: String::new(),
                 heading_level: None,
                 collapsed: false,
                 logseq_uuid: None,
