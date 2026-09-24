@@ -1751,6 +1751,14 @@ impl PhysicalGraphProjectionDatabase {
     /// on a slow disk: call it from a thread nothing interactive waits on. It
     /// never creates the file. Returns how many WAL frames it could not copy
     /// yet because a reader still needs them; a later call copies them.
+    ///
+    /// When every frame is copied it also empties the WAL, if that needs no
+    /// waiting (no write transaction and no reader on the WAL). A copied WAL
+    /// otherwise keeps its frames until the writer next restarts it, and a
+    /// process that exits first leaves them behind: the next open cannot know
+    /// they were copied and copies them all again (tine GH #543: a rename's
+    /// frames re-copied on every reopen, 13-23 s on a hosted Windows disk,
+    /// with the first search waiting on it).
     pub fn checkpoint_passive_at(path: &Path) -> Result<u64, MaterializationError> {
         let connection = Connection::open_with_flags(
             path,
@@ -1761,6 +1769,14 @@ impl PhysicalGraphProjectionDatabase {
             connection.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
                 Ok((row.get(1)?, row.get(2)?))
             })?;
+        if log > 0 && checkpointed == log {
+            // Busy is a row value here, not an error: a writer or reader on
+            // the WAL leaves it for a later call. No busy handler, so neither
+            // waits on this connection.
+            connection.busy_timeout(Duration::ZERO)?;
+            let _busy: i64 =
+                connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        }
         Ok(u64::try_from(log.saturating_sub(checkpointed)).unwrap_or(0))
     }
 
@@ -4476,6 +4492,14 @@ mod tests {
             image_bytes() > before,
             "the checkpoint copies the commit into the image"
         );
+        assert_eq!(
+            std::fs::metadata(format!("{}-wal", path.display()))
+                .unwrap()
+                .len(),
+            0,
+            "a complete checkpoint empties the WAL, so a restart that finds it \
+             does not copy it again (tine GH #543: 13-23 s on every reopen)"
+        );
         assert_eq!(scalar(&database, "SELECT COUNT(*) FROM pages"), 200);
         assert!(
             PhysicalGraphProjectionDatabase::checkpoint_passive_at(&path.with_extension("absent"))
@@ -4483,6 +4507,83 @@ mod tests {
             "a checkpoint never creates an image"
         );
         assert!(!path.with_extension("absent").exists());
+        drop(database);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
+
+    /// Emptying the WAL needs the writer's lock and no readers on the WAL. The
+    /// checkpoint only tries it: a writer mid-transaction or an open reader
+    /// leaves the WAL for a later call instead of making either wait.
+    #[test]
+    fn a_checkpoint_never_waits_to_empty_the_wal() {
+        let path = std::env::temp_dir().join(format!(
+            "tine-storage-checkpoint-busy-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut database = PhysicalGraphProjectionDatabase::open_writable(&path).unwrap();
+        database.initialize_schema().unwrap();
+        database.checkpoint_truncate().unwrap();
+        database.disable_automatic_checkpoints().unwrap();
+        let (change, revisions, _) = gh543_snapshot(50);
+        database
+            .apply_with_source_revisions_and_aliases(&change, &revisions, &[])
+            .unwrap();
+        let wal_bytes = || {
+            std::fs::metadata(format!("{}-wal", path.display()))
+                .unwrap()
+                .len()
+        };
+        let written = wal_bytes();
+        assert!(written > 0);
+
+        // A reader holding a snapshot: the copy completes, the WAL stays.
+        let reader = PhysicalGraphProjectionDatabase::open_read_only(&path).unwrap();
+        reader.connection.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .connection
+            .query_row("SELECT COUNT(*) FROM pages", [], |row| row.get(0))
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            PhysicalGraphProjectionDatabase::checkpoint_passive_at(&path).unwrap(),
+            0
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an open reader must not make the checkpoint wait: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(wal_bytes(), written, "a reader still uses the WAL");
+        reader.connection.execute_batch("COMMIT").unwrap();
+
+        // A writer mid-transaction: nothing waits either.
+        database
+            .connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(
+            PhysicalGraphProjectionDatabase::checkpoint_passive_at(&path).unwrap(),
+            0
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an open write transaction must not make the checkpoint wait: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(wal_bytes(), written, "the writer holds the WAL");
+        database.connection.execute_batch("COMMIT").unwrap();
+
+        // Neither: the WAL is emptied.
+        assert_eq!(
+            PhysicalGraphProjectionDatabase::checkpoint_passive_at(&path).unwrap(),
+            0
+        );
+        assert_eq!(wal_bytes(), 0);
+        assert_eq!(scalar(&database, "SELECT COUNT(*) FROM pages"), 50);
+        drop(reader);
         drop(database);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));

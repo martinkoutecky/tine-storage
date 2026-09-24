@@ -7,6 +7,17 @@ independently in `src/formats.rs` and summarized in
 
 ## Unreleased
 
+## [0.28.2] - 2026-09-25
+
+### Fixed
+
+- `checkpoint_passive_at` empties the WAL once every frame is in the image,
+  when that needs no waiting (no write transaction, no reader on the WAL).
+  Before, a copied WAL kept its frames until the writer next restarted it; a
+  process that exited first left them behind, and the next open copied them
+  all again (Tine GH #543: 13-23 s on every reopen after a rename on a hosted
+  Windows disk, with the first search waiting on it).
+
 ## [0.28.1] - 2026-09-24
 
 Write-side cost of incremental updates (Tine GH #543). A 261-page rename on a
